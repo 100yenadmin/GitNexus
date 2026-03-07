@@ -168,16 +168,18 @@ async function installClaudeCodeHooks(result: SetupResult): Promise<void> {
       // even when it's no longer inside the npm package tree
       const resolvedCli = path.join(__dirname, '..', 'cli', 'index.js');
       const normalizedCli = path.resolve(resolvedCli).replace(/\\/g, '/');
+      const jsonCli = JSON.stringify(normalizedCli);
       content = content.replace(
         "let cliPath = path.resolve(__dirname, '..', '..', 'dist', 'cli', 'index.js');",
-        `let cliPath = '${normalizedCli}';`
+        `let cliPath = ${jsonCli};`
       );
       await fs.writeFile(dest, content, 'utf-8');
     } catch {
       // Script not found in source — skip
     }
 
-    const hookCmd = `node "${path.join(destHooksDir, 'gitnexus-hook.cjs').replace(/\\/g, '/')}"`;
+    const hookPath = path.join(destHooksDir, 'gitnexus-hook.cjs').replace(/\\/g, '/');
+    const hookCmd = `node "${hookPath.replace(/"/g, '\\"')}"`;
 
     // Merge hook config into ~/.claude/settings.json
     const existing = await readJsonFile(settingsPath) || {};
@@ -186,39 +188,28 @@ async function installClaudeCodeHooks(result: SetupResult): Promise<void> {
     // NOTE: SessionStart hooks are broken on Windows (Claude Code bug #23576).
     // Session context is delivered via CLAUDE.md / skills instead.
 
-    // Add PreToolUse hook if not already present
-    if (!existing.hooks.PreToolUse) existing.hooks.PreToolUse = [];
-    const hasPreToolHook = existing.hooks.PreToolUse.some(
-      (h: any) => h.hooks?.some((hh: any) => hh.command?.includes('gitnexus'))
-    );
-    if (!hasPreToolHook) {
-      existing.hooks.PreToolUse.push({
-        matcher: 'Grep|Glob|Bash',
-        hooks: [{
-          type: 'command',
-          command: hookCmd,
-          timeout: 8,
-          statusMessage: 'Enriching with GitNexus graph context...',
-        }],
-      });
+    // Helper: add a hook entry if one with 'gitnexus-hook' isn't already registered
+    interface HookEntry { hooks?: Array<{ command?: string }> }
+    function ensureHookEntry(
+      eventName: string,
+      matcher: string,
+      timeout: number,
+      statusMessage: string,
+    ) {
+      if (!existing.hooks[eventName]) existing.hooks[eventName] = [];
+      const hasHook = existing.hooks[eventName].some(
+        (h: HookEntry) => h.hooks?.some(hh => hh.command?.includes('gitnexus-hook'))
+      );
+      if (!hasHook) {
+        existing.hooks[eventName].push({
+          matcher,
+          hooks: [{ type: 'command', command: hookCmd, timeout, statusMessage }],
+        });
+      }
     }
 
-    // Add PostToolUse hook for auto-reindex after git commit
-    if (!existing.hooks.PostToolUse) existing.hooks.PostToolUse = [];
-    const hasPostToolHook = existing.hooks.PostToolUse.some(
-      (h: any) => h.hooks?.some((hh: any) => hh.command?.includes('gitnexus'))
-    );
-    if (!hasPostToolHook) {
-      existing.hooks.PostToolUse.push({
-        matcher: 'Bash',
-        hooks: [{
-          type: 'command',
-          command: hookCmd,
-          timeout: 120,
-          statusMessage: 'Updating GitNexus index...',
-        }],
-      });
-    }
+    ensureHookEntry('PreToolUse', 'Grep|Glob|Bash', 10, 'Enriching with GitNexus graph context...');
+    ensureHookEntry('PostToolUse', 'Bash', 10, 'Checking GitNexus index freshness...');
 
     await writeJsonFile(settingsPath, existing);
     result.configured.push('Claude Code hooks (PreToolUse, PostToolUse)');

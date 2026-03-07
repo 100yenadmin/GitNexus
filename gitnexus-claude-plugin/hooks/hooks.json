@@ -20,8 +20,8 @@
           {
             "type": "command",
             "command": "node ${CLAUDE_PLUGIN_ROOT}/hooks/gitnexus-hook.js",
-            "timeout": 120,
-            "statusMessage": "Updating GitNexus index..."
+            "timeout": 10,
+            "statusMessage": "Checking GitNexus index freshness..."
           }
         ]
       }
