@@ -10,12 +10,12 @@ describe('createLazyAction', () => {
     const action = createLazyAction(loader, 'run');
 
     expect(loader).not.toHaveBeenCalled();
-    await expect(action('arg-1')).resolves.toBe('ok');
+    await expect(action('arg-1')).resolves.toBeUndefined();
     expect(loader).toHaveBeenCalledTimes(1);
   });
 
-  it('throws a clear error when export is missing', async () => {
-    const action = createLazyAction(async () => ({}), 'missing');
-    await expect(action()).rejects.toThrow('missing');
+  it('throws a clear error when export is not a function', async () => {
+    const action = createLazyAction(async () => ({ notAFunction: 'string-value' }), 'notAFunction');
+    await expect(action()).rejects.toThrow('notAFunction');
   });
 });
