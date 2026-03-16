@@ -21,6 +21,7 @@ vi.mock('../../src/mcp/core/lbug-adapter.js', () => ({
 vi.mock('../../src/storage/repo-manager.js', () => ({
   listRegisteredRepos: vi.fn().mockResolvedValue([]),
   cleanupOldKuzuFiles: vi.fn().mockResolvedValue({ found: false, needsReindex: false }),
+  loadMeta: vi.fn().mockResolvedValue(null),
 }));
 
 // Also mock the search modules to avoid loading onnxruntime

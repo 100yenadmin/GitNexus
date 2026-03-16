@@ -16,6 +16,7 @@ import { initLbug, executeQuery, executeParameterized, closeLbug, isLbugReady } 
 import {
   listRegisteredRepos,
   cleanupOldKuzuFiles,
+  loadMeta,
   type RegistryEntry,
 } from '../../storage/repo-manager.js';
 // AI context generation is CLI-only (gitnexus analyze)
@@ -82,6 +83,7 @@ interface RepoHandle {
   indexedAt: string;
   lastCommit: string;
   stats?: RegistryEntry['stats'];
+  loadedAt?: string;   // meta.indexedAt when DB was opened — for staleness detection
 }
 
 export class LocalBackend {
@@ -247,7 +249,24 @@ export class LocalBackend {
 
   private async ensureInitialized(repoId: string): Promise<void> {
     // Always check the actual pool — the idle timer may have evicted the connection
-    if (this.initializedRepos.has(repoId) && isLbugReady(repoId)) return;
+    if (this.initializedRepos.has(repoId) && isLbugReady(repoId)) {
+      // Staleness check: did `gitnexus analyze` rebuild the DB since we opened it?
+      const handle = this.repos.get(repoId);
+      if (handle?.loadedAt) {
+        const meta = await loadMeta(handle.storagePath);
+        if (meta?.indexedAt && meta.indexedAt !== handle.loadedAt) {
+          // DB was rebuilt — close stale connection and fall through to re-init
+          await closeLbug(repoId);
+          this.initializedRepos.delete(repoId);
+          this.contextCache.delete(repoId);
+          handle.loadedAt = undefined;
+        } else {
+          return; // Still fresh
+        }
+      } else {
+        return; // No loadedAt tracked yet (first run)
+      }
+    }
 
     const handle = this.repos.get(repoId);
     if (!handle) throw new Error(`Unknown repo: ${repoId}`);
@@ -255,6 +274,10 @@ export class LocalBackend {
     try {
       await initLbug(repoId, handle.lbugPath);
       this.initializedRepos.add(repoId);
+
+      // Record when we loaded so we can detect staleness later
+      const meta = await loadMeta(handle.storagePath);
+      handle.loadedAt = meta?.indexedAt;
     } catch (err: any) {
       // If lock error, mark as not initialized so next call retries
       this.initializedRepos.delete(repoId);

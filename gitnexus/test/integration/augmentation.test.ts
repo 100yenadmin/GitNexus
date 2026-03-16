@@ -54,6 +54,7 @@ const AUGMENT_FTS_INDEXES = [
 // Mock repo-manager so augment() finds our test DB
 vi.mock('../../src/storage/repo-manager.js', () => ({
   listRegisteredRepos: vi.fn(),
+  loadMeta: vi.fn().mockResolvedValue(null),
 }));
 
 let augment: (pattern: string, cwd?: string) => Promise<string>;

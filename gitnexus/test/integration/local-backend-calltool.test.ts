@@ -14,6 +14,7 @@ import { LOCAL_BACKEND_SEED_DATA, LOCAL_BACKEND_FTS_INDEXES } from '../fixtures/
 vi.mock('../../src/storage/repo-manager.js', () => ({
   listRegisteredRepos: vi.fn().mockResolvedValue([]),
   cleanupOldKuzuFiles: vi.fn().mockResolvedValue({ found: false, needsReindex: false }),
+  loadMeta: vi.fn().mockResolvedValue(null),
 }));
 
 // ─── Block 2: callTool dispatch tests ────────────────────────────────
