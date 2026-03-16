@@ -1,7 +1,7 @@
 import fs from 'fs/promises';
 import path from 'path';
 import { glob } from 'glob';
-import { shouldIgnorePath } from '../../config/ignore-service.js';
+import { shouldIgnorePath, createIgnoreFilter } from '../../config/ignore-service.js';
 
 export interface FileEntry {
   path: string;
@@ -30,7 +30,8 @@ const MAX_FILE_SIZE = 512 * 1024;
  */
 export const walkRepositoryPaths = async (
   repoPath: string,
-  onProgress?: (current: number, total: number, filePath: string) => void
+  onProgress?: (current: number, total: number, filePath: string) => void,
+  options?: { excludePatterns?: string[] }
 ): Promise<ScannedFile[]> => {
   const files = await glob('**/*', {
     cwd: repoPath,
@@ -38,7 +39,8 @@ export const walkRepositoryPaths = async (
     dot: false,
   });
 
-  const filtered = files.filter(file => !shouldIgnorePath(file));
+  const ignoreFilter = createIgnoreFilter(repoPath, options?.excludePatterns);
+  const filtered = files.filter(file => !ignoreFilter(file));
   const entries: ScannedFile[] = [];
   let processed = 0;
   let skippedLarge = 0;

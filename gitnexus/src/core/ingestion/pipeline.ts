@@ -35,7 +35,8 @@ const AST_CACHE_CAP = 50;
 
 export const runPipelineFromRepo = async (
   repoPath: string,
-  onProgress: (progress: PipelineProgress) => void
+  onProgress: (progress: PipelineProgress) => void,
+  options?: { excludePatterns?: string[] }
 ): Promise<PipelineResult> => {
   const graph = createKnowledgeGraph();
   const ctx = createResolutionContext();
@@ -64,7 +65,7 @@ export const runPipelineFromRepo = async (
         detail: filePath,
         stats: { filesProcessed: current, totalFiles: total, nodesCreated: graph.nodeCount },
       });
-    });
+    }, { excludePatterns: options?.excludePatterns });
 
     const totalFiles = scannedFiles.length;
 

@@ -14,7 +14,7 @@ import { initLbug, loadGraphToLbug, getLbugStats, executeQuery, executeWithReuse
 // loaded when embeddings are not requested. This avoids crashes on Node
 // versions whose ABI is not yet supported by the native binary (#89).
 // disposeEmbedder intentionally not called — ONNX Runtime segfaults on cleanup (see #38)
-import { getStoragePaths, saveMeta, loadMeta, addToGitignore, registerRepo, getGlobalRegistryPath, cleanupOldKuzuFiles } from '../storage/repo-manager.js';
+import { getStoragePaths, saveMeta, loadMeta, addToGitignore, registerRepo, getGlobalRegistryPath, cleanupOldKuzuFiles, type RepoMeta } from '../storage/repo-manager.js';
 import { getCurrentCommit, isGitRepo, getGitRoot } from '../storage/git.js';
 import { generateAIContextFiles } from './ai-context.js';
 import { generateSkillFiles, type GeneratedSkillInfo } from './skill-gen.js';
@@ -48,6 +48,9 @@ export interface AnalyzeOptions {
   embeddings?: boolean;
   skills?: boolean;
   verbose?: boolean;
+  exclude?: string[];
+  noAgentsMd?: boolean;
+  noClaudeMd?: boolean;
 }
 
 /** Threshold: auto-skip embeddings for repos with more nodes than this */
@@ -198,12 +201,19 @@ export const analyzeCommand = async (
     }
   }
 
+  // Merge --exclude patterns with any persisted exclusions from meta.json
+  const excludePatterns = options?.exclude || [];
+  const existingExcludes = (existingMeta as any)?.excludePatterns as string[] | undefined;
+  if (existingExcludes && excludePatterns.length === 0) {
+    excludePatterns.push(...existingExcludes);
+  }
+
   // ── Phase 1: Full Pipeline (0–60%) ─────────────────────────────────
   const pipelineResult = await runPipelineFromRepo(repoPath, (progress) => {
     const phaseLabel = PHASE_LABELS[progress.phase] || progress.phase;
     const scaled = Math.round(progress.percent * 0.6);
     updateBar(scaled, phaseLabel);
-  });
+  }, { excludePatterns: excludePatterns.length > 0 ? excludePatterns : undefined });
 
   // ── Phase 2: LadybugDB (60–85%) ──────────────────────────────────────
   updateBar(60, 'Loading into LadybugDB...');
@@ -298,7 +308,7 @@ export const analyzeCommand = async (
     embeddingCount = embResult?.[0]?.cnt ?? 0;
   } catch { /* table may not exist if embeddings never ran */ }
 
-  const meta = {
+  const meta: RepoMeta = {
     repoPath,
     lastCommit: currentCommit,
     indexedAt: new Date().toISOString(),
@@ -311,6 +321,10 @@ export const analyzeCommand = async (
       embeddings: embeddingCount,
     },
   };
+  // Persist --exclude patterns so incremental re-index respects them
+  if (excludePatterns.length > 0) {
+    meta.excludePatterns = excludePatterns;
+  }
   await saveMeta(storagePath, meta);
   await registerRepo(repoPath, meta);
   await addToGitignore(repoPath);
@@ -340,7 +354,10 @@ export const analyzeCommand = async (
     communities: pipelineResult.communityResult?.stats.totalCommunities,
     clusters: aggregatedClusterCount,
     processes: pipelineResult.processResult?.stats.totalProcesses,
-  }, generatedSkills);
+  }, generatedSkills, {
+    noAgentsMd: options?.noAgentsMd,
+    noClaudeMd: options?.noClaudeMd,
+  });
 
   await closeLbug();
   // Note: we intentionally do NOT call disposeEmbedder() here.

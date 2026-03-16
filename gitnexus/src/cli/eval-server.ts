@@ -26,6 +26,7 @@
 
 import http from 'http';
 import { LocalBackend } from '../mcp/local/local-backend.js';
+import { truncateToTokenBudget } from '../config/ignore-service.js';
 
 export interface EvalServerOptions {
   port?: string;
@@ -311,6 +312,12 @@ export async function evalServerCommand(options?: EvalServerOptions): Promise<vo
   const repos = await backend.listRepos();
   console.error(`GitNexus eval-server: ${repos.length} repo(s) loaded: ${repos.map(r => r.name).join(', ')}`);
 
+  // Bearer token auth — if GITNEXUS_AUTH_TOKEN is set, all requests must authenticate
+  const authToken = process.env.GITNEXUS_AUTH_TOKEN || null;
+  if (authToken) {
+    console.error('GitNexus eval-server: Bearer token auth enabled');
+  }
+
   let idleTimer: ReturnType<typeof setTimeout> | null = null;
 
   function resetIdleTimer() {
@@ -325,6 +332,17 @@ export async function evalServerCommand(options?: EvalServerOptions): Promise<vo
 
   const server = http.createServer(async (req, res) => {
     resetIdleTimer();
+
+    // Auth check — if GITNEXUS_AUTH_TOKEN is set, verify Bearer token
+    if (authToken) {
+      const authHeader = req.headers.authorization;
+      if (!authHeader || authHeader !== `Bearer ${authToken}`) {
+        res.setHeader('Content-Type', 'application/json');
+        res.writeHead(401);
+        res.end(JSON.stringify({ error: 'Unauthorized — set Authorization: Bearer <token> header' }));
+        return;
+      }
+    }
 
     try {
       // Health check
@@ -367,13 +385,21 @@ export async function evalServerCommand(options?: EvalServerOptions): Promise<vo
         }
 
         // Call tool, format result as text, append next-step hint
+        const maxTokens = args.maxTokens ? parseInt(args.maxTokens) : undefined;
+        delete args.maxTokens; // Don't pass to backend
         const result = await backend.callTool(toolName, args);
-        const formatted = formatToolResult(toolName, result);
+        let formatted = formatToolResult(toolName, result);
         const hint = getNextStepHint(toolName);
+        formatted = formatted + hint;
+
+        // Apply token budget if specified
+        if (maxTokens && maxTokens > 0) {
+          formatted = truncateToTokenBudget(formatted, maxTokens);
+        }
 
         res.setHeader('Content-Type', 'text/plain');
         res.writeHead(200);
-        res.end(formatted + hint);
+        res.end(formatted);
         return;
       }
 

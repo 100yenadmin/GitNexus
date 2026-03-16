@@ -22,6 +22,7 @@ export interface RepoMeta {
     processes?: number;
     embeddings?: number;
   };
+  excludePatterns?: string[];
 }
 
 export interface IndexedRepo {

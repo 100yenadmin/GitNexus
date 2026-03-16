@@ -277,6 +277,28 @@ Use GitNexus tools to accomplish this task.
   return installedSkills;
 }
 
+export interface AIContextOptions {
+  noAgentsMd?: boolean;
+  noClaudeMd?: boolean;
+}
+
+/**
+ * Load .gitnexus/config.json from a repo root.
+ * Returns an object with optional generateAgentsMd/generateClaudeMd flags.
+ */
+async function loadGitNexusConfig(repoPath: string): Promise<{
+  generateAgentsMd?: boolean;
+  generateClaudeMd?: boolean;
+}> {
+  try {
+    const configPath = path.join(repoPath, '.gitnexus', 'config.json');
+    const raw = await fs.readFile(configPath, 'utf-8');
+    return JSON.parse(raw);
+  } catch {
+    return {};
+  }
+}
+
 /**
  * Generate AI context files after indexing
  */
@@ -285,20 +307,30 @@ export async function generateAIContextFiles(
   _storagePath: string,
   projectName: string,
   stats: RepoStats,
-  generatedSkills?: GeneratedSkillInfo[]
+  generatedSkills?: GeneratedSkillInfo[],
+  options?: AIContextOptions
 ): Promise<{ files: string[] }> {
   const content = generateGitNexusContent(projectName, stats, generatedSkills);
   const createdFiles: string[] = [];
 
+  // Check .gitnexus/config.json for generation preferences
+  const config = await loadGitNexusConfig(repoPath);
+  const skipAgentsMd = options?.noAgentsMd || config.generateAgentsMd === false;
+  const skipClaudeMd = options?.noClaudeMd || config.generateClaudeMd === false;
+
   // Create AGENTS.md (standard for Cursor, Windsurf, OpenCode, Cline, etc.)
-  const agentsPath = path.join(repoPath, 'AGENTS.md');
-  const agentsResult = await upsertGitNexusSection(agentsPath, content);
-  createdFiles.push(`AGENTS.md (${agentsResult})`);
+  if (!skipAgentsMd) {
+    const agentsPath = path.join(repoPath, 'AGENTS.md');
+    const agentsResult = await upsertGitNexusSection(agentsPath, content);
+    createdFiles.push(`AGENTS.md (${agentsResult})`);
+  }
 
   // Create CLAUDE.md (for Claude Code)
-  const claudePath = path.join(repoPath, 'CLAUDE.md');
-  const claudeResult = await upsertGitNexusSection(claudePath, content);
-  createdFiles.push(`CLAUDE.md (${claudeResult})`);
+  if (!skipClaudeMd) {
+    const claudePath = path.join(repoPath, 'CLAUDE.md');
+    const claudeResult = await upsertGitNexusSection(claudePath, content);
+    createdFiles.push(`CLAUDE.md (${claudeResult})`);
+  }
 
   // Install skills to .claude/skills/gitnexus/
   const installedSkills = await installSkills(repoPath);

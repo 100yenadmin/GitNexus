@@ -27,8 +27,11 @@ program
   .option('-f, --force', 'Force full re-index even if up to date')
   .option('--embeddings', 'Enable embedding generation for semantic search (off by default)')
   .option('--skills', 'Generate repo-specific skill files from detected communities')
-   .option('-v, --verbose', 'Enable verbose ingestion warnings (default: false)')
-   .action(createLazyAction(() => import('./analyze.js'), 'analyzeCommand'));
+  .option('-e, --exclude <pattern...>', 'Glob patterns to exclude from indexing (e.g. "tests/**" "benchmarks/**")')
+  .option('--no-agents-md', 'Skip AGENTS.md generation')
+  .option('--no-claude-md', 'Skip CLAUDE.md generation')
+  .option('-v, --verbose', 'Enable verbose ingestion warnings (default: false)')
+  .action(createLazyAction(() => import('./analyze.js'), 'analyzeCommand'));
 
 program
   .command('serve')
@@ -86,6 +89,7 @@ program
   .option('-g, --goal <text>', 'What you want to find')
   .option('-l, --limit <n>', 'Max processes to return (default: 5)')
   .option('--content', 'Include full symbol source code')
+  .option('--max-tokens <n>', 'Truncate output to N estimated tokens')
   .action(createLazyAction(() => import('./tool.js'), 'queryCommand'));
 
 program
@@ -95,6 +99,7 @@ program
   .option('-u, --uid <uid>', 'Direct symbol UID (zero-ambiguity lookup)')
   .option('-f, --file <path>', 'File path to disambiguate common names')
   .option('--content', 'Include full symbol source code')
+  .option('--max-tokens <n>', 'Truncate output to N estimated tokens')
   .action(createLazyAction(() => import('./tool.js'), 'contextCommand'));
 
 program
