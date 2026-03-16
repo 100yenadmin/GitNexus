@@ -49,8 +49,8 @@ export interface AnalyzeOptions {
   skills?: boolean;
   verbose?: boolean;
   exclude?: string[];
-  noAgentsMd?: boolean;
-  noClaudeMd?: boolean;
+  skipAgentsMd?: boolean;
+  skipClaudeMd?: boolean;
 }
 
 /** Threshold: auto-skip embeddings for repos with more nodes than this */
@@ -355,8 +355,8 @@ export const analyzeCommand = async (
     clusters: aggregatedClusterCount,
     processes: pipelineResult.processResult?.stats.totalProcesses,
   }, generatedSkills, {
-    noAgentsMd: options?.noAgentsMd,
-    noClaudeMd: options?.noClaudeMd,
+    noAgentsMd: options?.skipAgentsMd,
+    noClaudeMd: options?.skipClaudeMd,
   });
 
   await closeLbug();
