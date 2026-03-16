@@ -354,7 +354,10 @@ export const analyzeCommand = async (
     communities: pipelineResult.communityResult?.stats.totalCommunities,
     clusters: aggregatedClusterCount,
     processes: pipelineResult.processResult?.stats.totalProcesses,
-  }, generatedSkills);
+  }, generatedSkills, {
+    noAgentsMd: options?.noAgentsMd,
+    noClaudeMd: options?.noClaudeMd,
+  });
 
   await closeLbug();
   // Note: we intentionally do NOT call disposeEmbedder() here.
