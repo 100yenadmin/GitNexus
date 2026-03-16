@@ -1,3 +1,8 @@
+import fs from 'fs';
+import path from 'path';
+import ignore, { type Ignore } from 'ignore';
+import { minimatch } from 'minimatch';
+
 const DEFAULT_IGNORE_LIST = new Set([
     // Version Control
     '.git',
@@ -235,5 +240,71 @@ export const shouldIgnorePath = (filePath: string): boolean => {
   }
 
   return false;
+}
+
+/**
+ * Load a .gitnexusignore file from a repo root and return an Ignore instance.
+ * Returns null if the file doesn't exist.
+ */
+export function loadGitNexusIgnore(repoPath: string): Ignore | null {
+  const ignorePath = path.join(repoPath, '.gitnexusignore');
+  try {
+    const content = fs.readFileSync(ignorePath, 'utf-8');
+    const ig = ignore();
+    ig.add(content);
+    return ig;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Create a filter function that checks both the default ignore rules,
+ * an optional .gitnexusignore, and optional --exclude glob patterns.
+ */
+export function createIgnoreFilter(
+  repoPath: string,
+  excludePatterns?: string[]
+): (filePath: string) => boolean {
+  const repoIgnore = loadGitNexusIgnore(repoPath);
+
+  return (filePath: string): boolean => {
+    // Check default ignore rules first
+    if (shouldIgnorePath(filePath)) return true;
+
+    // Check .gitnexusignore patterns
+    if (repoIgnore && repoIgnore.ignores(filePath)) return true;
+
+    // Check --exclude glob patterns
+    if (excludePatterns && excludePatterns.length > 0) {
+      for (const pattern of excludePatterns) {
+        if (minimatch(filePath, pattern, { dot: true })) return true;
+      }
+    }
+
+    return false;
+  };
+}
+
+/**
+ * Estimate token count from text length.
+ * Simple heuristic: ~4 chars per token (good enough for agent use).
+ */
+export function estimateTokens(text: string): number {
+  return Math.ceil(text.length / 4);
+}
+
+/**
+ * Truncate text to fit within a token budget.
+ * Returns the truncated text with a note about remaining tokens.
+ */
+export function truncateToTokenBudget(text: string, maxTokens: number): string {
+  const totalTokens = estimateTokens(text);
+  if (totalTokens <= maxTokens) return text;
+
+  const maxChars = maxTokens * 4;
+  const truncated = text.substring(0, maxChars);
+  const remaining = totalTokens - maxTokens;
+  return truncated + `\n\n... (truncated, ${remaining} more tokens available)`;
 }
 
