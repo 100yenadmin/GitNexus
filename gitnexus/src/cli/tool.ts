@@ -15,6 +15,7 @@
  */
 
 import { LocalBackend } from '../mcp/local/local-backend.js';
+import { truncateToTokenBudget } from '../config/ignore-service.js';
 
 let _backend: LocalBackend | null = null;
 
@@ -41,6 +42,7 @@ export async function queryCommand(queryText: string, options?: {
   goal?: string;
   limit?: string;
   content?: boolean;
+  maxTokens?: string;
 }): Promise<void> {
   if (!queryText?.trim()) {
     console.error('Usage: gitnexus query <search_query>');
@@ -56,7 +58,11 @@ export async function queryCommand(queryText: string, options?: {
     include_content: options?.content ?? false,
     repo: options?.repo,
   });
-  output(result);
+  let text = typeof result === 'string' ? result : JSON.stringify(result, null, 2);
+  if (options?.maxTokens) {
+    text = truncateToTokenBudget(text, parseInt(options.maxTokens));
+  }
+  output(text);
 }
 
 export async function contextCommand(name: string, options?: {
@@ -64,6 +70,7 @@ export async function contextCommand(name: string, options?: {
   file?: string;
   uid?: string;
   content?: boolean;
+  maxTokens?: string;
 }): Promise<void> {
   if (!name?.trim() && !options?.uid) {
     console.error('Usage: gitnexus context <symbol_name> [--uid <uid>] [--file <path>]');
@@ -78,7 +85,11 @@ export async function contextCommand(name: string, options?: {
     include_content: options?.content ?? false,
     repo: options?.repo,
   });
-  output(result);
+  let text = typeof result === 'string' ? result : JSON.stringify(result, null, 2);
+  if (options?.maxTokens) {
+    text = truncateToTokenBudget(text, parseInt(options.maxTokens));
+  }
+  output(text);
 }
 
 export async function impactCommand(target: string, options?: {
