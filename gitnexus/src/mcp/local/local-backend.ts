@@ -310,10 +310,24 @@ export class LocalBackend {
         const raw = await this.cypher(repo, params);
         return this.formatCypherAsMarkdown(raw);
       }
-      case 'context':
-        return this.context(repo, params);
-      case 'impact':
-        return this.impact(repo, params);
+      case 'context': {
+        // Normalize aliases: file → file_path, symbol → name
+        const ctxParams = { ...params };
+        if (ctxParams.file && !ctxParams.file_path) ctxParams.file_path = ctxParams.file;
+        if (ctxParams.symbol && !ctxParams.name) ctxParams.name = ctxParams.symbol;
+        return this.context(repo, ctxParams);
+      }
+      case 'impact': {
+        // Normalize aliases: name/symbol → target
+        const impactParams = { ...params };
+        if (!impactParams.target) {
+          impactParams.target = impactParams.name || impactParams.symbol;
+        }
+        if (!impactParams.direction) {
+          impactParams.direction = 'upstream'; // sensible default
+        }
+        return this.impact(repo, impactParams);
+      }
       case 'detect_changes':
         return this.detectChanges(repo, params);
       case 'rename':
