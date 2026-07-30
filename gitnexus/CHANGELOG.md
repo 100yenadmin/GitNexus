@@ -4,6 +4,20 @@ All notable changes to GitNexus will be documented in this file.
 
 ## [Unreleased]
 
+## [1.6.10-electric.9] - 2026-07-30
+
+### Fixed
+
+- **One invalid or ambiguous MCP allowlist entry no longer denies access to every valid repository**: valid entries remain available, rejected entries grant no access, and agents receive sanitized degraded-policy coordinates (#182, #183)
+- **Absolute repository paths accept equivalent filesystem capitalization and aliases during startup resolution** while runtime requests use a precomputed in-memory map instead of synchronous filesystem calls (#182, #183)
+- **MCP policy doctor exits nonzero for degraded configurations** so automation can detect rejected entries without changing the runtime's fail-closed, partial-service behavior (#182, #183)
+
+### Changed
+
+- An allowlist still blocks all repository access when none of its entries resolve. Invalid, ambiguous, or outside-allowlist defaults remain fully blocking, and GitNexus never falls back to unrestricted access.
+- Distribution remains GitHub-only as one tarball plus `SHA256SUMS`; npm and container registries are unchanged.
+- Existing `1.6.10-electric.8` remains installed as the immediate rollback runtime.
+
 ## [1.6.10-electric.8] - 2026-07-23
 
 ### Fixed
