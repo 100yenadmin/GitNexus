@@ -281,6 +281,13 @@ export const doctorCommand = async (
     const report = await buildMcpConfigDoctorReport();
     if (options.json) {
       console.log(JSON.stringify(report, null, 2));
+    } else if (report.valid && report.degraded) {
+      console.log('MCP repository policy: degraded (read-only preflight)');
+      for (const rejected of report.rejectedEntries) {
+        console.log(`  environment: ${rejected.environmentKey}`);
+        console.log(`  entry:       ${rejected.entryPosition}`);
+        console.log(`  failure:     ${rejected.failureClass}`);
+      }
     } else if (report.valid) {
       console.log('MCP repository policy: valid (read-only preflight)');
     } else if ('failureClass' in report) {
@@ -289,7 +296,7 @@ export const doctorCommand = async (
       console.log(`  entry:       ${report.entryPosition}`);
       console.log(`  failure:     ${report.failureClass}`);
     }
-    if (!report.valid) process.exitCode = 1;
+    if (!report.valid || report.degraded) process.exitCode = 1;
     return;
   }
 

@@ -57,11 +57,11 @@ Format: **Trigger → Instruction → Reason**. Append new Signs when the same m
 - **Do:** Call `list_repos`, then pass `repo` on subsequent tools.
 - **Why:** Default target is ambiguous when multiple repos are registered.
 
-### MCP repository policy is blocked
+### MCP repository policy is degraded or blocked
 
-- **Trigger:** Stdio MCP tools are present but their descriptions or calls report `MCP repository policy is blocked`.
-- **Do:** Repair the named environment key. For an ambiguous allowlist entry, replace the bare repository name with its unique absolute indexed path, then restart the MCP client. Do not remove the allowlist or choose a worktree arbitrarily.
-- **Why:** Stdio MCP stays protocol-visible so agents receive the sanitized configuration error, but every repository tool and resource remains fail-closed until restart. Standalone HTTP still refuses to bind when its repository policy is invalid.
+- **Trigger:** MCP tool descriptions or `list_repos` report a degraded repository policy, or calls report `MCP repository policy is blocked`.
+- **Do:** Run `gitnexus doctor --mcp-config --json` and repair the named environment key/entry. For an ambiguous allowlist entry, replace the bare repository name with its unique absolute indexed path. Restart the MCP client after changing its environment. Do not remove the allowlist or choose a worktree arbitrarily.
+- **Why:** Each rejected allowlist entry grants no access. Other successfully resolved entries remain available and agent-visible diagnostics identify the rejected positions without exposing configured values. Stdio and HTTP remain fully blocked when a configured allowlist resolves no repositories, or when the configured default is invalid or outside the successfully resolved allowlist.
 
 ### LadybugDB lock / "database busy"
 
