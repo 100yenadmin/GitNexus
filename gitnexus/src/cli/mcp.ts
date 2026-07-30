@@ -90,6 +90,15 @@ export const mcpCommand = async (options?: {
   });
 
   if (!repositoryPolicy.configurationError) {
+    if (repositoryPolicy.rejectedEntries.length > 0) {
+      logger.warn(
+        {
+          mode: 'degraded',
+          rejectedEntries: repositoryPolicy.rejectedEntries,
+        },
+        'MCP repository policy rejected configured allowlist entries; valid entries remain available and rejected entries grant no access.',
+      );
+    }
     const repos = await repositoryPolicy.scopeBackend(backend).listRepos();
     if (repos.length === 0) {
       // Operator-actionable but the server still starts and serves; warn-level,
