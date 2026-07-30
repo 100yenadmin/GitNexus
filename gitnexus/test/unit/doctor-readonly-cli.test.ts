@@ -59,6 +59,48 @@ describe('read-only doctor CLI modes (#127, #133)', () => {
     expect(`${result.stdout}${result.stderr}`).not.toContain('KnownSecretAlias');
   });
 
+  it('exits nonzero with sanitized coordinates when MCP policy is degraded', async () => {
+    const secretPath = path.join(home.dbPath, 'secret-registry-repo');
+    const configuredSecret = 'MissingConfiguredSecret';
+    await fs.writeFile(
+      path.join(home.dbPath, 'registry.json'),
+      JSON.stringify([
+        {
+          name: 'KnownSecretAlias',
+          path: secretPath,
+          storagePath: path.join(secretPath, '.gitnexus'),
+          indexedAt: '2026-07-20T00:00:00.000Z',
+          lastCommit: 'a'.repeat(40),
+        },
+      ]),
+    );
+
+    const result = runDoctor(['--mcp-config', '--json'], {
+      GITNEXUS_MCP_ALLOWED_REPOS: `KnownSecretAlias,${configuredSecret}`,
+      GITNEXUS_MCP_DEFAULT_REPO: undefined,
+      OPENCLAW_CODE_INDEX_ALLOWED_REPOS: undefined,
+      OPENCLAW_CODE_INDEX_DEFAULT_REPO: undefined,
+    });
+
+    expect(result.status).toBe(1);
+    expect(JSON.parse(result.stdout)).toEqual({
+      mode: 'mcp-config',
+      readOnly: true,
+      valid: true,
+      degraded: true,
+      rejectedEntries: [
+        {
+          environmentKey: 'GITNEXUS_MCP_ALLOWED_REPOS',
+          entryPosition: 2,
+          failureClass: 'invalid',
+        },
+      ],
+    });
+    expect(`${result.stdout}${result.stderr}`).not.toContain(secretPath);
+    expect(`${result.stdout}${result.stderr}`).not.toContain(configuredSecret);
+    expect(`${result.stdout}${result.stderr}`).not.toContain('KnownSecretAlias');
+  });
+
   it('hides registry paths by default and reveals them only with --show-paths', async () => {
     const secretPath = path.join(home.dbPath, 'secret-registry-repo');
     await fs.writeFile(

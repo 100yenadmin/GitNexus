@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import fsSync from 'node:fs';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -297,11 +298,17 @@ describe('MCP repository policy', () => {
         GITNEXUS_MCP_ALLOWED_REPOS: alternateCase,
       });
       expect(policy.rejectedEntries).toEqual([]);
-      await policy.scopeBackend(backend).callTool('query', { search_query: 'agents' });
+      const syncRealpath = vi.spyOn(fsSync, 'realpathSync');
+      const syncStat = vi.spyOn(fsSync, 'statSync');
+      await policy
+        .scopeBackend(backend)
+        .callTool('query', { search_query: 'agents', repo: alternateCase });
       expect(backend.callTool).toHaveBeenCalledWith('query', {
         search_query: 'agents',
         repo: canonical,
       });
+      expect(syncRealpath).not.toHaveBeenCalled();
+      expect(syncStat).not.toHaveBeenCalled();
     } finally {
       await fs.rm(tempRoot, { recursive: true, force: true });
     }

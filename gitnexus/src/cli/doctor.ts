@@ -296,7 +296,7 @@ export const doctorCommand = async (
       console.log(`  entry:       ${report.entryPosition}`);
       console.log(`  failure:     ${report.failureClass}`);
     }
-    if (!report.valid) process.exitCode = 1;
+    if (!report.valid || report.degraded) process.exitCode = 1;
     return;
   }
 

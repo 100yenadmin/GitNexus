@@ -162,21 +162,23 @@ export class McpRepositoryPolicy {
   private readonly registry: readonly ResolvedRepository[];
   private readonly allowed: readonly ResolvedRepository[];
   private readonly allowedPathKeys: ReadonlySet<string>;
+  private readonly runtimePathAliases: ReadonlyMap<string, ResolvedRepository>;
   private readonly defaultRepo?: ResolvedRepository;
   private readonly uniqueAllowedContextNames: ReadonlySet<string>;
 
   static unrestricted(): McpRepositoryPolicy {
-    return new McpRepositoryPolicy([], undefined, undefined);
+    return new McpRepositoryPolicy([], undefined, undefined, undefined);
   }
 
   static blocked(error: McpRepositoryPolicyConfigurationError): McpRepositoryPolicy {
-    return new McpRepositoryPolicy([], [], undefined, error);
+    return new McpRepositoryPolicy([], [], undefined, undefined, error);
   }
 
   constructor(
     registry: readonly ResolvedRepository[],
     allowed: readonly ResolvedRepository[] | undefined,
     defaultRepo: ResolvedRepository | undefined,
+    runtimePathAliases: ReadonlyMap<string, ResolvedRepository> | undefined,
     configurationError?: McpRepositoryPolicyConfigurationError,
     rejectedEntries: readonly McpRepositoryPolicyRejection[] = [],
   ) {
@@ -185,6 +187,10 @@ export class McpRepositoryPolicy {
     this.configured = this.restricted || defaultRepo !== undefined;
     this.allowed = allowed ?? registry;
     this.allowedPathKeys = new Set(this.allowed.map((repo) => repo.pathKey));
+    this.runtimePathAliases = new Map([
+      ...registry.map((repo) => [repo.pathKey, repo] as const),
+      ...(runtimePathAliases ?? new Map<string, ResolvedRepository>()),
+    ]);
     this.defaultRepo = defaultRepo;
     this.configurationError = configurationError;
     this.rejectedEntries = rejectedEntries;
@@ -202,11 +208,17 @@ export class McpRepositoryPolicy {
   }
 
   private resolveRuntimeRepo(specifier: string): ResolvedRepository {
-    const result = resolveSpecifier(specifier, this.registry);
-    if (!result.repo || (this.restricted && !this.allowedPathKeys.has(result.repo.pathKey))) {
+    const trimmed = specifier.trim();
+    const matches = isAbsolutePath(trimmed)
+      ? [this.runtimePathAliases.get(normalizedPath(trimmed))].filter(
+          (repo): repo is ResolvedRepository => repo !== undefined,
+        )
+      : this.registry.filter((repo) => repo.name.toLowerCase() === trimmed.toLowerCase());
+    const repo = matches.length === 1 ? matches[0] : undefined;
+    if (!repo || (this.restricted && !this.allowedPathKeys.has(repo.pathKey))) {
       throw unavailableRepositoryError();
     }
-    return result.repo;
+    return repo;
   }
 
   private repoForArgs(args: Record<string, unknown> | undefined): ResolvedRepository | undefined {
@@ -440,6 +452,7 @@ export async function createMcpRepositoryPolicy(
   }));
 
   let allowed: ResolvedRepository[] | undefined;
+  const runtimePathAliases = new Map<string, ResolvedRepository>();
   const rejectedEntries: McpRepositoryPolicyRejection[] = [];
   if (raw.allowed) {
     const byPath = new Map<string, ResolvedRepository>();
@@ -454,6 +467,9 @@ export async function createMcpRepositoryPolicy(
         continue;
       }
       byPath.set(result.repo.pathKey, result.repo);
+      if (isAbsolutePath(specifier.value)) {
+        runtimePathAliases.set(normalizedPath(specifier.value), result.repo);
+      }
     }
     allowed = [...byPath.values()];
     if (allowed.length === 0) {
@@ -480,6 +496,9 @@ export async function createMcpRepositoryPolicy(
       );
     }
     defaultRepo = result.repo;
+    if (isAbsolutePath(raw.defaultRepo)) {
+      runtimePathAliases.set(normalizedPath(raw.defaultRepo), result.repo);
+    }
   }
 
   const defaultPathKey = defaultRepo?.pathKey;
@@ -491,7 +510,14 @@ export async function createMcpRepositoryPolicy(
     );
   }
 
-  return new McpRepositoryPolicy(registry, allowed, defaultRepo, undefined, rejectedEntries);
+  return new McpRepositoryPolicy(
+    registry,
+    allowed,
+    defaultRepo,
+    runtimePathAliases,
+    undefined,
+    rejectedEntries,
+  );
 }
 
 export type McpRepositoryPolicyPreflightFailureClass =
