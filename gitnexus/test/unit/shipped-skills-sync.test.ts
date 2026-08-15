@@ -139,9 +139,7 @@ describe('STANDARD_SKILL_CATALOG distribution', () => {
       expect(text, file).not.toContain('gitnexus@latest');
       expect(text, file).not.toMatch(/\bgitnexus@rc\b/);
       expect(text, file).not.toMatch(/\bnpx(?:\s+-y)?\s+gitnexus(?!@[\w<])\b/);
-      expect(text, file).not.toMatch(
-        /\bnpm\s+(?:i|install)\s+-g\s+gitnexus(?!@[\w<])\b/,
-      );
+      expect(text, file).not.toMatch(/\bnpm\s+(?:i|install)\s+-g\s+gitnexus(?!@[\w<])\b/);
     }
   });
 });
