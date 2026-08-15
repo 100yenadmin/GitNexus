@@ -37,6 +37,26 @@ function filesUnder(root: string): string[] {
   });
 }
 
+function hasFloatingGitnexusNpx(line: string): boolean {
+  const tokens = line
+    .replace(/[`"'()[\]{},;]/g, ' ')
+    .trim()
+    .split(/\s+/);
+  for (let i = 0; i < tokens.length; i += 1) {
+    if (!/^npx(?:\.cmd)?$/i.test(tokens[i])) continue;
+    for (let j = i + 1; j < tokens.length; j += 1) {
+      const token = tokens[j];
+      if (/^--package=gitnexus(?:@[\w.-]+)?$/i.test(token)) return true;
+      if (/^(?:--package|-p)$/i.test(token)) {
+        return /^gitnexus(?:@[\w.-]+)?$/i.test(tokens[j + 1] || '');
+      }
+      if (token.startsWith('-')) continue;
+      return /^gitnexus(?:@[\w.-]+)?$/i.test(token);
+    }
+  }
+  return false;
+}
+
 describe('STANDARD_SKILL_CATALOG distribution', () => {
   const names = STANDARD_SKILL_CATALOG.map((entry) => entry.name).sort();
   const analyzeProjectSkills = STANDARD_SKILL_CATALOG.filter((entry) => entry.analyzeProject).map(
@@ -139,12 +159,32 @@ describe('STANDARD_SKILL_CATALOG distribution', () => {
       const text = fs.readFileSync(file, 'utf8');
       expect(text, file).not.toContain('gitnexus@latest');
       expect(text, file).not.toMatch(/\bgitnexus@rc\b/);
-      expect(text, file).not.toMatch(/\bnpx(?:\s+-y)?\s+gitnexus(?:@[\w.-]+)?\b/);
+      expect(
+        text.split(/\r?\n/).some((line) => hasFloatingGitnexusNpx(line)),
+        file,
+      ).toBe(false);
       expect(text, file).not.toMatch(/\bpnpm(?:\s+\S+)*\s+dlx\s+gitnexus(?:@[\w.-]+)?\b/);
       expect(text, file).not.toMatch(
         /\bnpm\s+(?:i|install)\s+(?:--global|-g)\s+gitnexus(?:@[\w.-]+)?\b/,
       );
     }
+  });
+
+  it('recognizes option-bearing floating npx launchers without rejecting exact URLs', () => {
+    for (const sample of [
+      'npx gitnexus',
+      'npx -y gitnexus',
+      'npx --yes gitnexus',
+      'npx --package gitnexus gitnexus',
+      'npx --package=gitnexus@1.2.3 gitnexus',
+    ]) {
+      expect(hasFloatingGitnexusNpx(sample), sample).toBe(true);
+    }
+    expect(
+      hasFloatingGitnexusNpx(
+        'npx -y https://github.com/electricsheephq/evaOS-gitnexus/releases/download/electric%2Fv1.6.10-electric.10/gitnexus-1.6.10-electric.10.tgz mcp',
+      ),
+    ).toBe(false);
   });
 });
 

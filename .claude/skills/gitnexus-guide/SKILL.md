@@ -14,8 +14,10 @@ For any task involving code understanding, debugging, impact analysis, or refact
 1. **Call `list_repos({limit, offset})`** until the exact repository is found;
    record its full path and full `lastCommit`.
 2. **Read `gitnexus://repo/{name}/context`** for overview, statistics, and
-   freshness. Do not use the unpaginated `gitnexus://repos` resource as an
-   exact-identity source; it abbreviates commits and can be truncated.
+   freshness. The unpaginated `gitnexus://repos` resource emits every registered
+   repository but abbreviates `lastCommit` to seven characters, so it is not an
+   exact-identity source. Use paginated `list_repos({limit, offset})` for full
+   repository paths and commits.
 3. **Record the repository path, worktree HEAD, and full index commit.**
 4. **Match your task to a skill below** and follow its workflow.
 
@@ -129,7 +131,7 @@ Lightweight reads (~100-500 tokens) for navigation:
 
 | Resource                                       | Content                                   |
 | ---------------------------------------------- | ----------------------------------------- |
-| `gitnexus://repos`                             | Paginated indexed-repository inventory    |
+| `gitnexus://repos`                             | Unpaginated inventory; seven-character commits |
 | `gitnexus://setup`                             | Setup guidance for the current MCP server |
 | `gitnexus://repo/{name}/context`               | Stats, staleness check                    |
 | `gitnexus://repo/{name}/clusters`              | All functional areas with cohesion scores |

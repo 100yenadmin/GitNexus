@@ -51,6 +51,37 @@ const MCP_EXACT_PACKAGE_REF =
   `https://github.com/electricsheephq/evaOS-gitnexus/releases/download/` +
   `electric%2Fv${_pkg.version}/gitnexus-${_pkg.version}.tgz`;
 
+function readGitnexusVersion(command: string): string | null {
+  try {
+    let program = command;
+    let args = ['--version'];
+
+    if (process.platform === 'win32' && /\.(cmd|bat)$/i.test(command)) {
+      // Keep the resolved wrapper as one cmd.exe argument even when its path
+      // contains spaces. Quotes/newlines are not valid Windows filename
+      // characters here; reject them rather than constructing shell text.
+      if (/[\r\n"]/u.test(command)) return null;
+      program = process.env.ComSpec || 'cmd.exe';
+      args = ['/d', '/s', '/c', `"${command}" --version`];
+    }
+
+    const output = execFileSync(program, args, {
+      encoding: 'utf-8',
+      timeout: 5000,
+      stdio: ['ignore', 'pipe', 'ignore'],
+      windowsHide: true,
+    });
+    return (
+      output
+        .split('\n')
+        .map((line) => line.trim())
+        .find((line) => /^\d+\.\d+\.\d+-electric\.\d+$/.test(line)) || null
+    );
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Build the `command` string written into an editor's hook settings, which the
  * editor shell-evaluates. `hookPath` is already forward-slash-normalized.
@@ -136,10 +167,11 @@ function resolveGitnexusBin(): string | null {
       // accept the Windows wrapper. If it is missing, fall back to the slower
       // npx entry instead of persisting a non-spawnable shim path.
       const cmdLine = lines.find((l) => /\.(cmd|bat)$/i.test(l));
-      return cmdLine || null;
+      return cmdLine && readGitnexusVersion(cmdLine) === _pkg.version ? cmdLine : null;
     }
 
-    return lines[0] || null;
+    const bin = lines[0] || null;
+    return bin && readGitnexusVersion(bin) === _pkg.version ? bin : null;
   } catch {
     return null;
   }

@@ -170,7 +170,9 @@ describe('setupClaudeCode', () => {
 
   it('uses global binary path when gitnexus is on PATH', async () => {
     setPlatform('darwin');
-    execFileSyncMock.mockReturnValueOnce('/usr/local/bin/gitnexus\n');
+    execFileSyncMock
+      .mockReturnValueOnce('/usr/local/bin/gitnexus\n')
+      .mockReturnValueOnce(`${PKG_VERSION}\n`);
 
     const { setupCommand } = await import('../../src/cli/setup.js');
     await setupCommand();
@@ -181,6 +183,23 @@ describe('setupClaudeCode', () => {
     expect(config.mcpServers.gitnexus).toEqual({
       command: '/usr/local/bin/gitnexus',
       args: ['mcp'],
+    });
+  });
+
+  it('rejects a PATH binary from a different GitNexus release', async () => {
+    setPlatform('darwin');
+    execFileSyncMock
+      .mockReturnValueOnce('/usr/local/bin/gitnexus\n')
+      .mockReturnValueOnce('1.6.10-electric.9\n');
+
+    const { setupCommand } = await import('../../src/cli/setup.js');
+    await setupCommand();
+
+    const raw = await fs.readFile(path.join(tempHome, '.claude.json'), 'utf-8');
+    const config = JSON.parse(raw);
+    expect(config.mcpServers.gitnexus).toEqual({
+      command: 'npx',
+      args: ['-y', MCP_EXACT_PACKAGE_REF, 'mcp'],
     });
   });
 
@@ -205,9 +224,11 @@ describe('setupClaudeCode', () => {
   it('picks .cmd wrapper from Windows where output (multiple lines)', async () => {
     setPlatform('win32');
     // `where gitnexus` on Windows returns the POSIX script first, then .cmd
-    execFileSyncMock.mockReturnValueOnce(
-      'C:\\Users\\dev\\AppData\\Roaming\\npm\\gitnexus\nC:\\Users\\dev\\AppData\\Roaming\\npm\\gitnexus.cmd\n',
-    );
+    execFileSyncMock
+      .mockReturnValueOnce(
+        'C:\\Users\\First Last\\AppData\\Roaming\\npm\\gitnexus\nC:\\Users\\First Last\\AppData\\Roaming\\npm\\gitnexus.cmd\n',
+      )
+      .mockReturnValueOnce(`${PKG_VERSION}\n`);
 
     const { setupCommand } = await import('../../src/cli/setup.js');
     await setupCommand();
@@ -216,17 +237,30 @@ describe('setupClaudeCode', () => {
     const config = JSON.parse(raw);
 
     expect(config.mcpServers.gitnexus).toEqual({
-      command: 'C:\\Users\\dev\\AppData\\Roaming\\npm\\gitnexus.cmd',
+      command: 'C:\\Users\\First Last\\AppData\\Roaming\\npm\\gitnexus.cmd',
       args: ['mcp'],
     });
+    expect(execFileSyncMock).toHaveBeenNthCalledWith(
+      2,
+      'cmd.exe',
+      [
+        '/d',
+        '/s',
+        '/c',
+        '"C:\\Users\\First Last\\AppData\\Roaming\\npm\\gitnexus.cmd" --version',
+      ],
+      expect.objectContaining({ encoding: 'utf-8' }),
+    );
   });
 
   it('handles CRLF line endings from Windows where output', async () => {
     setPlatform('win32');
     // Windows `where` produces CRLF line endings
-    execFileSyncMock.mockReturnValueOnce(
-      'C:\\Users\\dev\\AppData\\Roaming\\npm\\gitnexus\r\nC:\\Users\\dev\\AppData\\Roaming\\npm\\gitnexus.cmd\r\n',
-    );
+    execFileSyncMock
+      .mockReturnValueOnce(
+        'C:\\Users\\dev\\AppData\\Roaming\\npm\\gitnexus\r\nC:\\Users\\dev\\AppData\\Roaming\\npm\\gitnexus.cmd\r\n',
+      )
+      .mockReturnValueOnce(`${PKG_VERSION}\r\n`);
 
     const { setupCommand } = await import('../../src/cli/setup.js');
     await setupCommand();
@@ -242,9 +276,11 @@ describe('setupClaudeCode', () => {
 
   it('picks .bat wrapper when .cmd is not present', async () => {
     setPlatform('win32');
-    execFileSyncMock.mockReturnValueOnce(
-      'C:\\Users\\dev\\AppData\\Roaming\\npm\\gitnexus\nC:\\Users\\dev\\AppData\\Roaming\\npm\\gitnexus.bat\n',
-    );
+    execFileSyncMock
+      .mockReturnValueOnce(
+        'C:\\Users\\dev\\AppData\\Roaming\\npm\\gitnexus\nC:\\Users\\dev\\AppData\\Roaming\\npm\\gitnexus.bat\n',
+      )
+      .mockReturnValueOnce(`${PKG_VERSION}\n`);
 
     const { setupCommand } = await import('../../src/cli/setup.js');
     await setupCommand();
@@ -260,9 +296,11 @@ describe('setupClaudeCode', () => {
 
   it('handles uppercase .CMD extension (case-insensitive match)', async () => {
     setPlatform('win32');
-    execFileSyncMock.mockReturnValueOnce(
-      'C:\\Users\\dev\\AppData\\Roaming\\npm\\gitnexus\nC:\\Users\\dev\\AppData\\Roaming\\npm\\gitnexus.CMD\n',
-    );
+    execFileSyncMock
+      .mockReturnValueOnce(
+        'C:\\Users\\dev\\AppData\\Roaming\\npm\\gitnexus\nC:\\Users\\dev\\AppData\\Roaming\\npm\\gitnexus.CMD\n',
+      )
+      .mockReturnValueOnce(`${PKG_VERSION}\n`);
 
     const { setupCommand } = await import('../../src/cli/setup.js');
     await setupCommand();

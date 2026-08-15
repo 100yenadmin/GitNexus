@@ -51,14 +51,15 @@ https://github.com/user-attachments/assets/172685ba-8e54-4ea7-9ad1-e31a3398da72
 
 ```bash
 # 0. Install this exact Electric release
-npm install --global https://github.com/electricsheephq/evaOS-gitnexus/releases/download/electric%2Fv1.6.10-electric.10/gitnexus-1.6.10-electric.10.tgz
-gitnexus --version
+ELECTRIC_PREFIX=/path/to/gitnexus/1.6.10-electric.10
+npm install --global --prefix "$ELECTRIC_PREFIX" https://github.com/electricsheephq/evaOS-gitnexus/releases/download/electric%2Fv1.6.10-electric.10/gitnexus-1.6.10-electric.10.tgz
+"$ELECTRIC_PREFIX/bin/gitnexus" --version
 
 # 1. Index your repo (run from repo root)
-gitnexus analyze
+"$ELECTRIC_PREFIX/bin/gitnexus" analyze
 
 # 2. Connect your editors (one-time, auto-detects Claude Code, Cursor, Codex, …)
-gitnexus setup
+"$ELECTRIC_PREFIX/bin/gitnexus" setup
 ```
 
 That's it. `analyze` indexes the codebase, installs agent skills, registers Claude Code hooks, and creates `AGENTS.md` / `CLAUDE.md` context files — all in one command. `setup` writes the MCP config so your AI agent can use the graph.

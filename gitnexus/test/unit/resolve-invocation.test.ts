@@ -10,7 +10,14 @@ import {
   warnIfNpm11NpxRisk,
   NPX_REF,
 } from '../../src/cli/resolve-invocation.js';
-import { readFileSync, mkdtempSync, writeFileSync, chmodSync, rmSync } from 'node:fs';
+import {
+  readFileSync,
+  mkdtempSync,
+  mkdirSync,
+  writeFileSync,
+  chmodSync,
+  rmSync,
+} from 'node:fs';
 import { createRequire } from 'node:module';
 import path from 'node:path';
 import os from 'node:os';
@@ -549,7 +556,9 @@ describe('formatAnalyzeCommand end-to-end via the pure scan (#1938)', () => {
   });
 
   it('resolves `gitnexus analyze` when the exact Electric launcher is on PATH', () => {
-    binDir = mkdtempSync(path.join(os.tmpdir(), 'gn-e2e-'));
+    const root = mkdtempSync(path.join(os.tmpdir(), 'gn-e2e-'));
+    binDir = path.join(root, 'launcher with spaces');
+    mkdirSync(binDir);
     const isWin = process.platform === 'win32';
     const launcher = path.join(binDir, isWin ? 'gitnexus.cmd' : 'gitnexus');
     writeFileSync(

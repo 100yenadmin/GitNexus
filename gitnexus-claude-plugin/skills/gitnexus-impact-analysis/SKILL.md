@@ -20,7 +20,7 @@ description: "Use when the user wants to know what will break if they change som
 1. list_repos() → Resolve the exact indexed repository
 2. Record repository path, worktree status/HEAD, and full index commit
 3. Stop graph-backed conclusions when the index commit differs from HEAD
-4. Read `git status --short` and inspect every untracked file directly
+4. Read `git status --short`; inspect tracked edits and every untracked file directly
 5. impact({target: "X", direction: "upstream", repo: "<repo>"})
 6. READ gitnexus://repo/{name}/processes → Check affected execution flows
 7. detect_changes({scope: "all", repo: "<repo>", worktree: "<absolute path>"})
@@ -30,14 +30,17 @@ description: "Use when the user wants to know what will break if they change som
 Record the repository, worktree, worktree HEAD, and index commit. Read the
 repository context/status and compare the indexed commit with worktree HEAD
 before graph calls. If they differ, stop graph-backed conclusions and label the
-evidence stale. Reindexing writes repository and registry state, so run
+evidence stale. A matching commit does not cover tracked worktree edits: when
+they exist, label graph evidence `commit-matched/content-unverified` and do not
+draw definitive impact conclusions until the changed source is inspected.
+Reindexing writes repository and registry state, so run
 `node .gitnexus/run.cjs analyze` only with authority.
 
 ## Checklist
 
 ```
 - [ ] Pin the exact repo, worktree, HEAD, and index commit
-- [ ] Read `git status --short` and inspect untracked files before graph conclusions
+- [ ] Read `git status --short`; inspect tracked edits and untracked files before graph conclusions
 - [ ] impact({target, direction: "upstream", repo}) to find dependents
 - [ ] Review d=1 direct dependents first
 - [ ] Check high-confidence (>0.8) dependencies

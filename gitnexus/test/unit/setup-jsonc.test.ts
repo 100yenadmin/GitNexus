@@ -181,7 +181,9 @@ describe('setupOpenCode — JSONC preservation', () => {
   });
 
   it('updates existing gitnexus MCP entry without losing other keys', async () => {
-    execFileSyncMock.mockReturnValueOnce('/usr/local/bin/gitnexus\n');
+    execFileSyncMock
+      .mockReturnValueOnce('/usr/local/bin/gitnexus\n')
+      .mockReturnValueOnce(`${PKG_VERSION}\n`);
 
     const jsonc = `{
   // config comment
