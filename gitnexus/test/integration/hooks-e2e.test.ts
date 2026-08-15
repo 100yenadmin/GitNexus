@@ -115,11 +115,10 @@ describe.each(HOOKS)('hooks e2e ($name)', ({ name, path: hookPath }) => {
       expect(output!.additionalContext).toContain('gitnexus-1.6.10-electric.10.tgz analyze');
     });
 
-    it('auto-detects a PATH-installed gitnexus and suggests `gitnexus analyze` (no npx)', () => {
+    it('rejects an unverified PATH gitnexus and suggests the exact Electric artifact', () => {
       // No GITNEXUS_INVOCATION forcing — this exercises the hook's real PATH probe
-      // (#1938): a launcher on PATH must yield `gitnexus analyze`, never the
-      // npm-11 npx crash path. createGitNexusPathEntry scrubs any ambient gitnexus
-      // first, so the result cannot pass for the wrong reason.
+      // (#1938). The fixture has no Electric version receipt, so the hook must
+      // bypass it and use the exact release artifact.
       fs.writeFileSync(
         path.join(gitNexusDir, 'meta.json'),
         JSON.stringify({ lastCommit: 'abababababababababababababababababababab', stats: {} }),
@@ -141,14 +140,14 @@ describe.each(HOOKS)('hooks e2e ($name)', ({ name, path: hookPath }) => {
 
         const output = parseHookOutput(result.stdout);
         expect(output).not.toBeNull();
-        expect(output!.additionalContext).toContain('Run `gitnexus analyze`');
-        expect(output!.additionalContext).not.toContain('npx gitnexus');
+        expect(output!.additionalContext).toContain('gitnexus-1.6.10-electric.10.tgz analyze');
+        expect(output!.additionalContext).not.toContain('Run `gitnexus analyze`');
       } finally {
         gn.cleanup();
       }
     });
 
-    it('appends --embeddings to the auto-detected `gitnexus analyze` when the index had embeddings', () => {
+    it('appends --embeddings to the exact Electric artifact when the index had embeddings', () => {
       fs.writeFileSync(
         path.join(gitNexusDir, 'meta.json'),
         JSON.stringify({
@@ -173,8 +172,10 @@ describe.each(HOOKS)('hooks e2e ($name)', ({ name, path: hookPath }) => {
 
         const output = parseHookOutput(result.stdout);
         expect(output).not.toBeNull();
-        expect(output!.additionalContext).toContain('Run `gitnexus analyze --embeddings`');
-        expect(output!.additionalContext).not.toContain('npx gitnexus');
+        expect(output!.additionalContext).toContain(
+          'gitnexus-1.6.10-electric.10.tgz analyze --embeddings',
+        );
+        expect(output!.additionalContext).not.toContain('Run `gitnexus analyze --embeddings`');
       } finally {
         gn.cleanup();
       }
