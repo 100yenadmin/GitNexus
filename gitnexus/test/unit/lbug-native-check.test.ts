@@ -26,10 +26,13 @@ describe('checkLbugNative', () => {
       expect(result.message).toContain('ignore-scripts');
       expect(result.message).toContain('--allow-build=@ladybugdb/core');
       expect(result.message).toContain('pnpm add -g --allow-build=@ladybugdb/core');
-      const allowBuildIdx = result.message!.indexOf('--allow-build=@ladybugdb/core');
-      const dlxIdx = result.message!.indexOf('dlx gitnexus');
-      expect(allowBuildIdx).toBeGreaterThanOrEqual(0);
-      expect(dlxIdx).toBeGreaterThan(allowBuildIdx);
+      const pnpmIdx = result.message!.indexOf('pnpm add -g --allow-build=@ladybugdb/core');
+      const exactAssetIdx = result.message!.indexOf(
+        '/path/to/gitnexus-1.6.10-electric.10.tgz',
+        pnpmIdx,
+      );
+      expect(pnpmIdx).toBeGreaterThanOrEqual(0);
+      expect(exactAssetIdx).toBeGreaterThan(pnpmIdx);
     } finally {
       await fs.rm(tmpDir, { recursive: true, force: true });
     }
