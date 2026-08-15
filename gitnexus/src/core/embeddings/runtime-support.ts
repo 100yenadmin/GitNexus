@@ -116,8 +116,8 @@ export const localEmbeddingStackMissingMessage = (): string =>
     '    Add --cuda on CUDA GPU hosts (behind a proxy, also set',
     '    GLOBAL_AGENT_HTTPS_PROXY=<proxy-url> for the NuGet download).',
     '  - Or reinstall with the CUDA download skipped (CPU embeddings need no CUDA):',
-    '      ONNXRUNTIME_NODE_INSTALL=skip npm install -g gitnexus',
-    '      (Windows: set ONNXRUNTIME_NODE_INSTALL=skip && npm install -g gitnexus)',
+    '      ONNXRUNTIME_NODE_INSTALL=skip npm install -g /path/to/gitnexus-1.6.10-electric.10.tgz',
+    '      (Windows: set ONNXRUNTIME_NODE_INSTALL=skip && npm install -g /path/to/gitnexus-1.6.10-electric.10.tgz)',
     '  - Or point GITNEXUS_EMBEDDING_URL (with GITNEXUS_EMBEDDING_MODEL) at an',
     '    OpenAI-compatible /v1/embeddings endpoint to embed over HTTP.',
   ].join('\n');
@@ -143,8 +143,8 @@ export const localEmbeddingPrefixUnloadableMessage = (): string =>
     '>= 22.15 (on the 22.x line) or >= 23.5 (on the 23.x line). Either:',
     '  - Upgrade Node to a build that has module.registerHooks, or',
     '  - Reinstall the packages normally (works on every supported Node):',
-    '      ONNXRUNTIME_NODE_INSTALL=skip npm install -g gitnexus',
-    '      (Windows: set ONNXRUNTIME_NODE_INSTALL=skip && npm install -g gitnexus)',
+    '      ONNXRUNTIME_NODE_INSTALL=skip npm install -g /path/to/gitnexus-1.6.10-electric.10.tgz',
+    '      (Windows: set ONNXRUNTIME_NODE_INSTALL=skip && npm install -g /path/to/gitnexus-1.6.10-electric.10.tgz)',
   ].join('\n');
 
 /** Module specifiers whose absence means the optional embedding stack was pruned. */

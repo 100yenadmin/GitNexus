@@ -137,9 +137,11 @@ describe('STANDARD_SKILL_CATALOG distribution', () => {
     for (const file of guidance) {
       const text = fs.readFileSync(file, 'utf8');
       expect(text, file).not.toContain('gitnexus@latest');
-      expect(text, file).not.toMatch(/\bgitnexus@rc(?:\s|`|$)/);
-      expect(text, file).not.toMatch(/\bnpx(?:\s+-y)?\s+gitnexus(?:\s|`|$)/);
-      expect(text, file).not.toMatch(/\bnpm\s+(?:i|install)\s+-g\s+gitnexus(?:\s|`|@|$)/);
+      expect(text, file).not.toMatch(/\bgitnexus@rc\b/);
+      expect(text, file).not.toMatch(/\bnpx(?:\s+-y)?\s+gitnexus(?!@[\w<])\b/);
+      expect(text, file).not.toMatch(
+        /\bnpm\s+(?:i|install)\s+-g\s+gitnexus(?!@[\w<])\b/,
+      );
     }
   });
 });
