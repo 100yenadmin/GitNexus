@@ -171,8 +171,10 @@ in `test/integration/cfg/`.
    (known load-flakes). `node scripts/build.js` before worker/integration runs.
 3. Flag-off golden byte-identical (pipeline-graph-golden.test.ts).
 4. bench/cfg/measure.mjs --check (no fingerprint drift / budget regression).
-5. detect_changes() before commit; impact({direction:'upstream'}) before
-   editing shared symbols (KnowledgeGraph, RepoMeta, RelationshipType, codec).
+5. `detect_changes({scope: "all", repo: "<repo>", worktree: "<absolute path>"})`
+   before commit; `impact({target: "<shared symbol>", direction: "upstream",
+   repo: "<repo>"})` before editing shared symbols (KnowledgeGraph, RepoMeta,
+   RelationshipType, codec).
 ```
 
 ## Prior art (for deeper design questions)
