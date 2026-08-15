@@ -129,7 +129,7 @@ describe('antigravity hook adapter e2e', () => {
       expect(output).not.toBeNull();
       expect(output!.hookEventName).toBe('AfterTool');
       expect(output!.additionalContext).toContain('index is stale');
-      expect(output!.additionalContext).toContain('npx gitnexus@latest analyze');
+      expect(output!.additionalContext).toContain('gitnexus-1.6.10-electric.10.tgz analyze');
       // Strict-runner contract: the hint is NOT mirrored to stderr by default.
       expect(result.stderr).not.toContain('[GitNexus] index is stale');
     });
@@ -240,7 +240,9 @@ describe('antigravity hook adapter e2e', () => {
 
       const output = parseHookOutput(result.stdout);
       expect(output).not.toBeNull();
-      expect(output!.additionalContext).toContain('npx gitnexus@latest analyze --embeddings');
+      expect(output!.additionalContext).toContain(
+        'gitnexus-1.6.10-electric.10.tgz analyze --embeddings',
+      );
     });
 
     it('prefers gitnexus.json over meta.json when both are present (dual-write steady state)', () => {

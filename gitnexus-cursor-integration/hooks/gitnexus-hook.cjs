@@ -18,6 +18,9 @@
 const fs = require('fs');
 const path = require('path');
 const { spawnSync } = require('child_process');
+
+const ELECTRIC_PACKAGE_REF =
+  'https://github.com/electricsheephq/evaOS-gitnexus/releases/download/electric%2Fv1.6.10-electric.10/gitnexus-1.6.10-electric.10.tgz';
 const { acquireHookSlot } = require('./hook-lock.cjs');
 
 function readInput() {
@@ -210,7 +213,7 @@ function runGitNexusCli(cliPath, args, cwd, timeout) {
       windowsHide: true,
     });
   }
-  return spawnSync(isWin ? 'npx.cmd' : 'npx', ['-y', 'gitnexus', ...args], {
+  return spawnSync(isWin ? 'npx.cmd' : 'npx', ['-y', ELECTRIC_PACKAGE_REF, ...args], {
     encoding: 'utf-8',
     timeout: timeout + 5000,
     cwd,

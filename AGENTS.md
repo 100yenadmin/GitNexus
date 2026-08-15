@@ -76,7 +76,7 @@ commits, or posts.
 
 This project is indexed by GitNexus as **GitNexus** (26675 symbols, 35395 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
-> Index stale? Run `node .gitnexus/run.cjs analyze` from the project root — it auto-selects an available runner. No `.gitnexus/run.cjs` yet? `npx gitnexus analyze` (npm 11 crash → `npm i -g gitnexus`; #1939).
+> Index stale? Run `node .gitnexus/run.cjs analyze` from the project root — it auto-selects an available runner. No `.gitnexus/run.cjs` yet? Install the exact Electric GitHub release tarball, then run `gitnexus analyze`.
 
 ## Always Do
 
@@ -153,7 +153,7 @@ This project is indexed by GitNexus as **GitNexus** (26675 symbols, 35395 relati
 ```bash
 cd gitnexus && npm run dev                 # CLI: tsx watch mode
 cd gitnexus-web && npm run dev             # Web UI: Vite on port 5173
-npx gitnexus serve                         # HTTP API on port 4747 (from any indexed repo)
+gitnexus serve                             # HTTP API on port 4747 (from any indexed repo)
 ```
 
 ### Testing

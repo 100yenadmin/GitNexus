@@ -29,8 +29,19 @@ function skillNames(root: string, flat: boolean): string[] {
     .sort();
 }
 
+function filesUnder(root: string): string[] {
+  return fs.readdirSync(root, { withFileTypes: true }).flatMap((entry) => {
+    const target = path.join(root, entry.name);
+    if (entry.isDirectory()) return filesUnder(target);
+    return entry.isFile() ? [target] : [];
+  });
+}
+
 describe('STANDARD_SKILL_CATALOG distribution', () => {
   const names = STANDARD_SKILL_CATALOG.map((entry) => entry.name).sort();
+  const analyzeProjectSkills = STANDARD_SKILL_CATALOG.filter((entry) => entry.analyzeProject).map(
+    (entry) => entry.name,
+  );
 
   it('exactly covers npm, Claude plugin, and Cursor skill copies', () => {
     expect(skillNames(path.join(REPO_ROOT, 'gitnexus', 'skills'), true)).toEqual(names);
@@ -40,6 +51,17 @@ describe('STANDARD_SKILL_CATALOG distribution', () => {
     expect(
       skillNames(path.join(REPO_ROOT, 'gitnexus-cursor-integration', 'skills'), false),
     ).toEqual(names);
+  });
+
+  it('keeps the existing six-skill analyze-time project install explicit', () => {
+    expect(analyzeProjectSkills).toEqual([
+      'gitnexus-cli',
+      'gitnexus-debugging',
+      'gitnexus-exploring',
+      'gitnexus-guide',
+      'gitnexus-impact-analysis',
+      'gitnexus-refactoring',
+    ]);
   });
 
   it.each(STANDARD_SKILL_CATALOG)(
@@ -98,21 +120,26 @@ describe('STANDARD_SKILL_CATALOG distribution', () => {
   });
 
   it('rejects floating package references from distributed MCP guidance', () => {
-    const guidance = [
-      'README.md',
-      'gitnexus/README.md',
-      'Documentation/kilo-code-mcp.md',
-      'gitnexus-cursor-integration/README.md',
-      ...STANDARD_SKILL_CATALOG.flatMap(({ name }) => [
-        path.relative(REPO_ROOT, canonical(name)),
-        ...distributed(name).map((file) => path.relative(REPO_ROOT, file)),
-      ]),
-    ];
+    const guidance = new Set([
+      path.join(REPO_ROOT, 'README.md'),
+      path.join(REPO_ROOT, 'AGENTS.md'),
+      path.join(REPO_ROOT, 'CLAUDE.md'),
+      path.join(REPO_ROOT, '.devcontainer', 'README.md'),
+      path.join(REPO_ROOT, 'gitnexus', 'README.md'),
+      path.join(REPO_ROOT, 'Documentation', 'kilo-code-mcp.md'),
+      path.join(REPO_ROOT, 'gitnexus-cursor-integration', 'README.md'),
+      ...STANDARD_SKILL_CATALOG.flatMap(({ name }) => [canonical(name), ...distributed(name)]),
+      ...filesUnder(path.join(REPO_ROOT, 'gitnexus', 'src')),
+      ...filesUnder(path.join(REPO_ROOT, 'gitnexus', 'hooks')),
+      ...filesUnder(path.join(REPO_ROOT, 'gitnexus-claude-plugin', 'hooks')),
+      ...filesUnder(path.join(REPO_ROOT, 'gitnexus-cursor-integration', 'hooks')),
+    ]);
     for (const file of guidance) {
-      const text = fs.readFileSync(path.join(REPO_ROOT, file), 'utf8');
+      const text = fs.readFileSync(file, 'utf8');
       expect(text, file).not.toContain('gitnexus@latest');
-      expect(text, file).not.toMatch(/\bnpx(?:\s+-y)?\s+gitnexus(?:\s|$)/);
-      expect(text, file).not.toMatch(/\bnpm\s+(?:i|install)\s+-g\s+gitnexus(?:\s|$)/);
+      expect(text, file).not.toMatch(/\bgitnexus@rc(?:\s|`|$)/);
+      expect(text, file).not.toMatch(/\bnpx(?:\s+-y)?\s+gitnexus(?:\s|`|$)/);
+      expect(text, file).not.toMatch(/\bnpm\s+(?:i|install)\s+-g\s+gitnexus(?:\s|`|@|$)/);
     }
   });
 });

@@ -372,22 +372,13 @@ Installed automatically by both `gitnexus analyze` (per-repo) and `gitnexus setu
 
 ## Release candidates
 
-Stable releases publish to the default `latest` dist-tag. When a pull request
-with non-documentation changes merges into `main`, an automated workflow also
-publishes a prerelease build under the `rc` dist-tag, so early adopters can
-try in-flight fixes without waiting for the next stable cut. (Docs-only
-merges are skipped.)
+Electric releases do not follow upstream npm prerelease tags. Install the exact
+Electric GitHub release tarball; revisit upstream only after a non-prerelease
+tag is published and reviewed.
 
-```bash
-# Try the latest release candidate (pre-stable — may change at any time)
-npm install -g gitnexus@rc
-# — or —
-npx gitnexus@rc analyze
-```
-
-Release-candidate versions follow the standard semver prerelease format
+Upstream release-candidate versions follow the standard semver prerelease format
 `X.Y.Z-rc.N`, where `X.Y.Z` is the next stable target (bumped from the
-current `latest` by patch by default; `minor` or `major` when kicking off a
+current stable release by patch by default; `minor` or `major` when kicking off a
 bigger cycle) and `N` increments per published rc. Example sequence:
 `1.6.2-rc.1`, `1.6.2-rc.2`, …, then once `1.6.2` ships stable,
 `1.6.3-rc.1`. See the [Releases page](https://github.com/abhigyanpatwari/GitNexus/releases)
@@ -464,7 +455,7 @@ npm install -g /path/to/gitnexus-1.6.10-electric.10.tgz
 
 `onnxruntime-node`'s postinstall downloads optional CUDA GPU binaries from `api.nuget.org` — outside the npm registry, so registry mirrors don't cover it, and its proxy layer (`global-agent`) ignores the standard `HTTP_PROXY`/`HTTPS_PROXY` variables and rejects 302 redirects ([#2370](https://github.com/abhigyanpatwari/GitNexus/issues/2370)).
 
-Since the packages are optional dependencies, a failed download no longer breaks `npm install -g gitnexus` — npm skips the embedding stack and everything else works. The stack then **self-heals on demand**: the first `gitnexus analyze --embeddings` (or an explicit `gitnexus embeddings install`) fetches it through your configured npm registry — mirrors and proxies apply, no NuGet download involved — into `~/.gitnexus/embedding-runtime`.
+Since the packages are optional dependencies, a failed download no longer breaks installation of the exact Electric tarball — npm skips the embedding stack and everything else works. The stack then **self-heals on demand**: the first `gitnexus analyze --embeddings` (or an explicit `gitnexus embeddings install`) fetches it through your configured npm registry — mirrors and proxies apply, no NuGet download involved — into `~/.gitnexus/embedding-runtime`.
 
 ```bash
 # heal a proxy-degraded install manually (CPU embeddings; registry-only)
@@ -479,7 +470,7 @@ GLOBAL_AGENT_HTTPS_PROXY=<proxy-url> gitnexus embeddings install --cuda
 
 The prefix defaults to `~/.gitnexus/embedding-runtime`; set `GITNEXUS_EMBEDDING_RUNTIME_DIR` to install it elsewhere (e.g. a writable path in a container).
 
-> **Node requirement for the on-demand prefix:** the self-heal loads the prefixed packages via `module.registerHooks`, available on Node **≥ 22.15** (on the 22.x line) or **≥ 23.5** (on the 23.x line). On an older Node the packages install but can't be loaded from the prefix — reinstall them into the install itself instead (works on every supported Node): `ONNXRUNTIME_NODE_INSTALL=skip npm install -g gitnexus` (Windows: `set ONNXRUNTIME_NODE_INSTALL=skip && npm install -g gitnexus`). Skipping only the CUDA download keeps full CPU embeddings (CPU embeddings don't need it). Check the result any time with `gitnexus doctor` (Embeddings → Support line).
+> **Node requirement for the on-demand prefix:** the self-heal loads the prefixed packages via `module.registerHooks`, available on Node **≥ 22.15** (on the 22.x line) or **≥ 23.5** (on the 23.x line). On an older Node the packages install but can't be loaded from the prefix — reinstall the exact Electric tarball with `ONNXRUNTIME_NODE_INSTALL=skip`. Skipping only the CUDA download keeps full CPU embeddings (CPU embeddings don't need it). Check the result any time with `gitnexus doctor` (Embeddings → Support line).
 
 ### Analyze warns about unavailable FTS or VECTOR extensions
 

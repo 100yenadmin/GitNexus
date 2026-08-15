@@ -19,7 +19,7 @@ const {
   hasGitNexusDbLockedByGitNexusServer,
   resolveUnixGuardTimeout,
 } = require('./hook-db-lock-probe.cjs');
-const { formatAnalyzeCommand } = require('./resolve-analyze-cmd.cjs');
+const { formatAnalyzeCommand, NPX_REF } = require('./resolve-analyze-cmd.cjs');
 
 /**
  * Read JSON input from stdin synchronously.
@@ -335,11 +335,11 @@ function runGitNexusCli(cliPath, args, cwd, timeout) {
           String(Math.ceil((timeout + 5000) / 1000) + 1),
           'npx',
           '-y',
-          'gitnexus',
+          NPX_REF,
           ...args,
         ],
       ]
-    : [isWin ? 'npx.cmd' : 'npx', ['-y', 'gitnexus', ...args]];
+    : [isWin ? 'npx.cmd' : 'npx', ['-y', NPX_REF, ...args]];
   return spawnSync(cmd, cmdArgs, {
     encoding: 'utf-8',
     timeout: timeout + 5000,

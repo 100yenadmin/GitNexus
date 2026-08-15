@@ -87,5 +87,5 @@ Empty stdout means "no augmentation, continue normally" — the hook never block
 ## Troubleshooting
 
 - **Nothing happens** — Confirm Cursor is on 2.4+ and the project root has `.cursor/hooks.json` plus both hook files at `hooks/gitnexus-hook.cjs` and `hooks/hook-lock.cjs`. Then run `gitnexus list` to confirm the project is indexed.
-- **`gitnexus` not found** — The hook prefers a locally-resolvable `gitnexus/dist/cli/index.js` and falls back to `npx -y gitnexus`. Install globally with `npm i -g gitnexus` to skip the npx cold-start latency.
+- **`gitnexus` not found** — Install the exact Electric GitHub release tarball and ensure its `gitnexus` launcher is available on `PATH`; the hook never follows an npm dist-tag.
 - **Wrong pattern extracted** — Set `GITNEXUS_DEBUG=1` and run a tool call. The raw stdin payload is logged to stderr; use it to confirm Cursor's actual `tool_input` field names against the table above. If they differ, file an issue with the captured payload.

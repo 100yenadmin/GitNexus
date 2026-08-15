@@ -130,7 +130,7 @@ describe('analyzeCommand non-4K page-size error handling (#1231)', () => {
     );
     expect(hint).toBeDefined();
     expect(hint?.msg).toContain('0.18.0');
-    expect(hint?.msg).toContain('npm install -g gitnexus@latest');
+    expect(hint?.msg).toContain('gitnexus-1.6.10-electric.10.tgz');
     // The raw native error text is embedded so users can attach it to reports
     // (#2424 review P2) — and the page-size line renders the mocked probe.
     expect(hint?.msg).toContain(PI5_COPY_ERROR);
@@ -173,7 +173,7 @@ describe('analyzeCommand non-4K page-size error handling (#1231)', () => {
     );
     expect(hint).toBeDefined();
     expect(hint?.msg).toContain('issues/1231');
-    expect(hint?.msg).not.toContain('npm install -g gitnexus@latest');
+    expect(hint?.msg).not.toContain('gitnexus-1.6.10-electric.10.tgz');
     // The report-a-bug path asks for "the full error message above" — the
     // embedded raw text is what makes that instruction fulfillable.
     expect(hint?.msg).toContain(PI5_COPY_ERROR);
@@ -233,7 +233,7 @@ describe('analyzeCommand non-4K page-size error handling (#1231)', () => {
     // review R2) — name the unknown state, keep the upgrade instruction.
     expect(hint?.msg).toContain('version is unknown');
     expect(hint?.msg).not.toContain('(unknown) assumes');
-    expect(hint?.msg).toContain('npm install -g gitnexus@latest');
+    expect(hint?.msg).toContain('gitnexus-1.6.10-electric.10.tgz');
 
     cap.restore();
   });

@@ -187,8 +187,8 @@ ${tableBody}`
   // full bootstrap + npm-11 fallback (`node.target is null` npx install crash).
   const runner = `node ${runnerPath}`;
   const bootstrapNote =
-    `No \`${runnerPath}\` yet? \`npx gitnexus analyze\` ` +
-    '(npm 11 crash → `npm i -g gitnexus`; #1939).';
+    `No \`${runnerPath}\` yet? Install the exact Electric GitHub release tarball, then run ` +
+    '`gitnexus analyze`.';
 
   return `${GITNEXUS_START_MARKER}
 # GitNexus — Code Intelligence

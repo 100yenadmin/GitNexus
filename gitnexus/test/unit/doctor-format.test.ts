@@ -139,7 +139,7 @@ describe('doctor page-size lines (#1231, #2424 review)', () => {
     // helper extraction against output drift.
     expect(lines[1]).toBe(
       `  ${padDisplayEnd('', 10)}⚠ non-4K page size with @ladybugdb/core < 0.18.0 — ` +
-        `'gitnexus analyze' may fail during COPY (#1231). Upgrade gitnexus (npm install -g gitnexus@latest).`,
+        `'gitnexus analyze' may fail during COPY (#1231). Reinstall the exact Electric GitHub release tarball.`,
     );
   });
 
@@ -162,7 +162,7 @@ describe('doctor page-size lines (#1231, #2424 review)', () => {
     expect(lines).toHaveLength(2);
     expect(lines[1]).toContain('an unknown @ladybugdb/core version (may predate 0.18.0)');
     expect(lines[1]).not.toContain('with @ladybugdb/core < 0.18.0');
-    expect(lines[1]).toContain('npm install -g gitnexus@latest');
+    expect(lines[1]).toContain('exact Electric GitHub release tarball');
   });
 });
 

@@ -79,8 +79,10 @@ describe('resolve-analyze-cmd.cjs (canonical invocation resolver)', () => {
     delete process.env.GITNEXUS_INVOCATION;
   });
 
-  it('standardizes the invocation ref on gitnexus@latest', () => {
-    expect(cjs.NPX_REF).toBe('gitnexus@latest');
+  it('pins the invocation ref to the exact Electric GitHub release artifact', () => {
+    expect(cjs.NPX_REF).toContain('electricsheephq/evaOS-gitnexus/releases/download/');
+    expect(cjs.NPX_REF).toContain('gitnexus-1.6.10-electric.10.tgz');
+    expect(cjs.NPX_REF).not.toContain('@latest');
   });
 
   it('formats each forced mode, with and without --embeddings', () => {
@@ -196,7 +198,7 @@ describe('resolve-analyze-cmd.cjs (canonical invocation resolver)', () => {
 
   it('formatDocumentationDlxCommand always includes allow-build for committed docs', () => {
     expect(cjs.formatDocumentationDlxCommand('analyze')).toContain('--allow-build=@ladybugdb/core');
-    expect(cjs.formatDocumentationDlxCommand('analyze')).toContain('gitnexus@latest analyze');
+    expect(cjs.formatDocumentationDlxCommand('analyze')).toContain(`${cjs.NPX_REF} analyze`);
   });
 
   it('lets GITNEXUS_INVOCATION override the probe without consulting it', () => {
@@ -282,7 +284,7 @@ describe('warnIfNpm11NpxRisk (#1939 npm-11 nudge)', () => {
     expect(write).toHaveBeenCalledTimes(1);
     expect(String(write.mock.calls[0]?.[0])).toContain('node.target is null');
     expect(String(write.mock.calls[0]?.[0])).toContain('--allow-build=@ladybugdb/core');
-    expect(String(write.mock.calls[0]?.[0])).toContain(`gitnexus@latest analyze`);
+    expect(String(write.mock.calls[0]?.[0])).toContain(`${cjs.NPX_REF} analyze`);
     write.mockRestore();
   });
 
@@ -336,7 +338,7 @@ describe('buildRunnerArgv (project-local runner exec, #1945)', () => {
   it('prefixes the registry ref for npx mode', () => {
     expect(cjs.buildRunnerArgv('npx', ['analyze'])).toEqual({
       program: 'npx',
-      args: ['gitnexus@latest', 'analyze'],
+      args: [cjs.NPX_REF, 'analyze'],
     });
   });
 
@@ -356,7 +358,7 @@ describe('buildRunnerArgv (project-local runner exec, #1945)', () => {
       '--allow-build=gitnexus',
       '--allow-build=tree-sitter',
     ]);
-    expect(args.slice(dlxIdx)).toEqual(['dlx', 'gitnexus@latest', 'analyze']);
+    expect(args.slice(dlxIdx)).toEqual(['dlx', cjs.NPX_REF, 'analyze']);
   });
 
   it('widens the pnpm allow-build set when --embeddings is requested', () => {

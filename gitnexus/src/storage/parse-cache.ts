@@ -37,7 +37,7 @@ import type { ParseWorkerResult } from '../core/ingestion/workers/parse-worker.j
  *     Any release that ships an updated tree-sitter grammar or revised
  *     extractor logic implies a version bump in package.json, which
  *     automatically invalidates the on-disk cache. Without this, a user
- *     running `npm i -g gitnexus@latest` after a parser-affecting
+ *     reinstalling the exact Electric GitHub release after a parser-affecting
  *     release would silently replay pre-upgrade ParseWorkerResults
  *     against the new graph schema (Bugbot/Claude review on #1479).
  *

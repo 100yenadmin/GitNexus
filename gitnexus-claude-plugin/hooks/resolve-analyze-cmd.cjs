@@ -30,7 +30,8 @@ const { execFileSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
-const NPX_REF = 'gitnexus@latest';
+const NPX_REF =
+  'https://github.com/electricsheephq/evaOS-gitnexus/releases/download/electric%2Fv1.6.10-electric.10/gitnexus-1.6.10-electric.10.tgz';
 
 // Native packages whose postinstall must run under pnpm 10+ (blocked by default).
 const PNPM_ALLOW_BUILD_BASE = ['@ladybugdb/core', 'gitnexus', 'tree-sitter'];

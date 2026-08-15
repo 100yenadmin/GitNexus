@@ -87,7 +87,7 @@ describe.each(HOOKS)('hooks e2e ($name)', ({ name, path: hookPath }) => {
       const output = parseHookOutput(result.stdout);
       expect(output).not.toBeNull();
       expect(output!.additionalContext).toContain('stale');
-      expect(output!.additionalContext).toContain('npx gitnexus@latest analyze');
+      expect(output!.additionalContext).toContain('gitnexus-1.6.10-electric.10.tgz analyze');
     });
 
     it('prefers pnpm dlx when GITNEXUS_INVOCATION=pnpm', () => {
@@ -112,7 +112,7 @@ describe.each(HOOKS)('hooks e2e ($name)', ({ name, path: hookPath }) => {
       const output = parseHookOutput(result.stdout);
       expect(output).not.toBeNull();
       expect(output!.additionalContext).toContain('--allow-build=@ladybugdb/core');
-      expect(output!.additionalContext).toContain('gitnexus@latest analyze');
+      expect(output!.additionalContext).toContain('gitnexus-1.6.10-electric.10.tgz analyze');
     });
 
     it('auto-detects a PATH-installed gitnexus and suggests `gitnexus analyze` (no npx)', () => {
@@ -231,7 +231,9 @@ describe.each(HOOKS)('hooks e2e ($name)', ({ name, path: hookPath }) => {
 
       const output = parseHookOutput(result.stdout);
       expect(output).not.toBeNull();
-      expect(output!.additionalContext).toContain('npx gitnexus@latest analyze --embeddings');
+      expect(output!.additionalContext).toContain(
+        'gitnexus-1.6.10-electric.10.tgz analyze --embeddings',
+      );
     });
 
     it('treats missing meta.json as stale', () => {

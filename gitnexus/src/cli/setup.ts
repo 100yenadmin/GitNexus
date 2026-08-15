@@ -42,7 +42,7 @@ const execFileAsync = promisify(execFile);
 // connect. Pinning to the installed version means subsequent invocations
 // skip the npm-registry metadata roundtrip (and stay reproducible until
 // the user upgrades). Static configs and READMEs intentionally use
-// `gitnexus@latest` since they're quickstart docs, not persisted state.
+// the exact Electric release since they're quickstart docs, not persisted state.
 const _require = createRequire(import.meta.url);
 const _pkg = _require('../../package.json') as { version?: unknown };
 if (typeof _pkg.version !== 'string' || !_pkg.version) {
@@ -51,7 +51,7 @@ if (typeof _pkg.version !== 'string' || !_pkg.version) {
   );
 }
 // Version-pinned ref for the persisted MCP entry — deliberately distinct from
-// the cjs's exported `gitnexus@latest` hint ref (resolve-analyze-cmd.cjs); the
+// the cjs's exported exact Electric hint ref (resolve-analyze-cmd.cjs); the
 // two are not unified (see the comment above and that file's MCP_PINNED_REF).
 const MCP_PINNED_REF = `gitnexus@${_pkg.version}`;
 
@@ -159,7 +159,7 @@ function resolveGitnexusBin(): string | null {
  * persisted user config matches the installed package.
  *
  * Falls back to npx when the binary isn't on PATH — e.g. first-time
- * users who ran `npx gitnexus analyze` but haven't done `npm i -g`.
+ * users who ran an exact package command but have not installed the release.
  */
 function getMcpEntry() {
   const bin = resolveGitnexusBin();

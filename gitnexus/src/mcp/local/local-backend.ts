@@ -1719,7 +1719,7 @@ export class LocalBackend {
    * Limitation: in MCP stdio server mode `process.cwd()` is the
    * server's CWD at start time, *not* the agent client's CWD. The
    * warning therefore only fires when the MCP server itself was
-   * launched from inside a sibling clone (typical for `npx gitnexus
+   * launched from inside a sibling clone (typical for `gitnexus
    * serve` from a polecat workspace). Surfacing the client's CWD
    * would require a per-tool-call `cwd` parameter — out of scope for
    * the current MCP contract.

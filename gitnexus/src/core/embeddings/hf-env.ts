@@ -216,7 +216,7 @@ export async function withHfDownloadRetry<T>(
   // Resolve effective values — explicit options take precedence over env vars,
   // which take precedence over built-in defaults. This lets users lower the
   // per-attempt timeout without rebuilding (e.g.
-  //   HF_DOWNLOAD_TIMEOUT_MS=60000 npx gitnexus analyze --embeddings
+  //   HF_DOWNLOAD_TIMEOUT_MS=60000 gitnexus analyze --embeddings
   // reduces the worst-case wait from 15 minutes to ~3 minutes).
   //
   // Upper bounds are clamped to prevent accidental runaway configuration:
