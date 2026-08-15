@@ -6,6 +6,8 @@ import { useTranslation } from 'react-i18next';
 // ── Design constants ─────────────────────────────────────────────────────────
 
 const isDev = import.meta.env.DEV;
+const electricReleaseTarball =
+  'https://github.com/electricsheephq/evaOS-gitnexus/releases/download/electric%2Fv1.6.10-electric.10/gitnexus-1.6.10-electric.10.tgz';
 
 // ── Copy-to-clipboard button ─────────────────────────────────────────────────
 
@@ -207,7 +209,9 @@ interface OnboardingGuideProps {
 
 export const OnboardingGuide = ({ isPolling }: OnboardingGuideProps) => {
   const { t } = useTranslation('onboarding');
-  const primary = isDev ? 'npm run --prefix gitnexus serve' : 'npx gitnexus@latest serve';
+  const primary = isDev
+    ? 'npm run --prefix gitnexus serve'
+    : `npx -y ${electricReleaseTarball} serve`;
   const termLabel = isDev ? t('guide.startBackend') : t('guide.terminal');
 
   // Step states: step 1 = copy command, step 2 = run/wait, step 3 = auto-connect
@@ -268,7 +272,7 @@ export const OnboardingGuide = ({ isPolling }: OnboardingGuideProps) => {
                 <div className="h-px flex-1 bg-border-subtle" />
               </div>
               <TerminalWindow
-                command="npm install -g gitnexus && gitnexus serve"
+                command={`npm install --global ${electricReleaseTarball} && gitnexus serve`}
                 label={t('guide.globalInstall')}
                 isActive={false}
               />

@@ -2,7 +2,7 @@
  * Single source of truth for how docs, hooks, and warnings invoke gitnexus.
  *
  * Automatically selects a working invocation path:
- * 1. Global `gitnexus` on PATH (best — no install step)
+ * 1. Exact Electric `gitnexus` on PATH (best — no install step)
  * 2. npm 11+ with pnpm on PATH → `pnpm --allow-build=… dlx` (avoids the npx
  *    arborist crash *and* pnpm 10+ ignored-build-script failures, #1939)
  * 3. npm < 11 with npm on PATH → `npx` (works; simpler than pnpm dlx)
@@ -32,6 +32,7 @@ const path = require('path');
 
 const NPX_REF =
   'https://github.com/electricsheephq/evaOS-gitnexus/releases/download/electric%2Fv1.6.10-electric.10/gitnexus-1.6.10-electric.10.tgz';
+const EXPECTED_GITNEXUS_VERSION = '1.6.10-electric.10';
 
 // Native packages whose postinstall must run under pnpm 10+ (blocked by default).
 const PNPM_ALLOW_BUILD_BASE = ['@ladybugdb/core', 'gitnexus', 'tree-sitter'];
@@ -140,6 +141,26 @@ function probeVersion(command) {
   }
 }
 
+function probeGitnexusVersion(command) {
+  try {
+    const output = execFileSync(command, ['--version'], {
+      encoding: 'utf-8',
+      timeout: PROBE_TIMEOUT_MS,
+      stdio: ['ignore', 'pipe', 'ignore'],
+      windowsHide: true,
+      shell: process.platform === 'win32',
+    });
+    return (
+      output
+        .split('\n')
+        .map((line) => line.trim())
+        .find((line) => /^\d+\.\d+\.\d+-electric\.\d+$/.test(line)) || null
+    );
+  } catch {
+    return null;
+  }
+}
+
 // `deps` is the single injection seam: an explicitly provided key — including a
 // `null` value, detected via `in` — is honored as-is so tests can simulate an
 // absent tool without spawning; an absent key falls through to the real probe.
@@ -177,17 +198,25 @@ function formatDocumentationDlxCommand(gitnexusArgs, options = {}) {
 }
 
 /**
- * Resolve `gitnexus` | `pnpm` | `npx`. `GITNEXUS_INVOCATION` forces a mode
- * (test/escape hatch). `probe` is injectable so the preference order can be
- * unit-tested without spawning; it defaults to the real PATH probe. `deps` can
- * inject `{ npmMajor, pnpmMajor }` for tests.
+ * Resolve `gitnexus` | `pnpm` | `npx`. A PATH `gitnexus` is accepted only when
+ * `--version` matches this Electric release. `GITNEXUS_INVOCATION` forces a mode
+ * for an explicitly managed/tested launcher. `probe` is injectable so the
+ * preference order can be unit-tested without spawning; it defaults to the real
+ * PATH probe. `deps` can inject versions for tests.
  */
 function resolveInvocationMode(probe = resolveOnPath, deps = {}) {
   const forced = process.env.GITNEXUS_INVOCATION?.trim().toLowerCase();
   if (forced === 'gitnexus' || forced === 'pnpm' || forced === 'npx') {
     return forced;
   }
-  if (probe('gitnexus', true)) return 'gitnexus';
+  const gitnexusPath = probe('gitnexus', true);
+  const gitnexusVersion =
+    'gitnexusVersion' in deps
+      ? deps.gitnexusVersion
+      : gitnexusPath
+        ? probeGitnexusVersion(gitnexusPath)
+        : null;
+  if (gitnexusPath && gitnexusVersion === EXPECTED_GITNEXUS_VERSION) return 'gitnexus';
 
   const npmMajor = getNpmMajorVersion(deps);
   // pnpm presence: prefer an explicit `pnpmPresent` flag (set by
@@ -235,12 +264,24 @@ function formatAnalyzeCommand(options = {}, deps = {}) {
     return cache.get(key);
   };
   let resolved = deps;
+  const forced = process.env.GITNEXUS_INVOCATION?.trim().toLowerCase();
+  const gitnexusPath =
+    forced === 'gitnexus' || forced === 'pnpm' || forced === 'npx' ? null : probe('gitnexus', true);
+  const gitnexusVersion =
+    'gitnexusVersion' in deps
+      ? deps.gitnexusVersion
+      : gitnexusPath
+        ? probeGitnexusVersion(gitnexusPath)
+        : null;
+  if (!('gitnexusVersion' in deps)) {
+    resolved = { ...resolved, gitnexusVersion };
+  }
   if (!('pnpmMajor' in deps)) {
-    const forced = process.env.GITNEXUS_INVOCATION?.trim().toLowerCase();
     // pnpm is only consulted when no non-pnpm mode is already certain: forced
-    // gitnexus/npx never use pnpm, and a present global gitnexus wins outright.
+    // gitnexus/npx never use pnpm, and an exact Electric global gitnexus wins.
     const mightUsePnpm = forced === 'pnpm' || (forced !== 'gitnexus' && forced !== 'npx');
-    if (mightUsePnpm && (forced === 'pnpm' || !probe('gitnexus', true))) {
+    const hasExactGitnexus = Boolean(gitnexusPath) && gitnexusVersion === EXPECTED_GITNEXUS_VERSION;
+    if (mightUsePnpm && (forced === 'pnpm' || !hasExactGitnexus)) {
       const { major, minor } = probeVersion('pnpm');
       // Carry presence separately from version: when the version probe fails
       // (timeout, Corepack banner) but pnpm is on PATH, still treat it as
@@ -288,6 +329,7 @@ module.exports = {
   resolveOnPath,
   getNpmMajorVersion,
   NPX_REF,
+  EXPECTED_GITNEXUS_VERSION,
   PNPM_ALLOW_BUILD_BASE,
 };
 

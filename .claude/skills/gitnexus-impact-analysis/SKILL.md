@@ -18,10 +18,13 @@ description: "Use when the user wants to know what will break if they change som
 
 ```
 1. list_repos() → Resolve the exact indexed repository
-2. impact({target: "X", direction: "upstream", repo: "<repo>"})
-3. READ gitnexus://repo/{name}/processes → Check affected execution flows
-4. detect_changes({scope: "all", repo: "<repo>", worktree: "<absolute path>"})
-5. Assess risk and report to user
+2. Record repository path, worktree status/HEAD, and full index commit
+3. Stop graph-backed conclusions when the index commit differs from HEAD
+4. Read `git status --short` and inspect every untracked file directly
+5. impact({target: "X", direction: "upstream", repo: "<repo>"})
+6. READ gitnexus://repo/{name}/processes → Check affected execution flows
+7. detect_changes({scope: "all", repo: "<repo>", worktree: "<absolute path>"})
+8. Assess risk and report to user
 ```
 
 Record the repository, worktree, worktree HEAD, and index commit. Read the
@@ -34,12 +37,12 @@ evidence stale. Reindexing writes repository and registry state, so run
 
 ```
 - [ ] Pin the exact repo, worktree, HEAD, and index commit
+- [ ] Read `git status --short` and inspect untracked files before graph conclusions
 - [ ] impact({target, direction: "upstream", repo}) to find dependents
 - [ ] Review d=1 direct dependents first
 - [ ] Check high-confidence (>0.8) dependencies
 - [ ] READ processes to check affected execution flows
-- [ ] detect_changes({scope: "all", repo, worktree}) for the intended checkout
-- [ ] Read `git status --short`; inspect untracked files directly because Git diff excludes them
+- [ ] detect_changes({scope: "all", repo, worktree}) for the intended checkout after the untracked-file check
 - [ ] Treat partial, truncated, or UNKNOWN results as unresolved
 - [ ] Warn and obtain acknowledgement before edits when runtime risk is HIGH or CRITICAL
 - [ ] Assess risk level and report to user

@@ -111,8 +111,11 @@ describe('setupCommand skills integration', () => {
 
     const codexConfig = await fs.readFile(path.join(tempHome, '.codex', 'config.toml'), 'utf-8');
     expect(codexConfig).toContain('[mcp_servers.gitnexus]');
-    expect(codexConfig).toMatch(
-      /releases\/download\/electric%2Fv\d+\.\d+\.\d+-electric\.\d+\/gitnexus-\d+\.\d+\.\d+-electric\.\d+\.tgz/,
+    const packageVersion = JSON.parse(
+      await fs.readFile(path.join(process.cwd(), 'package.json'), 'utf-8'),
+    ).version;
+    expect(codexConfig).toContain(
+      `https://github.com/electricsheephq/evaOS-gitnexus/releases/download/electric%2Fv${packageVersion}/gitnexus-${packageVersion}.tgz`,
     );
 
     const codexSkill = await fs.readFile(

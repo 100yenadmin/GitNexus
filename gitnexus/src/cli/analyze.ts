@@ -1941,8 +1941,8 @@ const analyzeCommandImpl = async (
           `  (e.g. behind a corporate proxy or a regional firewall).\n` +
           `  Suggestions:\n` +
           `    1. Set HF_ENDPOINT to a mirror and retry:\n` +
-          `         HF_ENDPOINT=https://hf-mirror.com gitnexus analyze --embeddings\n` +
-          `         (Windows: set HF_ENDPOINT=https://hf-mirror.com && gitnexus analyze --embeddings)\n` +
+          `         HF_ENDPOINT=https://hf-mirror.com npx -y https://github.com/electricsheephq/evaOS-gitnexus/releases/download/electric%2Fv1.6.10-electric.10/gitnexus-1.6.10-electric.10.tgz analyze --embeddings\n` +
+          `         (Windows: set HF_ENDPOINT=https://hf-mirror.com && npx -y https://github.com/electricsheephq/evaOS-gitnexus/releases/download/electric%2Fv1.6.10-electric.10/gitnexus-1.6.10-electric.10.tgz analyze --embeddings)\n` +
           `    2. Check your proxy / VPN settings.\n` +
           `    3. Once downloaded the model is cached — future runs work offline.\n`,
         { recoveryHint: 'hf-endpoint-unreachable' },

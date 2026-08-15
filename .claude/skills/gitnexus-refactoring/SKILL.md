@@ -33,8 +33,11 @@ run it only with authority.
 ### Rename Symbol
 
 ```
+- [ ] Confirm the MCP server is attached to the exact intended checkout; rename has no worktree parameter
+- [ ] Require a clean worktree, or capture the tracked diff, Git status, and every untracked file as a baseline
 - [ ] rename({symbol_name: "oldName", new_name: "newName", dry_run: true, repo}) — preview edits
 - [ ] Review graph edits (high confidence) and text_search edits (review carefully)
+- [ ] Stop and re-preview if the baseline or checkout identity changed
 - [ ] If satisfied: rename({..., dry_run: false, repo}) — apply edits
 - [ ] Read Git status/diff and every affected untracked file directly
 - [ ] detect_changes({scope: "all", repo, worktree}) — graph-map the Git diff
@@ -44,6 +47,9 @@ run it only with authority.
 Preview and apply are separate recomputations, not an immutable transaction.
 There is no plan token or content hash binding apply to the preview. Recheck the
 worktree immediately before apply and re-preview after any intervening change.
+`rename` does not accept `worktree`; it operates on the checkout attached to the
+indexed repository. Confirm that checkout is the intended worktree before both
+preview and apply. Stop rather than applying when the identity cannot be proved.
 The current implementation may replace whole-file word matches, including in
 untracked files; Git-diff-based `detect_changes` cannot prove those untracked
 edits. Treat source/diff inspection and focused tests as the verification gate.

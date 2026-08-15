@@ -187,15 +187,14 @@ ${tableBody}`
   // full bootstrap + npm-11 fallback (`node.target is null` npx install crash).
   const runner = `node ${runnerPath}`;
   const bootstrapNote =
-    `No \`${runnerPath}\` yet? Install the exact Electric GitHub release tarball, then run ` +
-    '`gitnexus analyze`.';
+    'No runner? Install exact Electric `1.6.10-electric.10`; verify and run `gitnexus analyze` with authority.';
 
   return `${GITNEXUS_START_MARKER}
 # GitNexus — Code Intelligence
 
 This project is indexed by GitNexus as **${projectName}**${noStats ? '' : ` (${stats.nodes || 0} symbols, ${stats.edges || 0} relationships, ${stats.processes || 0} execution flows)`}. Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
-> Index stale? Run \`${runner} analyze\` from the project root — it auto-selects an available runner. ${bootstrapNote}
+> Stale index? Confirm repo/worktree status, index/HEAD, version/write authority before \`${runner} analyze\`. ${bootstrapNote}
 
 ## Always Do
 

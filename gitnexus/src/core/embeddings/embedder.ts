@@ -234,8 +234,8 @@ export const initEmbedder = async (
               ? `The configured endpoint (${process.env.HF_ENDPOINT}) may be unreachable.`
               : `huggingface.co may be unreachable from your network.\n` +
                 `  Set HF_ENDPOINT to a mirror and retry:\n` +
-                `    HF_ENDPOINT=https://hf-mirror.com gitnexus analyze --embeddings\n` +
-                `    (Windows: set HF_ENDPOINT=https://hf-mirror.com && gitnexus analyze --embeddings)`;
+                `    HF_ENDPOINT=https://hf-mirror.com npx -y https://github.com/electricsheephq/evaOS-gitnexus/releases/download/electric%2Fv1.6.10-electric.10/gitnexus-1.6.10-electric.10.tgz analyze --embeddings\n` +
+                `    (Windows: set HF_ENDPOINT=https://hf-mirror.com && npx -y https://github.com/electricsheephq/evaOS-gitnexus/releases/download/electric%2Fv1.6.10-electric.10/gitnexus-1.6.10-electric.10.tgz analyze --embeddings)`;
             throw new Error(`Failed to download embedding model: ${errMsg}\n  ${endpointHint}`);
           }
           if (isDev && (device === 'cuda' || device === 'dml')) {

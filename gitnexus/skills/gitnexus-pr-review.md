@@ -39,6 +39,12 @@ the same source before the review is described as graph-backed. Do not run
 `analyze`, reindex, clean, or mutate the registry unless the user authorized
 that side effect.
 
+Commit equality is necessary but not sufficient: analysis reads live tracked
+and untracked content while the stored index identity records only `HEAD`. Treat
+the graph as exact only when analysis-time clean-worktree/content provenance is
+available. Otherwise report it as commit-matched but content-unverified, and
+verify claims in the pinned source instead of presenting the graph as exact.
+
 When the exact graph already exists, pass identity explicitly:
 
 ```text
@@ -65,6 +71,9 @@ verdict as if it described the PR.
    behaviorally changed symbols.
 5. Inspect each direct dependent outside the diff. A direct dependency is a
    review lead, not proof that it breaks; verify the contract and caller source.
+   For a fully deleted symbol or file, the head graph cannot resolve the removed
+   node. Inspect the merge-base source and use bounded source/text search for
+   callers; label deletion impact incomplete rather than reporting low risk.
 6. Use `context({name, repo})` and exact process resources for key symbols.
 7. Read new files, generated files, configuration, and untracked content
    directly because graph and Git diff coverage may be incomplete.
@@ -99,7 +108,7 @@ speculation as defects. Do not infer safety from zero graph hits.
 - Merge base: <sha>
 - Worktree: <absolute path>
 - GitNexus index commit: <sha or unavailable>
-- Graph status: exact | stale | skipped
+- Graph status: exact | commit-matched/content-unverified | stale | skipped
 - Local states included: committed | staged | unstaged | untracked
 
 ### Findings

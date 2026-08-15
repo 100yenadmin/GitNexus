@@ -131,6 +131,7 @@ describe('STANDARD_SKILL_CATALOG distribution', () => {
       ...STANDARD_SKILL_CATALOG.flatMap(({ name }) => [canonical(name), ...distributed(name)]),
       ...filesUnder(path.join(REPO_ROOT, 'gitnexus', 'src')),
       ...filesUnder(path.join(REPO_ROOT, 'gitnexus', 'hooks')),
+      ...filesUnder(path.join(REPO_ROOT, 'gitnexus-web', 'src')),
       ...filesUnder(path.join(REPO_ROOT, 'gitnexus-claude-plugin', 'hooks')),
       ...filesUnder(path.join(REPO_ROOT, 'gitnexus-cursor-integration', 'hooks')),
     ]);
@@ -138,8 +139,11 @@ describe('STANDARD_SKILL_CATALOG distribution', () => {
       const text = fs.readFileSync(file, 'utf8');
       expect(text, file).not.toContain('gitnexus@latest');
       expect(text, file).not.toMatch(/\bgitnexus@rc\b/);
-      expect(text, file).not.toMatch(/\bnpx(?:\s+-y)?\s+gitnexus(?!@[\w<])\b/);
-      expect(text, file).not.toMatch(/\bnpm\s+(?:i|install)\s+-g\s+gitnexus(?!@[\w<])\b/);
+      expect(text, file).not.toMatch(/\bnpx(?:\s+-y)?\s+gitnexus(?:@[\w.-]+)?\b/);
+      expect(text, file).not.toMatch(/\bpnpm(?:\s+\S+)*\s+dlx\s+gitnexus(?:@[\w.-]+)?\b/);
+      expect(text, file).not.toMatch(
+        /\bnpm\s+(?:i|install)\s+(?:--global|-g)\s+gitnexus(?:@[\w.-]+)?\b/,
+      );
     }
   });
 });
@@ -174,6 +178,8 @@ describe('narrow electric skill contracts', () => {
   it('documents rename transaction and untracked-file limits', () => {
     const text = fs.readFileSync(canonical('gitnexus-refactoring'), 'utf8');
     expect(text).toContain('not an immutable transaction');
+    expect(text).toContain('`rename` does not accept `worktree`');
+    expect(text).toContain('Require a clean worktree');
     expect(text).toContain('untracked files');
     expect(text).toContain('`status: "partial"`');
     expect(text).toContain('`failed_files`');
@@ -209,6 +215,7 @@ describe('narrow electric skill contracts', () => {
     }
     expect(guide).toContain('`group_sync` rebuilds');
     expect(cli).toContain('GITNEXUS_EMBEDDING_API_KEY');
+    expect(cli).toContain('`--index-only` still updates');
     expect(cli).toContain('public, account-visible write');
     expect(cli).not.toContain('gitnexus@latest');
   });

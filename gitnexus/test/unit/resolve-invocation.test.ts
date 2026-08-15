@@ -39,7 +39,12 @@ const PLUGIN_CJS = path.resolve(
 interface CjsModule {
   formatAnalyzeCommand: (
     o?: { embeddings?: boolean },
-    deps?: { npmMajor?: number | null; pnpmMajor?: number | null; pnpmMinor?: number | null },
+    deps?: {
+      npmMajor?: number | null;
+      pnpmMajor?: number | null;
+      pnpmMinor?: number | null;
+      gitnexusVersion?: string | null;
+    },
   ) => string;
   formatDocumentationDlxCommand: (args: string, o?: { embeddings?: boolean }) => string;
   formatPnpmAllowBuildArgs: (
@@ -48,7 +53,12 @@ interface CjsModule {
   ) => string[];
   resolveInvocationMode: (
     probe?: (command: string, gitnexusWrapper?: boolean) => string | null,
-    deps?: { npmMajor?: number | null; pnpmMajor?: number | null; pnpmPresent?: boolean },
+    deps?: {
+      npmMajor?: number | null;
+      pnpmMajor?: number | null;
+      pnpmPresent?: boolean;
+      gitnexusVersion?: string | null;
+    },
   ) => 'gitnexus' | 'pnpm' | 'npx';
   resolveOnPath: (
     command: string,
@@ -61,6 +71,7 @@ interface CjsModule {
     deps?: { pnpmMajor?: number | null; pnpmMinor?: number | null },
   ) => { program: string; args: string[] };
   NPX_REF: string;
+  EXPECTED_GITNEXUS_VERSION: string;
 }
 
 // Require the real shipped artifact — the hook runtime loads this exact file, so
@@ -80,9 +91,10 @@ describe('resolve-analyze-cmd.cjs (canonical invocation resolver)', () => {
   });
 
   it('pins the invocation ref to the exact Electric GitHub release artifact', () => {
-    expect(cjs.NPX_REF).toContain('electricsheephq/evaOS-gitnexus/releases/download/');
-    expect(cjs.NPX_REF).toContain('gitnexus-1.6.10-electric.10.tgz');
-    expect(cjs.NPX_REF).not.toContain('@latest');
+    expect(cjs.NPX_REF).toBe(
+      'https://github.com/electricsheephq/evaOS-gitnexus/releases/download/electric%2Fv1.6.10-electric.10/gitnexus-1.6.10-electric.10.tgz',
+    );
+    expect(cjs.EXPECTED_GITNEXUS_VERSION).toBe('1.6.10-electric.10');
   });
 
   it('formats each forced mode, with and without --embeddings', () => {
@@ -108,7 +120,20 @@ describe('resolve-analyze-cmd.cjs (canonical invocation resolver)', () => {
   });
 
   it('auto-selects global gitnexus first', () => {
-    expect(cjs.resolveInvocationMode(() => '/usr/local/bin/gitnexus')).toBe('gitnexus');
+    expect(
+      cjs.resolveInvocationMode(() => '/usr/local/bin/gitnexus', {
+        gitnexusVersion: cjs.EXPECTED_GITNEXUS_VERSION,
+      }),
+    ).toBe('gitnexus');
+  });
+
+  it('rejects a PATH gitnexus whose version is not the exact Electric release', () => {
+    expect(
+      cjs.resolveInvocationMode(() => '/usr/local/bin/gitnexus', {
+        gitnexusVersion: '1.6.10',
+        npmMajor: 10,
+      }),
+    ).toBe('npx');
   });
 
   it('auto-selects pnpm on npm 11+ when pnpm is on PATH', () => {
@@ -523,16 +548,36 @@ describe('formatAnalyzeCommand end-to-end via the pure scan (#1938)', () => {
     delete process.env.GITNEXUS_INVOCATION;
   });
 
-  it('resolves `gitnexus analyze` when a launcher is the only thing on PATH', () => {
+  it('resolves `gitnexus analyze` when the exact Electric launcher is on PATH', () => {
     binDir = mkdtempSync(path.join(os.tmpdir(), 'gn-e2e-'));
     const isWin = process.platform === 'win32';
     const launcher = path.join(binDir, isWin ? 'gitnexus.cmd' : 'gitnexus');
-    writeFileSync(launcher, isWin ? '@echo off\r\nexit /b 0\r\n' : '#!/bin/sh\nexit 0\n');
+    writeFileSync(
+      launcher,
+      isWin
+        ? `@echo off\r\necho ${cjs.EXPECTED_GITNEXUS_VERSION}\r\n`
+        : `#!/bin/sh\nprintf '%s\\n' '${cjs.EXPECTED_GITNEXUS_VERSION}'\n`,
+    );
     if (!isWin) chmodSync(launcher, 0o755);
     // PATH reduced to just the launcher dir — the former `where`/`which` resolver
     // would have ENOENT'd here; the pure scan finds the launcher directly.
     process.env.PATH = binDir;
     expect(cjs.formatAnalyzeCommand()).toBe('gitnexus analyze');
+  });
+
+  it('rejects a different gitnexus version on PATH and uses the exact artifact', () => {
+    binDir = mkdtempSync(path.join(os.tmpdir(), 'gn-e2e-stale-'));
+    const isWin = process.platform === 'win32';
+    const launcher = path.join(binDir, isWin ? 'gitnexus.cmd' : 'gitnexus');
+    writeFileSync(
+      launcher,
+      isWin ? '@echo off\r\necho 1.6.10\r\n' : "#!/bin/sh\nprintf '%s\\n' '1.6.10'\n",
+    );
+    if (!isWin) chmodSync(launcher, 0o755);
+    process.env.PATH = binDir;
+    expect(cjs.formatAnalyzeCommand(undefined, { pnpmMajor: null })).toBe(
+      `npx ${cjs.NPX_REF} analyze`,
+    );
   });
 });
 

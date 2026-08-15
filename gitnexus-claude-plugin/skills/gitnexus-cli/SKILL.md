@@ -29,7 +29,10 @@ node .gitnexus/run.cjs analyze
 Run from the exact project root. This parses source, writes `.gitnexus/`,
 updates the global registry, writes `.gitnexus/run.cjs`, and may create/update
 CLAUDE.md, AGENTS.md, and project skills. Use `--index-only` when the approved
-action is limited to the index. Do not run against the wrong worktree.
+action excludes AI-context and skill generation. `--index-only` still updates
+the global registry and writes `.gitnexus/run.cjs`; those are permitted only
+when the caller authorized that complete write set. Do not run against the wrong
+worktree.
 
 | Flag           | Effect                                                           |
 | -------------- | ---------------------------------------------------------------- |
