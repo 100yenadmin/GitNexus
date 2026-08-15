@@ -1,11 +1,11 @@
 {
   "name": "gitnexus",
-  "description": "Code intelligence powered by a knowledge graph. Provides execution flow tracing, blast radius analysis, and augmented search across your codebase.",
-  "version": "1.6.10-electric.9",
+  "description": "Electric Sheep managed GitNexus skills and hooks for code intelligence.",
+  "version": "1.6.10-electric.10",
   "author": {
-    "name": "GitNexus"
+    "name": "Electric Sheep"
   },
-  "homepage": "https://github.com/abhigyanpatwari/GitNexus",
-  "repository": "https://github.com/abhigyanpatwari/GitNexus",
+  "homepage": "https://github.com/electricsheephq/evaOS-gitnexus",
+  "repository": "https://github.com/electricsheephq/evaOS-gitnexus",
   "keywords": ["code-intelligence", "knowledge-graph", "mcp", "static-analysis"]
 }

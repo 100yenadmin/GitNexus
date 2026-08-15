@@ -1,11 +1,12 @@
 ---
 name: gitnexus-impact-analysis
-description: Analyze blast radius before making code changes
+description: "Use when the user wants to know what will break if they change something, or needs safety analysis before editing code. Examples: \"Is it safe to change X?\", \"What depends on this?\", \"What will break?\""
 ---
 
 # Impact Analysis with GitNexus
 
 ## When to Use
+
 - "Is it safe to change this function?"
 - "What will break if I modify X?"
 - "Show me the blast radius"
@@ -16,64 +17,87 @@ description: Analyze blast radius before making code changes
 ## Workflow
 
 ```
-1. impact({target: "X", direction: "upstream"})  → What depends on this
-2. READ gitnexus://repo/{name}/processes                   → Check affected execution flows
-3. detect_changes()                               → Map current git changes to affected flows
-4. Assess risk and report to user
+1. list_repos() → Resolve the exact indexed repository
+2. impact({target: "X", direction: "upstream", repo: "<repo>"})
+3. READ gitnexus://repo/{name}/processes → Check affected execution flows
+4. detect_changes({scope: "all", repo: "<repo>", worktree: "<absolute path>"})
+5. Assess risk and report to user
 ```
 
-> If "Index is stale" → run `node .gitnexus/run.cjs analyze` in terminal.
+Record the repository, worktree, worktree HEAD, and index commit. If the index
+is stale, do not present the graph as current. Reindexing writes repository and
+registry state, so run `node .gitnexus/run.cjs analyze` only with authority.
 
 ## Checklist
 
 ```
-- [ ] impact({target, direction: "upstream"}) to find dependents
-- [ ] Review d=1 items first (these WILL BREAK)
+- [ ] Pin the exact repo, worktree, HEAD, and index commit
+- [ ] impact({target, direction: "upstream", repo}) to find dependents
+- [ ] Review d=1 direct dependents first
 - [ ] Check high-confidence (>0.8) dependencies
 - [ ] READ processes to check affected execution flows
-- [ ] detect_changes() for pre-commit check
+- [ ] detect_changes({scope: "all", repo, worktree}) for the intended checkout
+- [ ] Treat partial, truncated, or UNKNOWN results as unresolved
 - [ ] Assess risk level and report to user
 ```
 
 ## Understanding Output
 
-| Depth | Risk Level | Meaning |
-|-------|-----------|---------|
-| d=1 | **WILL BREAK** | Direct callers/importers |
-| d=2 | LIKELY AFFECTED | Indirect dependencies |
-| d=3 | MAY NEED TESTING | Transitive effects |
+| Depth | Meaning |
+| --- | --- |
+| d=1 | Direct callers/importers. Review first; dependency is not proof of breakage. |
+| d=2 | Indirect dependents that may need review. |
+| d=3 | Transitive dependents that may need focused tests. |
 
 ## Risk Assessment
 
-| Affected | Risk |
-|----------|------|
-| <5 symbols, few processes | LOW |
-| 5-15 symbols, 2-5 processes | MEDIUM |
-| >15 symbols or many processes | HIGH |
-| Critical path (auth, payments) | CRITICAL |
+The runtime score is a lower-bound graph heuristic, not a safety verdict:
+
+| Runtime threshold | Risk |
+| --- | --- |
+| direct ≥30, processes ≥5, modules ≥5, or total ≥200 | CRITICAL |
+| direct ≥15, processes ≥3, modules ≥3, or total ≥100 | HIGH |
+| direct ≥5 or total ≥30 | MEDIUM |
+| otherwise, when the walk completed | LOW |
+
+`UNKNOWN` is not a low rung. Zero callers can mean unused code, but it can also
+mean the index could not resolve dynamic dispatch, property access, or another
+edge. Confirm with source/text search before treating the target as safe.
+
+If `impact` or `detect_changes` returns `partial: true` or `truncated: true`,
+the result is incomplete. A short list or zero means unseen, not unaffected;
+re-run with a tighter target or larger supported bound before using it as a
+gate.
 
 ## Tools
 
 **impact** — the primary tool for symbol blast radius:
+
 ```
 impact({
   target: "validateUser",
   direction: "upstream",
+  repo: "my-app",
   minConfidence: 0.8,
   maxDepth: 3
 })
 
-→ d=1 (WILL BREAK):
+→ d=1 (DIRECT REVIEW LEADS):
   - loginHandler (src/auth/login.ts:42) [CALLS, 100%]
   - apiMiddleware (src/api/middleware.ts:15) [CALLS, 100%]
 
-→ d=2 (LIKELY AFFECTED):
+→ d=2 (INDIRECT REVIEW LEADS):
   - authRouter (src/routes/auth.ts:22) [CALLS, 95%]
 ```
 
 **detect_changes** — git-diff based impact analysis:
+
 ```
-detect_changes({scope: "staged"})
+detect_changes({
+  scope: "staged",
+  repo: "my-app",
+  worktree: "/absolute/path/to/my-app"
+})
 
 → Changed: 5 symbols in 3 files
 → Affected: LoginFlow, TokenRefresh, APIMiddlewarePipeline
@@ -83,12 +107,12 @@ detect_changes({scope: "staged"})
 ## Example: "What breaks if I change validateUser?"
 
 ```
-1. impact({target: "validateUser", direction: "upstream"})
-   → d=1: loginHandler, apiMiddleware (WILL BREAK)
-   → d=2: authRouter, sessionManager (LIKELY AFFECTED)
+1. impact({target: "validateUser", direction: "upstream", repo: "my-app"})
+   → d=1: loginHandler, apiMiddleware (review their contracts)
+   → d=2: authRouter, sessionManager (consider focused tests)
 
 2. READ gitnexus://repo/my-app/processes
    → LoginFlow and TokenRefresh touch validateUser
 
-3. Risk: 2 direct callers, 2 processes = MEDIUM
+3. Verify caller compatibility in source; report the runtime risk plus evidence
 ```

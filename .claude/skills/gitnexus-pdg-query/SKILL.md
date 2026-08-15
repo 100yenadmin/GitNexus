@@ -36,7 +36,7 @@ All three are `BasicBlock → BasicBlock` edges in the single `CodeRelation` tab
 
 - `pdg_query({ mode: 'controls', target })` — CDG. For the anchored function,
   each edge: controlling predicate block → dependent block + branch sense in
-  `label` (`'T'` = predicate's true/taken arm, `'F'` = false/fall-through). An
+  `reason` (`'T'` = predicate's true/taken arm, `'F'` = false/fall-through). An
   edge into an early-return/throw block is flagged `guard: true`.
 - `pdg_query({ mode: 'flows', target, variable? })` — REACHING_DEF def→use
   edges; `variable` filters to one binding.
@@ -44,16 +44,30 @@ All three are `BasicBlock → BasicBlock` edges in the single `CodeRelation` tab
 `target` is **required** — a file path or a symbol/function name (resolved like
 `context()`). There is no anchorless mode (see below).
 
-## The corrected guard-clause Cypher
+## Guard-clause query
 
-The RFC #567 §2 form (`[:CDG {label:'F'}]`) does **not** run as written. Edges
-are values of the single `CodeRelation` table's `type` property, and the branch
-sense is in `reason`, NOT a `label` column:
+Prefer the bounded, anchored tool:
+
+```text
+pdg_query({
+  mode: "controls",
+  target: "validateUser",
+  repo: "my-app",
+  limit: 50
+})
+```
+
+The RFC #567 §2 raw form (`[:CDG {label:'F'}]`) does not match the stored
+schema. Edges use `CodeRelation.type = 'CDG'`, and branch sense is in `reason`,
+not a `label` column. If raw Cypher is truly necessary, the caller must add a
+file/symbol anchor and a hard result bound, for example:
 
 ```cypher
 MATCH (pred:BasicBlock)-[r:CodeRelation {type: 'CDG'}]->(dep:BasicBlock)
-WHERE dep.text STARTS WITH 'return' OR dep.text STARTS WITH 'throw'
+WHERE pred.id STARTS WITH $anchoredFunctionPrefix
+  AND (dep.text STARTS WITH 'return' OR dep.text STARTS WITH 'throw')
 RETURN pred.startLine, r.reason AS branch, dep.startLine, dep.text
+LIMIT 50
 ```
 
 `r.reason` is the sense the predicate took to reach the early exit. For
@@ -66,7 +80,7 @@ so don't hard-code one sense.
 - **Always anchored + LIMIT-bounded.** LadybugDB has no rel-property index, so
   an unanchored `[:CDG*]`/`[:REACHING_DEF*]` path scan is unbounded. `pdg_query`
   requires `target` and bounds the page; raw `cypher` callers must anchor on a
-  file id-prefix or symbol span themselves.
+  file id-prefix or symbol span and add `LIMIT` themselves.
 - **BasicBlock↔symbol join is reconstructed.** No `Function→BasicBlock` edge:
   the block is matched by its id-prefix (`BasicBlock:<file>:<fnStartLine>:…`)
   plus `startLine` within the symbol's span. BasicBlock `startLine` is **1-based**

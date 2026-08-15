@@ -4,6 +4,11 @@
 
 Works with **Cursor**, **Claude Code**, **Antigravity** (Google), **Codex**, **Windsurf**, **Cline**, **OpenCode**, **CodeBuddy** (Tencent), **Qoder** (Alibaba), and any MCP-compatible tool.
 
+> **Electric distribution:** install the exact `1.6.10-electric.10` GitHub
+> release tarball into a versioned prefix. This fork does not publish npm
+> dist-tags, and its plugin ships skills and hooks only; managed client
+> configuration supplies the MCP command.
+
 [![npm version](https://img.shields.io/npm/v/gitnexus.svg)](https://www.npmjs.com/package/gitnexus)
 [![License: PolyForm Noncommercial](https://img.shields.io/badge/License-PolyForm%20Noncommercial-blue.svg)](https://polyformproject.org/licenses/noncommercial/1.0.0/)
 
@@ -19,20 +24,13 @@ AI coding tools don't understand your codebase structure. They edit a function w
 
 ```bash
 # Index your repo (run from repo root)
-npx gitnexus analyze
+gitnexus analyze
 ```
 
 That's it. This indexes the codebase, installs agent skills, registers Claude Code hooks, and creates `AGENTS.md` / `CLAUDE.md` context files — all in one command.
 
-> **On npm 11.x?** `npx` can crash during install (`Cannot destructure property 'package' of 'node.target'`). Use the pnpm form instead:
->
-> ```bash
-> pnpm --allow-build=@ladybugdb/core --allow-build=gitnexus --allow-build=tree-sitter dlx gitnexus@latest analyze
-> ```
->
-> See [Troubleshooting → `npx gitnexus` crashes with `node.target is null` (npm 11)](#cannot-destructure-property-package-of-nodetarget-as-it-is-null) for the full matrix (global install, npm downgrade).
-
-To configure MCP for your editor, run `npx gitnexus setup` once — or set it up manually below.
+To configure MCP for your editor, run `gitnexus setup` once—or use the managed
+versioned configuration below.
 
 `gitnexus setup` auto-detects your editors and writes the correct global MCP config. You only need to run it once. To configure only selected integrations, pass `--coding-agent`/`-c` with a comma-separated list or repeat the option, for example `gitnexus setup -c cursor,codex`.
 
@@ -65,24 +63,24 @@ If you prefer to configure manually instead of using `gitnexus setup`:
 
 ```bash
 # macOS / Linux
-claude mcp add gitnexus -- npx -y gitnexus@latest mcp
+claude mcp add gitnexus -- gitnexus mcp
 
 # Windows
-claude mcp add gitnexus -- cmd /c npx -y gitnexus@latest mcp
+claude mcp add gitnexus -- cmd /c gitnexus mcp
 ```
 
 ### Codex (full support — MCP + skills + hooks)
 
 ```bash
-codex mcp add gitnexus -- npx -y gitnexus@latest mcp
+codex mcp add gitnexus -- gitnexus mcp
 ```
 
 Codex hooks (PreToolUse graph enrichment + PostToolUse stale-index detection in `~/.codex/hooks.json`, [same schema as Claude Code](https://developers.openai.com/codex/hooks)) need the bundled adapter script, so they are installed by `gitnexus setup -c codex` rather than manually.
 
-Alternatively, install everything as a [Codex plugin](https://developers.openai.com/codex/plugins/build) (MCP + skills + hooks in one step):
+Alternatively, install the Electric [Codex plugin](https://developers.openai.com/codex/plugins/build) for skills and hooks. MCP remains in managed client configuration:
 
 ```bash
-codex plugin marketplace add abhigyanpatwari/GitNexus
+codex plugin marketplace add electricsheephq/evaOS-gitnexus
 # then inside Codex: /plugins → install "GitNexus"
 ```
 
@@ -96,8 +94,8 @@ Add to `~/.cursor/mcp.json` (global — works for all projects):
 {
   "mcpServers": {
     "gitnexus": {
-      "command": "npx",
-      "args": ["-y", "gitnexus@latest", "mcp"]
+      "command": "gitnexus",
+      "args": ["mcp"]
     }
   }
 }
@@ -111,8 +109,8 @@ Add to `~/.config/opencode/config.json`:
 {
   "mcp": {
     "gitnexus": {
-      "command": "npx",
-      "args": ["-y", "gitnexus@latest", "mcp"]
+      "command": "gitnexus",
+      "args": ["mcp"]
     }
   }
 }
@@ -126,8 +124,8 @@ CodeBuddy reads only the **first existing file** in its config priority chain: `
 {
   "mcpServers": {
     "gitnexus": {
-      "command": "npx",
-      "args": ["-y", "gitnexus@latest", "mcp"]
+      "command": "gitnexus",
+      "args": ["mcp"]
     }
   }
 }
@@ -141,8 +139,8 @@ Add to `~/.qoder.json`:
 {
   "mcpServers": {
     "gitnexus": {
-      "command": "npx",
-      "args": ["-y", "gitnexus@latest", "mcp"]
+      "command": "gitnexus",
+      "args": ["mcp"]
     }
   }
 }
@@ -168,7 +166,7 @@ The result is a **LadybugDB graph database** stored locally in `.gitnexus/` with
 Community detection uses the bundled Graphology Leiden implementation by default. To test the #2337 Icebug migration path without changing default analyze behavior, set:
 
 ```bash
-GITNEXUS_COMMUNITY_ENGINE=icebug npx gitnexus analyze
+GITNEXUS_COMMUNITY_ENGINE=icebug gitnexus analyze
 ```
 
 Supported values are `graphology`, `icebug`, and `auto`. The Icebug path is an experimental probe: GitNexus does not bundle an Icebug native package yet, and if a separately resolvable module is unavailable or its API does not match the expected `Graph.fromCSR` / `ParallelLeidenView` shape, analyze falls back to Graphology and reports the fallback in progress output. Today `auto` is behaviorally identical to `icebug`: both try Icebug and fall back to Graphology, while `graphology` skips the Icebug probe entirely.
@@ -402,8 +400,8 @@ for the full list; stable `latest` is unaffected.
 This error comes from **npm 11.x's arborist** while installing gitnexus (often via `npx`), before gitnexus code runs. It is triggered by platform-filtered `optionalDependencies` in native packages such as `onnxruntime-node` / `@huggingface/transformers` (used when indexing with `--embeddings`). GitNexus cannot catch it at runtime — use one of these workarounds:
 
 ```bash
-pnpm --allow-build=@ladybugdb/core --allow-build=gitnexus --allow-build=tree-sitter dlx gitnexus@latest analyze       # auto-selected when pnpm + npm 11+
-npm install -g gitnexus@latest         # global install avoids per-run npx reify
+gitnexus analyze                       # exact installed Electric release
+npm install -g /path/to/gitnexus-1.6.10-electric.10.tgz
 gitnexus analyze                       # if already installed globally
 ```
 
@@ -419,7 +417,7 @@ See [#1939](https://github.com/abhigyanpatwari/GitNexus/issues/1939) and the ori
 
 ```bash
 npm cache clean --force
-npx gitnexus@latest analyze
+gitnexus analyze
 ```
 
 ### `ERR_DLOPEN_FAILED` / `lbugjs.node` missing (pnpm dlx, pnpx)
@@ -437,19 +435,13 @@ Error: dlopen(.../@ladybugdb/core/lbugjs.node, ...): tried: '...' (no such file)
 Options that run install scripts:
 
 ```bash
-# pnpm dlx with explicit build permission (one-off, no global install required)
-pnpm --allow-build=@ladybugdb/core --allow-build=gitnexus --allow-build=tree-sitter \
-  dlx gitnexus@latest serve
-
-# npm: global install (recommended on npm 11+; bare npx may crash — see section above)
-npm install -g gitnexus@latest
+# npm: install the exact Electric release tarball
+npm install -g /path/to/gitnexus-1.6.10-electric.10.tgz
 gitnexus serve
 
-# npx (npm < 11, or after upgrading npm)
-npx gitnexus@latest serve
-
-# pnpm: global install with build scripts allowed (pnpm 10.2+; no approve-builds -g on pnpm 11+)
-pnpm add -g --allow-build=@ladybugdb/core --allow-build=gitnexus --allow-build=tree-sitter gitnexus
+# pnpm: install the same exact tarball with native builds allowed
+pnpm add -g --allow-build=@ladybugdb/core --allow-build=gitnexus --allow-build=tree-sitter \
+  /path/to/gitnexus-1.6.10-electric.10.tgz
 gitnexus serve
 ```
 
@@ -457,7 +449,7 @@ gitnexus serve
 
 Some optional language grammars (Dart, Proto, Swift, Kotlin) require native compilation. If they fail, GitNexus still works — those languages will be skipped. To skip them intentionally (no C++ toolchain needed), set `GITNEXUS_SKIP_OPTIONAL_GRAMMARS=1` before installing.
 
-If `npm install -g gitnexus` fails on native modules:
+If installation of the exact Electric release tarball fails on native modules:
 
 ```bash
 # Ensure build tools are available (Linux/macOS)
@@ -465,7 +457,7 @@ If `npm install -g gitnexus` fails on native modules:
 # macOS: xcode-select --install
 
 # Retry installation
-npm install -g gitnexus
+npm install -g /path/to/gitnexus-1.6.10-electric.10.tgz
 ```
 
 ### Installation fails behind an HTTP proxy (`onnxruntime-node` postinstall)
@@ -508,18 +500,18 @@ Configure the behavior with these environment variables:
 
 ```bash
 # Offline/airgapped: never reach the network for extensions
-GITNEXUS_LBUG_EXTENSION_INSTALL=load-only npx gitnexus analyze
+GITNEXUS_LBUG_EXTENSION_INSTALL=load-only gitnexus analyze
 
 # Slow network: give extension downloads more time
-GITNEXUS_LBUG_EXTENSION_INSTALL_TIMEOUT_MS=30000 npx gitnexus analyze
+GITNEXUS_LBUG_EXTENSION_INSTALL_TIMEOUT_MS=30000 gitnexus analyze
 
 # CJK-heavy codebase: rebuild keyword indexes without English stemming
-GITNEXUS_FTS_STEMMER=none npx gitnexus analyze --repair-fts
+GITNEXUS_FTS_STEMMER=none gitnexus analyze --repair-fts
 
 # CJK-heavy codebase: enable sub-phrase search over Chinese/Japanese Han text.
 # On an already-indexed repo, the first run after enabling this MUST be --force —
 # --repair-fts and plain incremental `analyze` both leave old files un-segmented.
-GITNEXUS_FTS_CJK_SEGMENTATION=bigram npx gitnexus analyze --force
+GITNEXUS_FTS_CJK_SEGMENTATION=bigram gitnexus analyze --force
 ```
 
 ### Analysis runs out of memory
@@ -528,7 +520,7 @@ For very large repositories:
 
 ```bash
 # Increase Node.js heap size
-NODE_OPTIONS="--max-old-space-size=16384" npx gitnexus analyze
+NODE_OPTIONS="--max-old-space-size=16384" gitnexus analyze
 
 # Exclude large directories
 echo "vendor/" >> .gitnexusignore
@@ -541,11 +533,11 @@ By default the walker skips files larger than **512 KB** (see log line `Skipped 
 
 ```bash
 # CLI flag (takes precedence over the env var)
-npx gitnexus analyze --max-file-size 2048     # skip only files > 2 MB
+gitnexus analyze --max-file-size 2048     # skip only files > 2 MB
 
 # Environment variable (persists across commands)
 export GITNEXUS_MAX_FILE_SIZE=2048
-npx gitnexus analyze
+gitnexus analyze
 ```
 
 Values above **32768 KB (32 MB)** are clamped to the tree-sitter parser ceiling; invalid values fall back to the 512 KB default with a one-time warning. When an override is active, `analyze` prints the effective threshold in its startup banner (e.g. `GITNEXUS_MAX_FILE_SIZE: effective threshold 2048KB (default 512KB)`).
@@ -556,11 +548,11 @@ Worker parse timeouts are recoverable. GitNexus retries stalled worker jobs with
 
 ```bash
 # CLI flag, in seconds
-npx gitnexus analyze --worker-timeout 60
+gitnexus analyze --worker-timeout 60
 
 # Environment variable, in milliseconds
 export GITNEXUS_WORKER_SUB_BATCH_TIMEOUT_MS=60000
-npx gitnexus analyze
+gitnexus analyze
 ```
 
 For repositories with very large source files, `GITNEXUS_WORKER_SUB_BATCH_MAX_BYTES` controls the worker job byte budget. The default is **8388608 bytes (8 MB)**.

@@ -16,18 +16,21 @@ description: "Use when the user is debugging a bug, tracing an error, or asking 
 ## Workflow
 
 ```
-1. query({search_query: "<error or symptom>"})            → Find related execution flows
-2. context({name: "<suspect>"})                    → See callers/callees/processes
-3. READ gitnexus://repo/{name}/process/{name}                → Trace execution flow
-4. cypher({statement: "MATCH path..."})                 → Custom traces if needed
+1. READ gitnexus://repos and pin repo/worktree HEAD/index commit
+2. query({search_query: "<error or symptom>", repo: "<repo>"})
+3. context({name: "<suspect>", repo: "<repo>"})
+4. READ gitnexus://repo/{name}/process/{name}
+5. Use an anchored, LIMIT-bounded custom query only if needed
 ```
 
-> If "Index is stale" → run `node .gitnexus/run.cjs analyze` in terminal.
+If the index is stale, label graph evidence stale. Reindexing writes repository
+and registry state; run it only with authority.
 
 ## Checklist
 
 ```
 - [ ] Understand the symptom (error message, unexpected behavior)
+- [ ] Record exact repo, absolute worktree, HEAD, and index commit
 - [ ] query for error text or related code
 - [ ] Identify the suspect function from returned processes
 - [ ] context to see callers and callees
@@ -52,7 +55,7 @@ description: "Use when the user is debugging a bug, tracing an error, or asking 
 **query** — find code related to error:
 
 ```
-query({search_query: "payment validation error"})
+query({search_query: "payment validation error", repo: "my-app"})
 → Processes: CheckoutFlow, ErrorHandling
 → Symbols: validatePayment, handlePaymentError, PaymentException
 ```
@@ -60,7 +63,7 @@ query({search_query: "payment validation error"})
 **context** — full context for a suspect:
 
 ```
-context({name: "validatePayment"})
+context({name: "validatePayment", repo: "my-app"})
 → Incoming calls: processCheckout, webhookHandler
 → Outgoing calls: verifyCard, fetchRates (external API!)
 → Processes: CheckoutFlow (step 3/7)
@@ -71,12 +74,13 @@ context({name: "validatePayment"})
 ```cypher
 MATCH path = (a)-[:CodeRelation {type: 'CALLS'}*1..2]->(b:Function {name: "validatePayment"})
 RETURN [n IN nodes(path) | n.name] AS chain
+LIMIT 100
 ```
 
 **trace** — shortest call chain between two symbols ("how does A reach B?"), one call instead of chaining `context` hops:
 
 ```
-trace({ from: "processCheckout", to: "fetchRates" })
+trace({ from: "processCheckout", to: "fetchRates", repo: "my-app" })
 → status: ok, hopCount: 3
 → hops: processCheckout → validatePayment → verifyCard → fetchRates
 → edges: CALLS (1.0), CALLS (0.95), CALLS (1.0)
@@ -87,11 +91,11 @@ When no path exists, `trace` reports the furthest reachable node — exactly whe
 ## Example: "Payment endpoint returns 500 intermittently"
 
 ```
-1. query({search_query: "payment error handling"})
+1. query({search_query: "payment error handling", repo: "my-app"})
    → Processes: CheckoutFlow, ErrorHandling
    → Symbols: validatePayment, handlePaymentError
 
-2. context({name: "validatePayment"})
+2. context({name: "validatePayment", repo: "my-app"})
    → Outgoing calls: verifyCard, fetchRates (external API!)
 
 3. READ gitnexus://repo/my-app/process/CheckoutFlow

@@ -51,10 +51,10 @@ https://github.com/user-attachments/assets/172685ba-8e54-4ea7-9ad1-e31a3398da72
 
 ```bash
 # 1. Index your repo (run from repo root)
-npx gitnexus analyze
+gitnexus analyze
 
 # 2. Connect your editors (one-time, auto-detects Claude Code, Cursor, Codex, …)
-npx gitnexus setup
+gitnexus setup
 ```
 
 That's it. `analyze` indexes the codebase, installs agent skills, registers Claude Code hooks, and creates `AGENTS.md` / `CLAUDE.md` context files — all in one command. `setup` writes the MCP config so your AI agent can use the graph.
@@ -65,10 +65,10 @@ That's it. `analyze` indexes the codebase, installs agent skills, registers Clau
 > **On npm 11.x?** `npx` can crash during install with `Cannot destructure property 'package' of 'node.target'` (an npm/arborist bug, before GitNexus runs). Use pnpm instead — it builds the native deps explicitly:
 >
 > ```bash
-> pnpm --allow-build=@ladybugdb/core --allow-build=gitnexus --allow-build=tree-sitter dlx gitnexus@latest analyze
+> gitnexus analyze
 > ```
 >
-> Or install globally (`npm install -g gitnexus@latest`) and run `gitnexus analyze`. See [#1939](https://github.com/abhigyanpatwari/GitNexus/issues/1939).
+> The Electric fork is installed from an exact GitHub release tarball; it does not publish npm dist-tags.
 
 > **Fastest MCP startup:** install globally (`npm i -g gitnexus`) before running `gitnexus setup` — this writes an absolute-path MCP config that bypasses `npx` entirely. On a cold cache, an `npx`-based MCP install can exceed Claude Code's `MCP_TIMEOUT` default (~30s).
 
@@ -219,32 +219,32 @@ flowchart TB
 
 ```bash
 # macOS / Linux
-claude mcp add gitnexus -- npx -y gitnexus@latest mcp
+claude mcp add gitnexus -- gitnexus mcp
 
 # Windows
-claude mcp add gitnexus -- cmd /c npx -y gitnexus@latest mcp
+claude mcp add gitnexus -- cmd /c gitnexus mcp
 ```
 
 **Codex** (full support — MCP + skills + hooks):
 
 ```bash
-codex mcp add gitnexus -- npx -y gitnexus@latest mcp
+codex mcp add gitnexus -- gitnexus mcp
 ```
 
 Or via `~/.codex/config.toml` (system scope) / `.codex/config.toml` (project scope):
 
 ```toml
 [mcp_servers.gitnexus]
-command = "npx"
-args = ["-y", "gitnexus@latest", "mcp"]
+command = "gitnexus"
+args = ["mcp"]
 ```
 
 Codex hooks (PreToolUse graph enrichment + PostToolUse stale-index detection in `~/.codex/hooks.json`, [same schema as Claude Code](https://developers.openai.com/codex/hooks)) need the bundled adapter script, so they are installed by `gitnexus setup -c codex` rather than manually.
 
-Alternatively, install everything as a [Codex plugin](https://developers.openai.com/codex/plugins/build) (MCP + skills + hooks in one step):
+Alternatively, install the Electric [Codex plugin](https://developers.openai.com/codex/plugins/build) for skills and hooks. MCP remains in managed client configuration:
 
 ```bash
-codex plugin marketplace add abhigyanpatwari/GitNexus
+codex plugin marketplace add electricsheephq/evaOS-gitnexus
 # then inside Codex: /plugins → install "GitNexus"
 ```
 
@@ -256,8 +256,8 @@ codex plugin marketplace add abhigyanpatwari/GitNexus
 {
   "mcpServers": {
     "gitnexus": {
-      "command": "npx",
-      "args": ["-y", "gitnexus@latest", "mcp"]
+      "command": "gitnexus",
+      "args": ["mcp"]
     }
   }
 }
@@ -269,8 +269,8 @@ codex plugin marketplace add abhigyanpatwari/GitNexus
 {
   "mcpServers": {
     "gitnexus": {
-      "command": "npx",
-      "args": ["-y", "gitnexus@latest", "mcp"]
+      "command": "gitnexus",
+      "args": ["mcp"]
     }
   }
 }
@@ -297,8 +297,8 @@ codex plugin marketplace add abhigyanpatwari/GitNexus
 {
   "mcpServers": {
     "gitnexus": {
-      "command": "npx",
-      "args": ["-y", "gitnexus@latest", "mcp"]
+      "command": "gitnexus",
+      "args": ["mcp"]
     }
   }
 }
@@ -310,8 +310,8 @@ codex plugin marketplace add abhigyanpatwari/GitNexus
 {
   "mcpServers": {
     "gitnexus": {
-      "command": "npx",
-      "args": ["-y", "gitnexus@latest", "mcp"]
+      "command": "gitnexus",
+      "args": ["mcp"]
     }
   }
 }
@@ -705,7 +705,7 @@ The wiki generator reads the indexed graph structure, groups files into modules 
 
 A client-side graph explorer and AI chat — your code never leaves your machine.
 
-**Try it now:** [gitnexus.vercel.app](https://gitnexus.vercel.app) — run `npx gitnexus@latest serve` locally and the page auto-connects to your local backend.
+**Try it now:** [gitnexus.vercel.app](https://gitnexus.vercel.app) — run `gitnexus serve` from the exact installed Electric release.
 
 <img width="2550" height="1343" alt="gitnexus_img" src="https://github.com/user-attachments/assets/cc5d637d-e0e5-48e6-93ff-5bcfdb929285" />
 
@@ -722,7 +722,7 @@ cd gitnexus/gitnexus-shared && npm install && npm run build
 cd ../gitnexus-web && npm install
 npm run dev
 # Then in another terminal, start the backend the frontend connects to:
-npx gitnexus@latest serve
+gitnexus serve
 ```
 
 </details>

@@ -32,7 +32,7 @@ function collectSkillFiles(): string[] {
 
   // Per-skill <name>/SKILL.md copies across the other distribution locations.
   const skillRoots = [
-    path.join(REPO_ROOT, '.claude', 'skills', 'gitnexus'),
+    path.join(REPO_ROOT, '.claude', 'skills'),
     path.join(REPO_ROOT, 'gitnexus-claude-plugin', 'skills'),
     path.join(REPO_ROOT, 'gitnexus-cursor-integration', 'skills'),
   ];
@@ -60,9 +60,7 @@ describe('skill-file steering (#1939, #1945)', () => {
   it('collects skill files from all four committed locations (guard is not vacuous)', () => {
     const rels = files.map((f) => path.relative(REPO_ROOT, f));
     expect(rels.some((r) => r.startsWith(`gitnexus${path.sep}skills${path.sep}`))).toBe(true);
-    expect(
-      rels.some((r) => r.startsWith(path.join('.claude', 'skills', 'gitnexus') + path.sep)),
-    ).toBe(true);
+    expect(rels.some((r) => r.startsWith(path.join('.claude', 'skills', 'gitnexus-')))).toBe(true);
     expect(
       rels.some((r) => r.startsWith(path.join('gitnexus-claude-plugin', 'skills') + path.sep)),
     ).toBe(true);
@@ -92,36 +90,28 @@ describe('skill-file steering (#1939, #1945)', () => {
     expect(offenders).toEqual([]);
   });
 
-  it('documents the not-analyzed-yet / npm-11 bootstrap fallback in the cli skill (#1939)', () => {
-    // The runner only exists after the first analyze, so the cli skill must
-    // document the bootstrap path (and the npm-11 npx install crash escape
-    // hatch): the issue reference plus at least one fallback mechanism.
+  it('documents the managed Electric bootstrap without a floating package ref', () => {
     const cli = cliSkillFiles(files);
     const offenders = cli.filter((f) => {
       const text = readFileSync(f, 'utf-8');
-      const refsIssue = /1939/.test(text);
-      const hasFallback =
-        /install -g gitnexus/.test(text) || /--allow-build.*dlx gitnexus/.test(text);
-      return !(refsIssue && hasFallback);
+      return (
+        !/exact\s+versioned GitHub release tarball/.test(text) ||
+        !/installed\s+electric version/.test(text) ||
+        text.includes('gitnexus@latest')
+      );
     });
     expect(offenders.map((f) => path.relative(REPO_ROOT, f))).toEqual([]);
-
-    // Positive vacuity guard: at least one cli skill must still carry the pnpm
-    // pre-`dlx` fallback form, so the npm-11 pnpm path can't silently vanish
-    // from every skill while the OR above is satisfied by `install -g` alone.
-    const withPnpmFallback = cli.filter((f) =>
-      /--allow-build.*dlx gitnexus/.test(readFileSync(f, 'utf-8')),
-    );
-    expect(withPnpmFallback.length).toBeGreaterThan(0);
   });
 
-  it('routes every stale-index reanalyze hint through the runner, not a raw package manager', () => {
-    // Skills that tell the agent to reanalyze a stale index must point at the
-    // runner so the package-manager choice is resolved at call time.
+  it('does not turn a stale-index warning into automatic reindex authority', () => {
     const offenders = files.filter((f) => {
       const text = readFileSync(f, 'utf-8');
       if (!/[Ss]tale/.test(text)) return false; // only skills with a reanalyze hint
-      return !/node\s+\.gitnexus\/run\.cjs\s+analyze/.test(text);
+      return (
+        /npx\s+(?:-y\s+)?gitnexus/.test(text) ||
+        /pnpm\b.*\bdlx\s+gitnexus/.test(text) ||
+        /run .*analyze.* first/i.test(text)
+      );
     });
     expect(offenders.map((f) => path.relative(REPO_ROOT, f))).toEqual([]);
   });

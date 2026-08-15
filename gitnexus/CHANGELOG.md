@@ -4,6 +4,19 @@ All notable changes to GitNexus will be documented in this file.
 
 ## [Unreleased]
 
+## [1.6.10-electric.10] - 2026-08-15
+
+### Changed
+
+- Pinned PR-review evidence to exact repository, base, head, merge base,
+  worktree, and GitNexus index identities.
+- Made `.claude/skills/<skill>/SKILL.md` the canonical source for nine
+  byte-identical npm, Claude-plugin, and Cursor skill copies.
+- Removed plugin-distributed MCP launch configuration and made Electric fork
+  provenance explicit across release manifests.
+- Corrected bounded impact, refactor, multi-repo, taint, PDG, CLI, and resource
+  guidance without changing the rename API or importing upstream RC features.
+
 ## [1.6.10-electric.9] - 2026-07-30
 
 ### Fixed

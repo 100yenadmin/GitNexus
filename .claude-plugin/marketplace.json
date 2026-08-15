@@ -1,19 +1,18 @@
 {
   "name": "gitnexus-marketplace",
   "owner": {
-    "name": "GitNexus",
-    "email": "nico@gitnexus.dev"
+    "name": "Electric Sheep"
   },
   "metadata": {
     "description": "Code intelligence powered by a knowledge graph — execution flows, blast radius, and semantic search",
-    "homepage": "https://github.com/nicosxt/gitnexus"
+    "homepage": "https://github.com/electricsheephq/evaOS-gitnexus"
   },
   "plugins": [
     {
       "name": "gitnexus",
-      "version": "1.6.10-electric.9",
+      "version": "1.6.10-electric.10",
       "source": "./gitnexus-claude-plugin",
-      "description": "Code intelligence powered by a knowledge graph. Provides execution flow tracing, blast radius analysis, and augmented search across your codebase."
+      "description": "Electric Sheep managed GitNexus skills and hooks for code intelligence."
     }
   ]
 }

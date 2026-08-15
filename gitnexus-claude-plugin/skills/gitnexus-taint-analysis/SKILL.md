@@ -99,8 +99,8 @@ parameter, source)`. Seed from `source→callee-arg`, propagate via
   before firing — the recurring multi-source bug class. (Bit M3; bit M4 U9.)
 - **Name-based call join.** Match a summary's call-arg edge to a `CALLS` edge by
   CALLEE NAME, not call-site line — line-base parity (CFG 1-based vs reference
-  site) is fragile; the callee identity is exact and context-insensitivity
-  taints the callee's param identically at every call site.
+  site) is fragile. This is context-insensitive name matching, not exact symbol identity:
+  distinct same-named callees can be over-attributed.
 - Persisted as `TAINT_PATH` edges (Function→Function), function-level hop chain
   in `reason` via the same codec; confidence < the intra-procedural 1.0.
 
@@ -129,7 +129,7 @@ finding is NOT proof of safety.
   have no column, so same-line functions (`{a:()=>x(), b:()=>y()}`) are
   ambiguous → drop (the summary driver counts `unresolved`) rather than
   cross-wire.
-- **No rel-property index (S1).** Kuzu has no secondary index on relationship
+- **No rel-property index (S1).** LadybugDB has no secondary index on relationship
   properties, and unanchored `[:TAINTED*]`/`[:TAINT_PATH*]` queries explode.
   TAINT_PATH is therefore MATERIALIZED + anchored at analyze time, never
   traversed live; `explain` reads it source-anchored + LIMIT-guarded.
@@ -148,13 +148,18 @@ finding is NOT proof of safety.
 
 ## Adding a source / sink / sanitizer
 
-Edit the language model in `taint/typescript-model.ts` (registered via the
-explicit `registerBuiltinTaintModels` seam, keyed by `SupportedLanguages`). The
-spec is hashable data (no functions). A sanitizer's `neutralizes` lists the
-EXACT sink kinds it defends — never a blanket kill. Add a fixture + assert the
-finding (or its absence) in `test/unit/taint/` (real-source harness:
-`test/helpers/ts-cfg-harness.ts`); the end-to-end proof is
-`test/integration/cfg/`.
+Edit the model for the target language:
+
+- TypeScript and JavaScript: `taint/typescript-model.ts`
+- Python: `taint/python-model.ts`
+- Java: `taint/java-model.ts`
+
+The models are registered through `registerBuiltinTaintModels`, keyed by
+`SupportedLanguages`. The spec is hashable data (no functions). A sanitizer's
+`neutralizes` lists the exact sink kinds it defends—never a blanket kill. Add a
+language fixture and assert the finding or absence in `test/unit/taint/`; for
+TypeScript, use `test/helpers/ts-cfg-harness.ts`. The end-to-end proof belongs
+in `test/integration/cfg/`.
 
 ## Validation checklist for any `--pdg` change
 

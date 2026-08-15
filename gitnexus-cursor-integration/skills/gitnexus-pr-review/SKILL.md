@@ -5,159 +5,120 @@ description: "Use when the user wants to review a pull request, understand what 
 
 # PR Review with GitNexus
 
-## When to Use
+Review the requested change without editing source, switching or resetting the
+user's checkout, committing, pushing, posting, or resolving threads. GitNexus
+provides structural evidence; source inspection and focused tests establish
+whether a concrete defect exists.
 
-- "Review this PR"
-- "What does PR #42 change?"
-- "Is this safe to merge?"
-- "What's the blast radius of this PR?"
-- "Are there missing tests for this PR?"
-- Reviewing someone else's code changes before merge
+## Resolve and pin the target
 
-## Workflow
+For a GitHub PR, use `gh pr view` or `gh api` to record:
 
-```
-1. gh pr diff <number>                                    → Get the raw diff
-2. detect_changes({scope: "compare", base_ref: "main"})  → Map diff to affected flows
-3. For each changed symbol:
-   impact({target: "<symbol>", direction: "upstream"})    → Blast radius per change
-4. context({name: "<key symbol>"})               → Understand callers/callees
-5. READ gitnexus://repo/{name}/processes                   → Check affected execution flows
-6. Summarize findings with risk assessment
-```
+- repository owner/name and local repository root;
+- PR number and URL;
+- base ref and exact base SHA;
+- head ref and exact head SHA;
+- merge base from `git merge-base <base-sha> <head-sha>`;
+- exact worktree used for the review.
 
-> If "Index is stale" → run `node .gitnexus/run.cjs analyze` in terminal before reviewing.
+Fetch the exact base and head commits without switching the user's branch.
+Fork PRs may require the pull ref or contributor remote; do not assume the head
+branch exists on `origin`. Use `git diff <merge-base> <head-sha>` as the PR diff
+source of truth.
 
-## Checklist
+Reuse a worktree only when it is at the exact head SHA. Otherwise use an
+independent detached worktree only when the user has authorized creating and
+removing one. If an exact checkout is unavailable, stop the graph-backed lane
+and state the limitation.
 
-```
-- [ ] Fetch PR diff (gh pr diff or git diff base...head)
-- [ ] detect_changes to map changes to affected execution flows
-- [ ] impact on each non-trivial changed symbol
-- [ ] Review d=1 items (WILL BREAK) — are callers updated?
-- [ ] context on key changed symbols to understand full picture
-- [ ] Check if affected processes have test coverage
-- [ ] Assess overall risk level
-- [ ] Write review summary with findings
-```
+## Bind the graph to the same source
 
-## Review Dimensions
+Read GitNexus status for the target repository and record the indexed commit.
+The repository, worktree head, diff head, and graph index commit must identify
+the same source before the review is described as graph-backed. Do not run
+`analyze`, reindex, clean, or mutate the registry unless the user authorized
+that side effect.
 
-| Dimension | How GitNexus Helps |
-| --- | --- |
-| **Correctness** | `context` shows callers — are they all compatible with the change? |
-| **Blast radius** | `impact` shows d=1/d=2/d=3 dependents — anything missed? |
-| **Completeness** | `detect_changes` shows all affected flows — are they all handled? |
-| **Test coverage** | `impact({includeTests: true})` shows which tests touch changed code |
-| **Breaking changes** | d=1 upstream items that aren't updated in the PR = potential breakage |
+When the exact graph already exists, pass identity explicitly:
 
-## Risk Assessment
-
-| Signal | Risk |
-| --- | --- |
-| Changes touch <3 symbols, 0-1 processes | LOW |
-| Changes touch 3-10 symbols, 2-5 processes | MEDIUM |
-| Changes touch >10 symbols or many processes | HIGH |
-| Changes touch auth, payments, or data integrity code | CRITICAL |
-| d=1 callers exist outside the PR diff | Potential breakage — flag it |
-
-## Tools
-
-**detect_changes** — map PR diff to affected execution flows:
-
-```
-detect_changes({scope: "compare", base_ref: "main"})
-
-→ Changed: 8 symbols in 4 files
-→ Affected processes: CheckoutFlow, RefundFlow, WebhookHandler
-→ Risk: MEDIUM
+```text
+detect_changes({
+  scope: "compare",
+  base_ref: "<merge-base-sha>",
+  repo: "<exact-indexed-repository>",
+  worktree: "<absolute-head-worktree>"
+})
 ```
 
-**impact** — blast radius per changed symbol:
+Use the same explicit `repo` for `impact`, `context`, and resource reads.
+If the graph index commit does not match the head SHA, review the raw source and
+diff, label graph evidence stale or skipped, and do not blend it into the
+verdict as if it described the PR.
 
-```
-impact({target: "validatePayment", direction: "upstream"})
+## Review workflow
 
-→ d=1 (WILL BREAK):
-  - processCheckout (src/checkout.ts:42) [CALLS, 100%]
-  - webhookHandler (src/webhooks.ts:15) [CALLS, 100%]
+1. Read the complete local diff and changed-file list at the pinned SHAs.
+2. Run `detect_changes` against the exact merge base, repository, and worktree.
+3. If the result has `partial: true` or `truncated: true`, treat it as incomplete.
+   A short or empty result is not proof that the change has no dependents.
+4. Run `impact({target, direction: "upstream", includeTests: true, repo})` for
+   behaviorally changed symbols.
+5. Inspect each direct dependent outside the diff. A direct dependency is a
+   review lead, not proof that it breaks; verify the contract and caller source.
+6. Use `context({name, repo})` and exact process resources for key symbols.
+7. Read new files, generated files, configuration, and untracked content
+   directly because graph and Git diff coverage may be incomplete.
+8. Run the narrowest focused tests that exercise the claimed behavior.
+9. Reconcile source, graph, and test evidence before assigning severity.
 
-→ d=2 (LIKELY AFFECTED):
-  - checkoutRouter (src/routes/checkout.ts:22) [CALLS, 95%]
-```
+## Finding standard
 
-**impact with tests** — check test coverage:
+Report a finding only when the change introduces a concrete defect, regression,
+security issue, compatibility break, or material missing test. Each finding
+must include:
 
-```
-impact({target: "validatePayment", direction: "upstream", includeTests: true})
+- severity and a precise `path:line` anchor;
+- a reachable failing scenario or violated contract;
+- source or test evidence;
+- GitNexus dependent/process evidence when applicable;
+- a concise remediation.
 
-→ Tests that cover this symbol:
-  - validatePayment.test.ts [direct]
-  - checkout.integration.test.ts [via processCheckout]
-```
+Do not report style preferences, pre-existing problems, raw risk counts, or
+speculation as defects. Do not infer safety from zero graph hits.
 
-**context** — understand a changed symbol's role:
-
-```
-context({name: "validatePayment"})
-
-→ Incoming calls: processCheckout, webhookHandler
-→ Outgoing calls: verifyCard, fetchRates
-→ Processes: CheckoutFlow (step 3/7), RefundFlow (step 1/5)
-```
-
-## Example: "Review PR #42"
-
-```
-1. gh pr diff 42 > /tmp/pr42.diff
-   → 4 files changed: payments.ts, checkout.ts, types.ts, utils.ts
-
-2. detect_changes({scope: "compare", base_ref: "main"})
-   → Changed symbols: validatePayment, PaymentInput, formatAmount
-   → Affected processes: CheckoutFlow, RefundFlow
-   → Risk: MEDIUM
-
-3. impact({target: "validatePayment", direction: "upstream"})
-   → d=1: processCheckout, webhookHandler (WILL BREAK)
-   → webhookHandler is NOT in the PR diff — potential breakage!
-
-4. impact({target: "PaymentInput", direction: "upstream"})
-   → d=1: validatePayment (in PR), createPayment (NOT in PR)
-   → createPayment uses the old PaymentInput shape — breaking change!
-
-5. context({name: "formatAmount"})
-   → Called by 12 functions — but change is backwards-compatible (added optional param)
-
-6. Review summary:
-   - MEDIUM risk — 3 changed symbols affect 2 execution flows
-   - BUG: webhookHandler calls validatePayment but isn't updated for new signature
-   - BUG: createPayment depends on PaymentInput type which changed
-   - OK: formatAmount change is backwards-compatible
-   - Tests: checkout.test.ts covers processCheckout path, but no webhook test
-```
-
-## Review Output Format
-
-Structure your review as:
+## Output
 
 ```markdown
-## PR Review: <title>
+## PR Review: <title or target>
 
-**Risk: LOW / MEDIUM / HIGH / CRITICAL**
+### Provenance
 
-### Changes Summary
-- <N> symbols changed across <M> files
-- <P> execution flows affected
+- Repository: <owner/name and absolute local root>
+- Base SHA: <sha>
+- Head SHA: <sha>
+- Merge base: <sha>
+- Worktree: <absolute path>
+- GitNexus index commit: <sha or unavailable>
+- Graph status: exact | stale | skipped
+- Local states included: committed | staged | unstaged | untracked
 
 ### Findings
-1. **[severity]** Description of finding
-   - Evidence from GitNexus tools
-   - Affected callers/flows
 
-### Missing Coverage
-- Callers not updated in PR: ...
-- Untested flows: ...
+- [HIGH|MEDIUM|LOW] `path:line` — <problem, proof, impact, remediation>
+
+### Change and blast-radius summary
+
+- Changed symbols/files and affected execution flows
+- Direct dependents reviewed in source
+
+### Coverage and residual risk
+
+- Focused checks run
+- Missing or incomplete graph, diff, untracked, and test evidence
 
 ### Recommendation
-APPROVE / REQUEST CHANGES / NEEDS DISCUSSION
+
+APPROVE | REQUEST CHANGES | NEEDS DISCUSSION
 ```
+
+Always include the exact identities so a later review can detect stale evidence.

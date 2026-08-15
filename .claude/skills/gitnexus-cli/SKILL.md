@@ -5,9 +5,13 @@ description: "Use when the user needs to run GitNexus CLI commands like analyze/
 
 # GitNexus CLI Commands
 
-Commands below use `node .gitnexus/run.cjs <command>` — the project-local runner `gitnexus analyze` drops next to the index. It auto-selects an available runner at call time (global `gitnexus`, else `pnpm dlx`, else `npx`), so no package-manager assumption and no global install is required.
+Commands below use `node .gitnexus/run.cjs <command>`—the project-local runner
+created by `gitnexus analyze`. In the electric distribution, install the exact
+versioned GitHub release tarball first and use the managed installed
+`gitnexus`; do not bootstrap through an unqualified npm dist-tag.
 
-> **Not analyzed yet, or `node .gitnexus/run.cjs` reports `Cannot find module`** (the gitignored runner is absent — e.g. a fresh clone or `git clean`)? (Re)generate it with `npx gitnexus analyze` from the project root. On **npm 11.x**, if `npx` crashes during install (`node.target is null`), install once with `npm i -g gitnexus` (then `gitnexus analyze`) or use `pnpm --allow-build=@ladybugdb/core --allow-build=gitnexus --allow-build=tree-sitter dlx gitnexus@latest analyze`. See [#1939](https://github.com/abhigyanpatwari/GitNexus/issues/1939).
+If `run.cjs` is absent, confirm the selected repository and the installed
+electric version, then run `gitnexus analyze` only with index-write authority.
 
 ## Commands
 
@@ -17,15 +21,27 @@ Commands below use `node .gitnexus/run.cjs <command>` — the project-local runn
 node .gitnexus/run.cjs analyze
 ```
 
-Run from the project root. This parses all source files, builds the knowledge graph, writes it to `.gitnexus/`, and generates CLAUDE.md / AGENTS.md context files.
+Run from the exact project root. This parses source, writes `.gitnexus/`,
+updates the global registry, writes `.gitnexus/run.cjs`, and may create/update
+CLAUDE.md, AGENTS.md, and project skills. Use `--index-only` when the approved
+action is limited to the index. Do not run against the wrong worktree.
 
 | Flag           | Effect                                                           |
 | -------------- | ---------------------------------------------------------------- |
 | `--force`      | Force full re-index even if up to date                           |
 | `--embeddings` | Enable embedding generation for semantic search (off by default) |
 | `--drop-embeddings` | Drop existing embeddings on rebuild. By default, an `analyze` without `--embeddings` preserves them. |
+| `--pdg` | Build the program-dependence layers used by `explain` and `pdg_query` (taint, CDG, and REACHING_DEF). |
 
-**When to run:** First time in a project, after major code changes, or when `gitnexus://repo/{name}/context` reports the index is stale. In Claude Code, a PostToolUse hook detects staleness after `git commit` and `git merge` and notifies the agent to run `analyze` — the hook does not run analyze itself, to avoid blocking the agent for up to 120s and risking KuzuDB corruption on timeout.
+Embedding generation may call a configured remote provider. Relevant settings
+are `GITNEXUS_EMBEDDING_URL`, `GITNEXUS_EMBEDDING_MODEL`,
+`GITNEXUS_EMBEDDING_API_KEY`, and `GITNEXUS_EMBEDDING_DIMS`; flags also cover
+device, threads, and batch size. Never paste keys into commands, logs, issues,
+or committed files.
+
+**When to run:** First index or a deliberately authorized refresh. A hook may
+report staleness after Git operations, but it does not authorize or run analyze.
+Avoid overlapping writers; LadybugDB expects one writer.
 
 ### status — Check index freshness
 
@@ -41,7 +57,10 @@ Shows whether the current repo has a GitNexus index, when it was last updated, a
 node .gitnexus/run.cjs clean
 ```
 
-Deletes the `.gitnexus/` directory and unregisters the repo from the global registry. Use before re-indexing if the index is corrupt or after removing GitNexus from a project.
+Deletes the `.gitnexus/` directory and unregisters the repo from the global
+registry. Confirm the exact repository before running it. `--force` skips the
+prompt, and `--all` affects every registered repository; neither is a routine
+reindex prerequisite.
 
 | Flag      | Effect                                            |
 | --------- | ------------------------------------------------- |
@@ -54,7 +73,10 @@ Deletes the `.gitnexus/` directory and unregisters the repo from the global regi
 node .gitnexus/run.cjs wiki
 ```
 
-Generates repository documentation from the knowledge graph using an LLM. Requires an API key (saved to `~/.gitnexus/config.json` on first use).
+Generates repository documentation using an LLM. This can send repository
+content to the configured provider and save provider configuration under
+`~/.gitnexus/`. Confirm the provider/account and data policy first. Avoid
+`--api-key` in shell history; use the supported secure environment/config path.
 
 | Flag                | Effect                                    |
 | ------------------- | ----------------------------------------- |
@@ -64,6 +86,9 @@ Generates repository documentation from the knowledge graph using an LLM. Requir
 | `--api-key <key>`   | LLM API key                               |
 | `--concurrency <n>` | Parallel LLM calls (default: 3)           |
 | `--gist`            | Publish wiki as a public GitHub Gist      |
+
+`--gist` is a public, account-visible write. Verify the active GitHub account
+and obtain publication authority before using it.
 
 ### list — Show all indexed repos
 
@@ -82,4 +107,6 @@ Lists all repositories registered in `~/.gitnexus/registry.json`. The MCP `list_
 
 - **"Not inside a git repository"**: Run from a directory inside a git repo
 - **Index is stale after re-analyzing**: Restart Claude Code to reload the MCP server
-- **Embeddings slow**: Omit `--embeddings` (it's off by default) or set `OPENAI_API_KEY` for faster API-based embedding
+- **Embeddings slow**: Omit `--embeddings` or configure the exact
+  `GITNEXUS_EMBEDDING_*` provider settings; `OPENAI_API_KEY` is for wiki LLM
+  usage, not the embedding contract

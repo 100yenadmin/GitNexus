@@ -11,11 +11,15 @@ Quick reference for all GitNexus MCP tools, resources, and the knowledge graph s
 
 For any task involving code understanding, debugging, impact analysis, or refactoring:
 
-1. **Read `gitnexus://repo/{name}/context`** — codebase overview + check index freshness
-2. **Match your task to a skill below** and **read that skill file**
-3. **Follow the skill's workflow and checklist**
+1. **Read `gitnexus://repos`** and select the exact repository.
+2. **Read `gitnexus://repo/{name}/context`** — overview, path, index commit, freshness.
+3. **Record the repository, worktree HEAD, and index commit.**
+4. **Match your task to a skill below** and follow its workflow.
 
-> If step 1 warns the index is stale, run `node .gitnexus/run.cjs analyze` in the terminal first.
+If the context says the index is stale, label graph evidence stale. `analyze`
+writes the index, registry, runner, AI context, and skill files unless narrowed
+by flags; run it only with authority. The electric plugin ships skills and hooks
+only. Managed client configuration supplies the versioned MCP command.
 
 ## Skills
 
@@ -34,7 +38,7 @@ For any task involving code understanding, debugging, impact analysis, or refact
 | ---------------- | ------------------------------------------------------------------------ |
 | `query`          | Process-grouped code intelligence — execution flows related to a concept |
 | `context`        | 360-degree symbol view — categorized refs, processes it participates in  |
-| `impact`         | Symbol blast radius — what breaks at depth 1/2/3 with confidence         |
+| `impact`         | Symbol dependency leads by depth and runtime risk; not proof of breakage |
 | `trace`          | Shortest path between two symbols — "how does A reach B?" in one call     |
 | `detect_changes` | Git-diff impact — what do your current changes affect                    |
 | `rename`         | Multi-file coordinated rename with confidence-tagged edits               |
@@ -42,7 +46,17 @@ For any task involving code understanding, debugging, impact analysis, or refact
 | `explain`        | Persisted taint findings — source→sink data flows (needs `analyze --pdg`) |
 | `pdg_query`      | Control/data dependence — what gates X (CDG) / where Y flows (REACHING_DEF); needs `analyze --pdg` |
 | `check`          | Check graph invariants such as circular imports                          |
+| `route_map`      | API route map — which components/hooks fetch which endpoints, and the handler files that serve them |
+| `shape_check`    | Response-shape drift — keys each route returns vs keys its consumers access (flags MISMATCH) |
+| `api_impact`     | Pre-change report for an API route — consumers, middleware, shape mismatches, risk level |
+| `tool_map`       | MCP/RPC tool definitions and the files that handle them                  |
+| `group_list`     | List configured multi-repo groups, or one group's config                 |
+| `group_sync`     | Rebuild a group's Contract Registry (cross-repo HTTP contract links); run after `group.yaml` changes or member re-index |
 | `list_repos`     | Discover indexed repos (paginated — `limit`/`offset`)                    |
+
+Pass `repo` explicitly whenever more than one repository is indexed. For
+change analysis, also pass the absolute `worktree` and exact `base_ref` when
+the MCP server is attached to a different checkout.
 
 ### Paginating `list_repos`
 
@@ -77,13 +91,13 @@ Notes: `offset` ≥ `total` returns an empty page (with `total` still reported).
 
 ### Taint findings (`explain`)
 
-`explain` returns intra-procedural taint findings (`TAINTED` edges) recorded by `gitnexus analyze --pdg` — each with a sink category (command-injection, code-injection, path-traversal, sql-injection, xss), source/sink lines, and the ordered hop path with the variable carried on each hop.
+`explain` returns taint findings recorded by `gitnexus analyze --pdg` — intra-procedural `TAINTED` edges plus cross-function `TAINT_PATH` hops where the interprocedural taint phase found a function-level source→sink chain. Each finding includes a sink category (command-injection, code-injection, path-traversal, sql-injection, xss), source/sink lines, and the ordered hop path with the variable carried on each hop.
 
 - `explain {}` — enumerate all findings for the repo (bounded by `limit`, deterministic order)
 - `explain { target: "src/vuln.ts" }` — findings in a file (suffix path match accepted)
 - `explain { target: "runUserCommand" }` — findings in a function (resolved like `context`; ambiguous names return ranked candidates)
 
-A repo indexed without `--pdg` returns a clear "no taint layer" note. Caveats: findings are intra-procedural only — cross-function, closure/callback, property/field, and implicit flows are not modeled, so the absence of a finding is **not** proof of safety. `SANITIZES` (sanitizer-kill) edges are queryable via `cypher`.
+A repo indexed without `--pdg` returns a clear "no taint layer" note. Caveats: closure/callback, property/field, and implicit flows are not modeled, and interprocedural findings are function-level `TAINT_PATH` hops rather than statement-level path proof, so the absence of a finding is **not** proof of safety. `SANITIZES` (sanitizer-kill) edges are queryable via `cypher`.
 
 ### Control & data dependence (`pdg_query`)
 
@@ -104,25 +118,40 @@ A repo indexed without `--pdg` returns a "no PDG layer" note (or "status unknown
 
 Returns ordered `hops` (each `{ name, filePath, startLine }`) and an aligned `edges[]` of `{ relType, confidence }`, so call hops and containment (`HAS_METHOD`) hops stay distinguishable. When no path exists it reports the **furthest** reachable node (where the chain breaks) and sets `truncated: true` if a traversal cap was hit first. Every result carries a `status`: `ok` / `no_path` / `ambiguous` / `not_found` / `error`.
 
+Cross-repo (experimental): pass `repo: "@groupName"` to trace across a group's member repos — the path may cross **one** `ContractLink` boundary (reported as a `CONTRACT_LINK` hop with the bridged contract in `crossings[]`). Omit `to` entirely to follow `from`'s outgoing HTTP call to whatever provider endpoint it lands on. Groups are configured via `group_list` / `group_sync`.
+
 ## Resources Reference
 
 Lightweight reads (~100-500 tokens) for navigation:
 
 | Resource                                       | Content                                   |
 | ---------------------------------------------- | ----------------------------------------- |
+| `gitnexus://repos`                             | Paginated indexed-repository inventory    |
+| `gitnexus://setup`                             | Setup guidance for the current MCP server |
 | `gitnexus://repo/{name}/context`               | Stats, staleness check                    |
 | `gitnexus://repo/{name}/clusters`              | All functional areas with cohesion scores |
 | `gitnexus://repo/{name}/cluster/{clusterName}` | Area members                              |
 | `gitnexus://repo/{name}/processes`             | All execution flows                       |
 | `gitnexus://repo/{name}/process/{processName}` | Step-by-step trace                        |
 | `gitnexus://repo/{name}/schema`                | Graph schema for Cypher                   |
+| `gitnexus://group/{name}/contracts`            | Cross-repo contract registry              |
+| `gitnexus://group/{name}/status`               | Group index and contract freshness        |
+
+The MCP query, context, impact, trace, explain, PDG, and resource surfaces are
+read-only. `rename` applies source edits when `dry_run` is false. CLI `analyze`,
+`clean`, `setup`, `uninstall`, and wiki publication have filesystem, registry,
+configuration, or account-visible side effects; read the CLI skill and confirm
+the intended target before running them.
 
 ## Graph Schema
 
-**Nodes:** File, Function, Class, Interface, Method, Community, Process
-**Edges (via CodeRelation.type):** CALLS, IMPORTS, EXTENDS, IMPLEMENTS, DEFINES, MEMBER_OF, STEP_IN_PROCESS
+**Nodes:** File, Folder, Function, Class, Interface, Method, CodeElement, Community, Process, Route, Tool, plus language-specific types (Struct, Enum, Trait, Impl, Namespace, Module, …) and BasicBlock (`--pdg` indexes only). The full node list lives in `gitnexus://repo/{name}/schema`.
+**Edges (via CodeRelation.type):** CALLS, IMPORTS, EXTENDS, IMPLEMENTS, DEFINES, CONTAINS, MEMBER_OF, HAS_METHOD, HAS_PROPERTY, ACCESSES, METHOD_OVERRIDES, METHOD_IMPLEMENTS, STEP_IN_PROCESS, HANDLES_ROUTE, FETCHES, HANDLES_TOOL, ENTRY_POINT_OF, WRAPS, QUERIES, INJECTS, plus `--pdg`-only types (CFG, REACHING_DEF, TAINTED, SANITIZES, TAINT_PATH, CDG — zero rows on a default index).
+
+Read `gitnexus://repo/{name}/schema` before writing Cypher — it is the authoritative schema for the indexed repo.
 
 ```cypher
 MATCH (caller)-[:CodeRelation {type: 'CALLS'}]->(f:Function {name: "myFunc"})
 RETURN caller.name, caller.filePath
+LIMIT 100
 ```

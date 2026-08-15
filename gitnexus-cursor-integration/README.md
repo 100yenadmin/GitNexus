@@ -8,8 +8,8 @@ Static config that adds GitNexus knowledge-graph augmentation and skill files to
 
 | Layer                     | What it does                                                                                                                              | How it's installed                                                              |
 | ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
-| **MCP**                   | `gitnexus` MCP server with 17 tools (`query`, `context`, `impact`, `detect_changes`, `rename`, …)                                         | `npx gitnexus setup` writes `~/.cursor/mcp.json` automatically.                 |
-| **Skills**                | All bundled markdown skills (`/gitnexus-exploring`, `/gitnexus-debugging`, `/gitnexus-impact-analysis`, `/gitnexus-refactoring`, `/gitnexus-guide`, `/gitnexus-cli`, `/gitnexus-pr-review`, `/gitnexus-pdg-query`, `/gitnexus-taint-analysis`) | `npx gitnexus setup` copies them to `~/.cursor/skills/gitnexus/`.               |
+| **MCP**                   | `gitnexus` MCP server with 17 tools (`query`, `context`, `impact`, `detect_changes`, `rename`, …)                                         | `gitnexus setup` writes `~/.cursor/mcp.json` automatically.                     |
+| **Skills**                | All bundled markdown skills (`/gitnexus-exploring`, `/gitnexus-debugging`, `/gitnexus-impact-analysis`, `/gitnexus-refactoring`, `/gitnexus-guide`, `/gitnexus-cli`, `/gitnexus-pr-review`, `/gitnexus-pdg-query`, `/gitnexus-taint-analysis`) | `gitnexus setup` copies them to `~/.cursor/skills/`.                             |
 | **Hooks** _(this README)_ | `postToolUse` hook that enriches `Shell` / `Read` / `Grep` tool calls with graph context — same augmentation Claude Code gets             | **Manual** — copy the files described below into your project's `.cursor/`. |
 
 ## Hook install
@@ -40,7 +40,7 @@ If you already have a `.cursor/hooks.json`, merge the `hooks.postToolUse` array 
 
 ### Verify
 
-1. Index the project: `npx gitnexus analyze` (on npm 11.x, `npx` can crash during install — use `pnpm --allow-build=@ladybugdb/core --allow-build=gitnexus --allow-build=tree-sitter dlx gitnexus@latest analyze` instead; see [#1939](https://github.com/abhigyanpatwari/GitNexus/issues/1939))
+1. Install the exact Electric GitHub release tarball, then index the project with `gitnexus analyze`.
 2. Reload the Cursor window so it picks up the new hook config.
 3. Ask the agent something that triggers `Read` / `Grep` / `Shell rg`. You should see a `[GitNexus]` block appended to the tool result.
 4. Diagnose silent no-ops by setting `GITNEXUS_DEBUG=1` in your shell environment — the hook will write Cursor's raw event payload to stderr so you can verify field names.
@@ -86,6 +86,6 @@ Empty stdout means "no augmentation, continue normally" — the hook never block
 
 ## Troubleshooting
 
-- **Nothing happens** — Confirm Cursor is on 2.4+ and the project root has `.cursor/hooks.json` plus both hook files at `hooks/gitnexus-hook.cjs` and `hooks/hook-lock.cjs`. Then `npx gitnexus list` to confirm the project is indexed.
+- **Nothing happens** — Confirm Cursor is on 2.4+ and the project root has `.cursor/hooks.json` plus both hook files at `hooks/gitnexus-hook.cjs` and `hooks/hook-lock.cjs`. Then run `gitnexus list` to confirm the project is indexed.
 - **`gitnexus` not found** — The hook prefers a locally-resolvable `gitnexus/dist/cli/index.js` and falls back to `npx -y gitnexus`. Install globally with `npm i -g gitnexus` to skip the npx cold-start latency.
 - **Wrong pattern extracted** — Set `GITNEXUS_DEBUG=1` and run a tool call. The raw stdin payload is logged to stderr; use it to confirm Cursor's actual `tool_input` field names against the table above. If they differ, file an issue with the captured payload.

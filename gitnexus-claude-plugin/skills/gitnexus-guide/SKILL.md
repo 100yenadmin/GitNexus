@@ -11,11 +11,15 @@ Quick reference for all GitNexus MCP tools, resources, and the knowledge graph s
 
 For any task involving code understanding, debugging, impact analysis, or refactoring:
 
-1. **Read `gitnexus://repo/{name}/context`** — codebase overview + check index freshness
-2. **Match your task to a skill below** and **read that skill file**
-3. **Follow the skill's workflow and checklist**
+1. **Read `gitnexus://repos`** and select the exact repository.
+2. **Read `gitnexus://repo/{name}/context`** — overview, path, index commit, freshness.
+3. **Record the repository, worktree HEAD, and index commit.**
+4. **Match your task to a skill below** and follow its workflow.
 
-> If step 1 warns the index is stale, run `node .gitnexus/run.cjs analyze` in the terminal first.
+If the context says the index is stale, label graph evidence stale. `analyze`
+writes the index, registry, runner, AI context, and skill files unless narrowed
+by flags; run it only with authority. The electric plugin ships skills and hooks
+only. Managed client configuration supplies the versioned MCP command.
 
 ## Skills
 
@@ -34,7 +38,7 @@ For any task involving code understanding, debugging, impact analysis, or refact
 | ---------------- | ------------------------------------------------------------------------ |
 | `query`          | Process-grouped code intelligence — execution flows related to a concept |
 | `context`        | 360-degree symbol view — categorized refs, processes it participates in  |
-| `impact`         | Symbol blast radius — what breaks at depth 1/2/3 with confidence         |
+| `impact`         | Symbol dependency leads by depth and runtime risk; not proof of breakage |
 | `trace`          | Shortest path between two symbols — "how does A reach B?" in one call     |
 | `detect_changes` | Git-diff impact — what do your current changes affect                    |
 | `rename`         | Multi-file coordinated rename with confidence-tagged edits               |
@@ -49,6 +53,10 @@ For any task involving code understanding, debugging, impact analysis, or refact
 | `group_list`     | List configured multi-repo groups, or one group's config                 |
 | `group_sync`     | Rebuild a group's Contract Registry (cross-repo HTTP contract links); run after `group.yaml` changes or member re-index |
 | `list_repos`     | Discover indexed repos (paginated — `limit`/`offset`)                    |
+
+Pass `repo` explicitly whenever more than one repository is indexed. For
+change analysis, also pass the absolute `worktree` and exact `base_ref` when
+the MCP server is attached to a different checkout.
 
 ### Paginating `list_repos`
 
@@ -118,12 +126,22 @@ Lightweight reads (~100-500 tokens) for navigation:
 
 | Resource                                       | Content                                   |
 | ---------------------------------------------- | ----------------------------------------- |
+| `gitnexus://repos`                             | Paginated indexed-repository inventory    |
+| `gitnexus://setup`                             | Setup guidance for the current MCP server |
 | `gitnexus://repo/{name}/context`               | Stats, staleness check                    |
 | `gitnexus://repo/{name}/clusters`              | All functional areas with cohesion scores |
 | `gitnexus://repo/{name}/cluster/{clusterName}` | Area members                              |
 | `gitnexus://repo/{name}/processes`             | All execution flows                       |
 | `gitnexus://repo/{name}/process/{processName}` | Step-by-step trace                        |
 | `gitnexus://repo/{name}/schema`                | Graph schema for Cypher                   |
+| `gitnexus://group/{name}/contracts`            | Cross-repo contract registry              |
+| `gitnexus://group/{name}/status`               | Group index and contract freshness        |
+
+The MCP query, context, impact, trace, explain, PDG, and resource surfaces are
+read-only. `rename` applies source edits when `dry_run` is false. CLI `analyze`,
+`clean`, `setup`, `uninstall`, and wiki publication have filesystem, registry,
+configuration, or account-visible side effects; read the CLI skill and confirm
+the intended target before running them.
 
 ## Graph Schema
 
@@ -135,4 +153,5 @@ Read `gitnexus://repo/{name}/schema` before writing Cypher — it is the authori
 ```cypher
 MATCH (caller)-[:CodeRelation {type: 'CALLS'}]->(f:Function {name: "myFunc"})
 RETURN caller.name, caller.filePath
+LIMIT 100
 ```

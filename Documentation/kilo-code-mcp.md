@@ -36,7 +36,7 @@ Kilo supports local MCP servers through STDIO, and GitNexus should be added as a
   "mcp": {
     "gitnexus": {
       "type": "local",
-      "command": ["npx", "-y", "gitnexus@latest", "mcp"],
+      "command": ["gitnexus", "mcp"],
       "enabled": true,
       "timeout": 10000
     }
