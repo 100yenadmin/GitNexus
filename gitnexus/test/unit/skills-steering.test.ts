@@ -106,7 +106,6 @@ describe('skill-file steering (#1939, #1945)', () => {
   it('does not turn a stale-index warning into automatic reindex authority', () => {
     const offenders = files.filter((f) => {
       const text = readFileSync(f, 'utf-8');
-      if (!/[Ss]tale/.test(text)) return false; // only skills with a reanalyze hint
       return (
         /npx\s+(?:-y\s+)?gitnexus/.test(text) ||
         /pnpm\b.*\bdlx\s+gitnexus/.test(text) ||

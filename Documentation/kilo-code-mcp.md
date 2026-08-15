@@ -4,7 +4,14 @@ This guide shows how to connect GitNexus to the Kilo Code VS Code extension usin
 
 ## Prerequisites
 
-GitNexus should already be installed globally and working on the target repository, and the repository should be indexed successfully with `gitnexus analyze` before testing inside Kilo.
+Install the exact Electric release and verify it before indexing the target
+repository:
+
+```bash
+npm install --global https://github.com/electricsheephq/evaOS-gitnexus/releases/download/electric%2Fv1.6.10-electric.10/gitnexus-1.6.10-electric.10.tgz
+gitnexus --version
+gitnexus analyze
+```
 
 ## Tested Versions
 
@@ -14,7 +21,7 @@ GitNexus should already be installed globally and working on the target reposito
 | Node.js | 24.15.0 |
 | Kilo Code | 7.3.50 |
 | OS | Windows 11 25H2 / Windows_NT x64 10.0.26200 |
-| GitNexus | 1.6.7 |
+| GitNexus | 1.6.10-electric.10 |
 
 ## Where Kilo Stores MCP Config
 

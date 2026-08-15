@@ -137,8 +137,9 @@ Lightweight reads (~100-500 tokens) for navigation:
 | `gitnexus://group/{name}/contracts`            | Cross-repo contract registry              |
 | `gitnexus://group/{name}/status`               | Group index and contract freshness        |
 
-The MCP query, context, impact, trace, explain, PDG, and resource surfaces are
-read-only. `rename` applies source edits when `dry_run` is false. CLI `analyze`,
+The MCP query, context, impact, trace, explain, PDG, `group_list`, and resource
+surfaces are read-only. `rename` applies source edits when `dry_run` is false.
+`group_sync` rebuilds the group's `contracts.json` registry. CLI `analyze`,
 `clean`, `setup`, `uninstall`, and wiki publication have filesystem, registry,
 configuration, or account-visible side effects; read the CLI skill and confirm
 the intended target before running them.

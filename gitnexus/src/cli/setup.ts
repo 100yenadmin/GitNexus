@@ -37,12 +37,9 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const execFileAsync = promisify(execFile);
 
-// Pin the npx fallback to the installed version. Reason: setup.ts writes
-// a config that persists in the user's editor and is invoked on every MCP
-// connect. Pinning to the installed version means subsequent invocations
-// skip the npm-registry metadata roundtrip (and stay reproducible until
-// the user upgrades). Static configs and READMEs intentionally use
-// the exact Electric release since they're quickstart docs, not persisted state.
+// Pin the package fallback to the exact Electric GitHub release asset. setup.ts
+// writes a config that persists in the user's editor and is invoked on every
+// MCP connect, while this fork intentionally publishes no npm dist-tag.
 const _require = createRequire(import.meta.url);
 const _pkg = _require('../../package.json') as { version?: unknown };
 if (typeof _pkg.version !== 'string' || !_pkg.version) {
@@ -50,10 +47,9 @@ if (typeof _pkg.version !== 'string' || !_pkg.version) {
     'gitnexus/package.json#version is missing or not a string — cannot generate MCP fallback config.',
   );
 }
-// Version-pinned ref for the persisted MCP entry — deliberately distinct from
-// the cjs's exported exact Electric hint ref (resolve-analyze-cmd.cjs); the
-// two are not unified (see the comment above and that file's MCP_PINNED_REF).
-const MCP_PINNED_REF = `gitnexus@${_pkg.version}`;
+const MCP_EXACT_PACKAGE_REF =
+  `https://github.com/electricsheephq/evaOS-gitnexus/releases/download/` +
+  `electric%2Fv${_pkg.version}/gitnexus-${_pkg.version}.tgz`;
 
 /**
  * Build the `command` string written into an editor's hook settings, which the
@@ -153,7 +149,7 @@ function resolveGitnexusBin(): string | null {
  * The MCP server entry for all editors.
  *
  * Prefers the globally-installed `gitnexus` binary (starts in ~1 s) over
- * `npx -y gitnexus@<version>` (cold-cache install of native deps can take
+ * `npx -y <exact Electric release URL>` (cold-cache install of native deps can take
  * >60 s, exceeding Claude Code's 30 s MCP connection timeout). The fallback
  * version is read from gitnexus/package.json#version at module load so the
  * persisted user config matches the installed package.
@@ -172,12 +168,12 @@ function getMcpEntry() {
   if (process.platform === 'win32') {
     return {
       command: 'cmd',
-      args: ['/c', 'npx', '-y', MCP_PINNED_REF, 'mcp'],
+      args: ['/c', 'npx', '-y', MCP_EXACT_PACKAGE_REF, 'mcp'],
     };
   }
   return {
     command: 'npx',
-    args: ['-y', MCP_PINNED_REF, 'mcp'],
+    args: ['-y', MCP_EXACT_PACKAGE_REF, 'mcp'],
   };
 }
 
@@ -193,9 +189,12 @@ function getOpenCodeMcpEntry() {
   }
 
   if (process.platform === 'win32') {
-    return { type: 'local', command: ['cmd', '/c', 'npx', '-y', MCP_PINNED_REF, 'mcp'] };
+    return {
+      type: 'local',
+      command: ['cmd', '/c', 'npx', '-y', MCP_EXACT_PACKAGE_REF, 'mcp'],
+    };
   }
-  return { type: 'local', command: ['npx', '-y', MCP_PINNED_REF, 'mcp'] };
+  return { type: 'local', command: ['npx', '-y', MCP_EXACT_PACKAGE_REF, 'mcp'] };
 }
 
 /**

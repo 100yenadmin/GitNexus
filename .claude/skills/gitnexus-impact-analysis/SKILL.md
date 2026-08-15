@@ -24,9 +24,11 @@ description: "Use when the user wants to know what will break if they change som
 5. Assess risk and report to user
 ```
 
-Record the repository, worktree, worktree HEAD, and index commit. If the index
-is stale, do not present the graph as current. Reindexing writes repository and
-registry state, so run `node .gitnexus/run.cjs analyze` only with authority.
+Record the repository, worktree, worktree HEAD, and index commit. Read the
+repository context/status and compare the indexed commit with worktree HEAD
+before graph calls. If they differ, stop graph-backed conclusions and label the
+evidence stale. Reindexing writes repository and registry state, so run
+`node .gitnexus/run.cjs analyze` only with authority.
 
 ## Checklist
 
@@ -37,7 +39,9 @@ registry state, so run `node .gitnexus/run.cjs analyze` only with authority.
 - [ ] Check high-confidence (>0.8) dependencies
 - [ ] READ processes to check affected execution flows
 - [ ] detect_changes({scope: "all", repo, worktree}) for the intended checkout
+- [ ] Read `git status --short`; inspect untracked files directly because Git diff excludes them
 - [ ] Treat partial, truncated, or UNKNOWN results as unresolved
+- [ ] Warn and obtain acknowledgement before edits when runtime risk is HIGH or CRITICAL
 - [ ] Assess risk level and report to user
 ```
 
@@ -64,10 +68,16 @@ The runtime score is a lower-bound graph heuristic, not a safety verdict:
 mean the index could not resolve dynamic dispatch, property access, or another
 edge. Confirm with source/text search before treating the target as safe.
 
-If `impact` or `detect_changes` returns `partial: true` or `truncated: true`,
-the result is incomplete. A short list or zero means unseen, not unaffected;
-re-run with a tighter target or larger supported bound before using it as a
-gate.
+If `impact` returns `partial: true` or `pagination.truncated: true`, or if
+`detect_changes` reports an incomplete result, the evidence is incomplete. A
+short list or zero means unseen, not unaffected; re-run with a tighter target or
+larger supported bound before using it as a gate. `detect_changes` is based on
+Git diff and excludes untracked files, so inspect `git status --short` and those
+files directly.
+
+Warn the user and obtain acknowledgement before making edits when the runtime
+risk is HIGH or CRITICAL. The label is still a review gate, not proof that a
+specific caller will break.
 
 ## Tools
 

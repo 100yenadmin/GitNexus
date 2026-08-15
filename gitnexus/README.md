@@ -23,6 +23,10 @@ AI coding tools don't understand your codebase structure. They edit a function w
 ## Quick Start
 
 ```bash
+# Install this exact Electric release
+npm install --global https://github.com/electricsheephq/evaOS-gitnexus/releases/download/electric%2Fv1.6.10-electric.10/gitnexus-1.6.10-electric.10.tgz
+gitnexus --version
+
 # Index your repo (run from repo root)
 gitnexus analyze
 ```

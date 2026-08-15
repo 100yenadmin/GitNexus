@@ -23,8 +23,10 @@ description: "Use when the user wants to rename, extract, split, move, or restru
 5. Plan update order: interfaces → implementations → callers → tests
 ```
 
-If the index is stale, do not present it as current. Reindexing writes repository
-and registry state; run it only with authority.
+Read the repository context/status and compare its indexed commit with the
+worktree HEAD before graph calls. If they differ, stop graph-backed conclusions
+and label the evidence stale. Reindexing writes repository and registry state;
+run it only with authority.
 
 ## Checklists
 
@@ -46,10 +48,11 @@ The current implementation may replace whole-file word matches, including in
 untracked files; Git-diff-based `detect_changes` cannot prove those untracked
 edits. Treat source/diff inspection and focused tests as the verification gate.
 
-If `rename` or `detect_changes` reports `partial: true` or `truncated: true`,
-the result is short of the truth. An empty or short list is not proof that only
-the expected files changed; re-run or inspect directly before treating the
-refactor as verified.
+If `rename` returns `status: "partial"`, inspect every `failed_files` entry
+before continuing. If `detect_changes` reports an incomplete result, the result
+is short of the truth. An empty or short list is not proof that only the
+expected files changed; re-run or inspect directly before treating the refactor
+as verified.
 
 ### Extract Module
 

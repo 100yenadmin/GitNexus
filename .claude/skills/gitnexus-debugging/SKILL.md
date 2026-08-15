@@ -23,8 +23,10 @@ description: "Use when the user is debugging a bug, tracing an error, or asking 
 5. Use an anchored, LIMIT-bounded custom query only if needed
 ```
 
-If the index is stale, label graph evidence stale. Reindexing writes repository
-and registry state; run it only with authority.
+Read the repository context/status and compare its indexed commit with the
+worktree HEAD before graph calls. If they differ, stop graph-backed conclusions
+and label the evidence stale. Reindexing writes repository and registry state;
+run it only with authority.
 
 ## Checklist
 

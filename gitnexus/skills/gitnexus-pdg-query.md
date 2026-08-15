@@ -64,7 +64,7 @@ file/symbol anchor and a hard result bound, for example:
 
 ```cypher
 MATCH (pred:BasicBlock)-[r:CodeRelation {type: 'CDG'}]->(dep:BasicBlock)
-WHERE pred.id STARTS WITH $anchoredFunctionPrefix
+WHERE pred.id STARTS WITH 'BasicBlock:src/auth/validate.ts:42:'
   AND (dep.text STARTS WITH 'return' OR dep.text STARTS WITH 'throw')
 RETURN pred.startLine, r.reason AS branch, dep.startLine, dep.text
 LIMIT 50

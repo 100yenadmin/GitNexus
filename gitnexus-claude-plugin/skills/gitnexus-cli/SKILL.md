@@ -10,6 +10,11 @@ created by `gitnexus analyze`. In the electric distribution, install the exact
 versioned GitHub release tarball first and use the managed installed
 `gitnexus`; do not bootstrap through an unqualified npm dist-tag.
 
+```bash
+npm install --global https://github.com/electricsheephq/evaOS-gitnexus/releases/download/electric%2Fv1.6.10-electric.10/gitnexus-1.6.10-electric.10.tgz
+gitnexus --version
+```
+
 If `run.cjs` is absent, confirm the selected repository and the installed
 electric version, then run `gitnexus analyze` only with index-write authority.
 
@@ -106,7 +111,7 @@ Lists all repositories registered in `~/.gitnexus/registry.json`. The MCP `list_
 ## Troubleshooting
 
 - **"Not inside a git repository"**: Run from a directory inside a git repo
-- **Index is stale after re-analyzing**: Restart Claude Code to reload the MCP server
+- **Index is stale after re-analyzing**: Restart the MCP client or editor to reload the server
 - **Embeddings slow**: Omit `--embeddings` or configure the exact
   `GITNEXUS_EMBEDDING_*` provider settings; `OPENAI_API_KEY` is for wiki LLM
   usage, not the embedding contract

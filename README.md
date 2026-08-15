@@ -50,6 +50,10 @@ https://github.com/user-attachments/assets/172685ba-8e54-4ea7-9ad1-e31a3398da72
 ## Quick Start
 
 ```bash
+# 0. Install this exact Electric release
+npm install --global https://github.com/electricsheephq/evaOS-gitnexus/releases/download/electric%2Fv1.6.10-electric.10/gitnexus-1.6.10-electric.10.tgz
+gitnexus --version
+
 # 1. Index your repo (run from repo root)
 gitnexus analyze
 

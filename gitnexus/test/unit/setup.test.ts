@@ -8,7 +8,9 @@ import { createRequire } from 'module';
 // so the test never goes stale on a release bump.
 const PKG_VERSION = (createRequire(import.meta.url)('../../package.json') as { version: string })
   .version;
-const MCP_PINNED_REF = `gitnexus@${PKG_VERSION}`;
+const MCP_EXACT_PACKAGE_REF =
+  `https://github.com/electricsheephq/evaOS-gitnexus/releases/download/` +
+  `electric%2Fv${PKG_VERSION}/gitnexus-${PKG_VERSION}.tgz`;
 
 /** Flatten the spied console.log calls into one searchable string. */
 const logLines = () =>
@@ -89,7 +91,7 @@ describe('setupClaudeCode', () => {
 
     expect(config.mcpServers.gitnexus).toEqual({
       command: 'cmd',
-      args: ['/c', 'npx', '-y', MCP_PINNED_REF, 'mcp'],
+      args: ['/c', 'npx', '-y', MCP_EXACT_PACKAGE_REF, 'mcp'],
     });
   });
 
@@ -104,7 +106,7 @@ describe('setupClaudeCode', () => {
 
     expect(config.mcpServers.gitnexus).toEqual({
       command: 'npx',
-      args: ['-y', MCP_PINNED_REF, 'mcp'],
+      args: ['-y', MCP_EXACT_PACKAGE_REF, 'mcp'],
     });
   });
 
@@ -196,7 +198,7 @@ describe('setupClaudeCode', () => {
 
     expect(config.mcpServers.gitnexus).toEqual({
       command: 'npx',
-      args: ['-y', MCP_PINNED_REF, 'mcp'],
+      args: ['-y', MCP_EXACT_PACKAGE_REF, 'mcp'],
     });
   });
 
@@ -379,7 +381,7 @@ describe('setupClaudeCode', () => {
 
     expect(config.mcpServers.gitnexus).toEqual({
       command: 'cmd',
-      args: ['/c', 'npx', '-y', MCP_PINNED_REF, 'mcp'],
+      args: ['/c', 'npx', '-y', MCP_EXACT_PACKAGE_REF, 'mcp'],
     });
   });
 
@@ -395,7 +397,7 @@ describe('setupClaudeCode', () => {
 
     expect(config.mcpServers.gitnexus).toEqual({
       command: 'cmd',
-      args: ['/c', 'npx', '-y', MCP_PINNED_REF, 'mcp'],
+      args: ['/c', 'npx', '-y', MCP_EXACT_PACKAGE_REF, 'mcp'],
     });
   });
 

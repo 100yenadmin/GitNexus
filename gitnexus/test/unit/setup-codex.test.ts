@@ -6,7 +6,9 @@ import { createRequire } from 'module';
 
 const PKG_VERSION = (createRequire(import.meta.url)('../../package.json') as { version: string })
   .version;
-const NPX_REF = `gitnexus@${PKG_VERSION}`;
+const MCP_EXACT_PACKAGE_REF =
+  `https://github.com/electricsheephq/evaOS-gitnexus/releases/download/` +
+  `electric%2Fv${PKG_VERSION}/gitnexus-${PKG_VERSION}.tgz`;
 
 const execFileMock = vi.fn((...args: any[]) => {
   const callback = args.at(-1);
@@ -73,7 +75,7 @@ describe('setupCommand codex execution', () => {
 
     expect(execFileMock).toHaveBeenCalledWith(
       'codex',
-      ['mcp', 'add', 'gitnexus', '--', 'cmd', '/c', 'npx', '-y', NPX_REF, 'mcp'],
+      ['mcp', 'add', 'gitnexus', '--', 'cmd', '/c', 'npx', '-y', MCP_EXACT_PACKAGE_REF, 'mcp'],
       { shell: true, windowsHide: true },
       expect.any(Function),
     );
@@ -88,7 +90,7 @@ describe('setupCommand codex execution', () => {
 
     expect(execFileMock).toHaveBeenCalledWith(
       'codex',
-      ['mcp', 'add', 'gitnexus', '--', 'cmd', '/c', 'npx', '-y', NPX_REF, 'mcp'],
+      ['mcp', 'add', 'gitnexus', '--', 'cmd', '/c', 'npx', '-y', MCP_EXACT_PACKAGE_REF, 'mcp'],
       { shell: true, windowsHide: true },
       expect.any(Function),
     );
@@ -103,7 +105,7 @@ describe('setupCommand codex execution', () => {
 
     expect(execFileMock).toHaveBeenCalledWith(
       'codex',
-      ['mcp', 'add', 'gitnexus', '--', 'npx', '-y', NPX_REF, 'mcp'],
+      ['mcp', 'add', 'gitnexus', '--', 'npx', '-y', MCP_EXACT_PACKAGE_REF, 'mcp'],
       { shell: false, windowsHide: true },
       expect.any(Function),
     );

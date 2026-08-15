@@ -24,7 +24,9 @@ import { createRequire } from 'module';
 
 const PKG_VERSION = (createRequire(import.meta.url)('../../package.json') as { version: string })
   .version;
-const NPX_REF = `gitnexus@${PKG_VERSION}`;
+const MCP_EXACT_PACKAGE_REF =
+  `https://github.com/electricsheephq/evaOS-gitnexus/releases/download/` +
+  `electric%2Fv${PKG_VERSION}/gitnexus-${PKG_VERSION}.tgz`;
 
 // vi.hoisted lets the mock factory below (which is hoisted by Vitest) see
 // these vi.fn instances. Plain top-level consts would be unreachable at
@@ -109,7 +111,7 @@ describe('setupAntigravity', () => {
 
     expect(config.mcpServers.gitnexus).toEqual({
       command: 'npx',
-      args: ['-y', NPX_REF, 'mcp'],
+      args: ['-y', MCP_EXACT_PACKAGE_REF, 'mcp'],
     });
   });
 
@@ -127,7 +129,7 @@ describe('setupAntigravity', () => {
 
     expect(config.mcpServers.gitnexus).toEqual({
       command: 'cmd',
-      args: ['/c', 'npx', '-y', NPX_REF, 'mcp'],
+      args: ['/c', 'npx', '-y', MCP_EXACT_PACKAGE_REF, 'mcp'],
     });
   });
 

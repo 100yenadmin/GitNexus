@@ -165,7 +165,9 @@ describe('narrow electric skill contracts', () => {
     const text = fs.readFileSync(canonical('gitnexus-impact-analysis'), 'utf8');
     expect(text).toContain('lower-bound graph heuristic');
     expect(text).toContain('`UNKNOWN` is not a low rung');
-    expect(text).toContain('`partial: true` or `truncated: true`');
+    expect(text).toContain('`pagination.truncated: true`');
+    expect(text).toContain('HIGH or CRITICAL');
+    expect(text).toContain('untracked files');
     expect(text).not.toContain('WILL BREAK');
   });
 
@@ -173,7 +175,8 @@ describe('narrow electric skill contracts', () => {
     const text = fs.readFileSync(canonical('gitnexus-refactoring'), 'utf8');
     expect(text).toContain('not an immutable transaction');
     expect(text).toContain('untracked files');
-    expect(text).toContain('`partial: true` or `truncated: true`');
+    expect(text).toContain('`status: "partial"`');
+    expect(text).toContain('`failed_files`');
   });
 
   it('keeps PDG examples anchored and bounded', () => {
@@ -204,6 +207,7 @@ describe('narrow electric skill contracts', () => {
     ]) {
       expect(guide).toContain(resource);
     }
+    expect(guide).toContain('`group_sync` rebuilds');
     expect(cli).toContain('GITNEXUS_EMBEDDING_API_KEY');
     expect(cli).toContain('public, account-visible write');
     expect(cli).not.toContain('gitnexus@latest');

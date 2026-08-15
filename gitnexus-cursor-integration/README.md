@@ -50,7 +50,7 @@ If you already have a `.cursor/hooks.json`, merge the `hooks.postToolUse` array 
 | Step                                                                 | Automated by `gitnexus setup`? |
 | -------------------------------------------------------------------- | ------------------------------ |
 | `~/.cursor/mcp.json`                                                 | ✅                             |
-| `~/.cursor/skills/gitnexus/*`                                        | ✅                             |
+| `~/.cursor/skills/gitnexus-*/SKILL.md`                               | ✅                             |
 | `<project>/.cursor/hooks.json` + `<project>/hooks/gitnexus-hook.cjs` + `<project>/hooks/hook-lock.cjs` | ❌ — copy manually (see above) |
 
 Hook install is per-project (Cursor scopes hooks to a project root); skills and MCP config are global.

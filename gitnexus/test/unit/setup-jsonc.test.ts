@@ -7,7 +7,9 @@ import { createRequire } from 'module';
 
 const PKG_VERSION = (createRequire(import.meta.url)('../../package.json') as { version: string })
   .version;
-const NPX_REF = `gitnexus@${PKG_VERSION}`;
+const MCP_EXACT_PACKAGE_REF =
+  `https://github.com/electricsheephq/evaOS-gitnexus/releases/download/` +
+  `electric%2Fv${PKG_VERSION}/gitnexus-${PKG_VERSION}.tgz`;
 
 const execFileMock = vi.fn((...args: any[]) => {
   const callback = args.at(-1);
@@ -237,7 +239,7 @@ describe('setupOpenCode — JSONC preservation', () => {
 
     expect(config.mcp.gitnexus).toEqual({
       type: 'local',
-      command: ['npx', '-y', NPX_REF, 'mcp'],
+      command: ['npx', '-y', MCP_EXACT_PACKAGE_REF, 'mcp'],
     });
   });
 
@@ -259,7 +261,7 @@ describe('setupOpenCode — JSONC preservation', () => {
 
     expect(config.mcp.gitnexus).toEqual({
       type: 'local',
-      command: ['cmd', '/c', 'npx', '-y', NPX_REF, 'mcp'],
+      command: ['cmd', '/c', 'npx', '-y', MCP_EXACT_PACKAGE_REF, 'mcp'],
     });
   });
 
@@ -281,7 +283,7 @@ describe('setupOpenCode — JSONC preservation', () => {
 
     expect(config.mcp.gitnexus).toEqual({
       type: 'local',
-      command: ['cmd', '/c', 'npx', '-y', NPX_REF, 'mcp'],
+      command: ['cmd', '/c', 'npx', '-y', MCP_EXACT_PACKAGE_REF, 'mcp'],
     });
   });
 
@@ -417,7 +419,7 @@ describe('setupCursor — JSONC preservation', () => {
 
     expect(config.mcpServers.gitnexus).toEqual({
       command: 'cmd',
-      args: ['/c', 'npx', '-y', NPX_REF, 'mcp'],
+      args: ['/c', 'npx', '-y', MCP_EXACT_PACKAGE_REF, 'mcp'],
     });
   });
 });
