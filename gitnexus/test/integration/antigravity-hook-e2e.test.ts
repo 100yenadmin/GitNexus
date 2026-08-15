@@ -160,11 +160,11 @@ describe('antigravity hook adapter e2e', () => {
       expect(result.stderr).toContain('[GitNexus] index is stale');
     });
 
-    it('auto-detects a PATH-installed gitnexus and suggests `gitnexus analyze` (no npx)', () => {
+    it('rejects an unverified PATH gitnexus and suggests the exact Electric artifact', () => {
       // No GITNEXUS_INVOCATION forcing — exercises the installed hook's real PATH
       // probe (#1938). The installed adapter resolves the analyze command through
-      // the copied resolve-analyze-cmd.cjs, so a launcher on PATH yields
-      // `gitnexus analyze` rather than the npm-11 npx crash path.
+      // the copied resolve-analyze-cmd.cjs. The fixture has no Electric version
+      // receipt, so the hook must bypass it and use the exact release artifact.
       fs.writeFileSync(
         path.join(gitNexusDir, 'meta.json'),
         JSON.stringify({ lastCommit: 'a'.repeat(39) + 'b', stats: {} }),
@@ -186,8 +186,8 @@ describe('antigravity hook adapter e2e', () => {
 
         const output = parseHookOutput(result.stdout);
         expect(output).not.toBeNull();
-        expect(output!.additionalContext).toContain('Run `gitnexus analyze`');
-        expect(output!.additionalContext).not.toContain('npx gitnexus');
+        expect(output!.additionalContext).toContain('gitnexus-1.6.10-electric.10.tgz analyze');
+        expect(output!.additionalContext).not.toContain('Run `gitnexus analyze`');
       } finally {
         gn.cleanup();
       }
