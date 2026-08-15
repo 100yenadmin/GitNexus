@@ -62,7 +62,7 @@ function readGitnexusVersion(command: string): string | null {
       // characters here; reject them rather than constructing shell text.
       if (/[\r\n"]/u.test(command)) return null;
       program = process.env.ComSpec || 'cmd.exe';
-      args = ['/d', '/s', '/c', `"${command}" --version`];
+      args = ['/d', '/s', '/c', `""${command}" --version"`];
     }
 
     const output = execFileSync(program, args, {

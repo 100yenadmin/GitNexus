@@ -148,7 +148,7 @@ function probeGitnexusVersion(command) {
     if (process.platform === 'win32' && /\.(cmd|bat)$/i.test(command)) {
       if (/[\r\n"]/u.test(command)) return null;
       program = process.env.ComSpec || 'cmd.exe';
-      args = ['/d', '/s', '/c', `"${command}" --version`];
+      args = ['/d', '/s', '/c', `""${command}" --version"`];
     }
     const output = execFileSync(program, args, {
       encoding: 'utf-8',
