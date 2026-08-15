@@ -243,12 +243,7 @@ describe('setupClaudeCode', () => {
     expect(execFileSyncMock).toHaveBeenNthCalledWith(
       2,
       'cmd.exe',
-      [
-        '/d',
-        '/s',
-        '/c',
-        '"C:\\Users\\First Last\\AppData\\Roaming\\npm\\gitnexus.cmd" --version',
-      ],
+      ['/d', '/s', '/c', '"C:\\Users\\First Last\\AppData\\Roaming\\npm\\gitnexus.cmd" --version'],
       expect.objectContaining({ encoding: 'utf-8' }),
     );
   });

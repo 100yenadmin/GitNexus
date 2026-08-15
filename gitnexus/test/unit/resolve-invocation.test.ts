@@ -10,14 +10,7 @@ import {
   warnIfNpm11NpxRisk,
   NPX_REF,
 } from '../../src/cli/resolve-invocation.js';
-import {
-  readFileSync,
-  mkdtempSync,
-  mkdirSync,
-  writeFileSync,
-  chmodSync,
-  rmSync,
-} from 'node:fs';
+import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import path from 'node:path';
 import os from 'node:os';
