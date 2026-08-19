@@ -460,6 +460,22 @@ export const assertVectorRepairPreflight = async (
       'Cannot repair VECTOR while index metadata records an incomplete analysis or embedding checkpoint.',
     );
   }
+  if (checkpoint && checkpointComplete) {
+    // The checkpoint is the only durable record of which model produced the
+    // stored vectors. The resume path refuses a model/dimension mismatch, and
+    // repair clears the checkpoint on success — so repairing through a
+    // mismatched identity would build HNSW over incompatible rows AND erase
+    // the evidence. Mirror the resume-path guard before allowing either.
+    const identity = await resolveEmbeddingIdentity();
+    if (checkpoint.model !== identity.model || checkpoint.dimensions !== identity.dimensions) {
+      throw new Error(
+        `Cannot repair VECTOR: the completed embedding checkpoint records ${checkpoint.model} at ` +
+          `${checkpoint.dimensions} dimensions, but this run resolves ${identity.model} at ` +
+          `${identity.dimensions}. Restore the matching embedding configuration, or rebuild with ` +
+          'analyze --drop-embeddings --embeddings.',
+      );
+    }
+  }
   return meta;
 };
 

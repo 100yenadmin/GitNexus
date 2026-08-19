@@ -45,14 +45,33 @@ async function createIndexedFixture(embeddings = 3, metaExtras: Partial<RepoMeta
   return { fixture, paths, meta };
 }
 
+// Matches the identity resolveEmbeddingIdentity() yields when no
+// GITNEXUS_EMBEDDING_* env is set (DEFAULT_EMBEDDING_CONFIG, local mode).
 const completedCheckpoint = {
   at: '2026-08-19T14:39:59.336Z',
   nodesProcessed: 5,
   totalNodes: 5,
   chunksProcessed: 6,
-  model: 'voyage-code-3',
-  dimensions: 2048,
+  model: 'Snowflake/snowflake-arctic-embed-xs',
+  dimensions: 384,
 } as const;
+
+const EMBEDDING_ENV_KEYS = [
+  'GITNEXUS_EMBEDDING_MODEL',
+  'GITNEXUS_EMBEDDING_URL',
+  'GITNEXUS_EMBEDDING_DIMS',
+] as const;
+
+function pinDefaultEmbeddingIdentity() {
+  const saved = EMBEDDING_ENV_KEYS.map((key) => [key, process.env[key]] as const);
+  for (const key of EMBEDDING_ENV_KEYS) delete process.env[key];
+  return () => {
+    for (const [key, value] of saved) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  };
+}
 
 async function importRepairSubject(options: {
   counts?: number[];
@@ -434,6 +453,7 @@ describe('runFullAnalysis VECTOR-only repair (#170)', () => {
   });
 
   it('repairs through a completed embedding checkpoint and clears the marker (#132)', async () => {
+    const restoreEnv = pinDefaultEmbeddingIdentity();
     const indexed = await createIndexedFixture(3, {
       embeddingCheckpoint: { ...completedCheckpoint },
     });
@@ -455,6 +475,29 @@ describe('runFullAnalysis VECTOR-only repair (#170)', () => {
       expect(repaired.incrementalInProgress).toBeUndefined();
       expect(repaired.capabilities.vectorSearch.status).toBe('vector-index');
     } finally {
+      restoreEnv();
+      await indexed.fixture.cleanup();
+    }
+  });
+
+  it('refuses a completed checkpoint whose embedding identity does not match this run', async () => {
+    const restoreEnv = pinDefaultEmbeddingIdentity();
+    const indexed = await createIndexedFixture(3, {
+      embeddingCheckpoint: { ...completedCheckpoint, model: 'voyage-code-3', dimensions: 2048 },
+    });
+    try {
+      const { runFullAnalysis, mocks } = await importRepairSubject({});
+      await expect(
+        runFullAnalysis(indexed.fixture.dbPath, { repairVector: true }, { onProgress: () => {} }),
+      ).rejects.toThrow(/records voyage-code-3 at 2048 dimensions/i);
+      expect(mocks.initLbugForMaintenance).not.toHaveBeenCalled();
+
+      const untouched = JSON.parse(
+        await fs.readFile(path.join(indexed.paths.storagePath, 'gitnexus.json'), 'utf8'),
+      );
+      expect(untouched.embeddingCheckpoint).toMatchObject({ model: 'voyage-code-3' });
+    } finally {
+      restoreEnv();
       await indexed.fixture.cleanup();
     }
   });
