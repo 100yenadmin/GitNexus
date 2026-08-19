@@ -921,22 +921,26 @@ const runFullAnalysisImpl = async (
     // but the integrity scan only proves the live rows are well-formed, not
     // that none went missing after the final checkpoint (a dirty-recovery
     // discard can drop committed rows). stats.embeddings is the persisted
-    // expectation from the interrupted run; refuse to certify a smaller table
-    // and reconcile the count downward. This must precede the zero-row branch
-    // below, or TOTAL row loss returns a successful `not-indexed` while
-    // metadata still expects a populated table. An operator who deliberately
-    // removed rows must update stats.embeddings alongside (the recovery
-    // playbook's existing contract).
+    // floor from before the crash; refuse to certify a table that fell BELOW
+    // it and reconcile the count downward. A deficit-only comparison, not
+    // equality: stats.embeddings is finalized at run end, so in the supported
+    // crash window (died between the last embedding write and finalize) the
+    // live table legitimately holds MORE rows than the stale expectation —
+    // and the server checkpoint producer never persists a count at all. This
+    // must precede the zero-row branch below, or TOTAL row loss returns a
+    // successful `not-indexed` while metadata still expects a populated
+    // table. An operator who deliberately removed rows must update
+    // stats.embeddings alongside (the recovery playbook's existing contract).
     if (
       existingMeta.embeddingCheckpoint &&
       typeof existingMeta.stats?.embeddings === 'number' &&
-      existingMeta.stats.embeddings !== embeddingCountBefore
+      embeddingCountBefore < existingMeta.stats.embeddings
     ) {
       throw new Error(
-        `Cannot repair VECTOR: metadata expects ${existingMeta.stats.embeddings} embedding rows ` +
-          `but the table holds ${embeddingCountBefore}. Rows were lost or removed after the ` +
-          'completed checkpoint; re-run analyze --embeddings to regenerate them, or correct ' +
-          'stats.embeddings if the removal was deliberate.',
+        `Cannot repair VECTOR: metadata expects at least ${existingMeta.stats.embeddings} ` +
+          `embedding rows but the table holds ${embeddingCountBefore}. Rows were lost or removed ` +
+          'after the completed checkpoint; re-run analyze --embeddings to regenerate them, or ' +
+          'correct stats.embeddings if the removal was deliberate.',
       );
     }
 
