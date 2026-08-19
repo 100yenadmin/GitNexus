@@ -443,7 +443,19 @@ export const assertVectorRepairPreflight = async (
 
   const meta = await loadMeta(path.dirname(paths.metaPath));
   if (!meta) throw new Error('Cannot repair VECTOR: index metadata is missing.');
-  if (meta.incrementalInProgress || meta.embeddingCheckpoint) {
+  // A checkpoint whose window is fully persisted (all nodes processed, no
+  // pending window) only means the run died between the last embedding write
+  // and finalize — the embedding table is complete, and the repair path still
+  // verifies it via inspectEmbeddingIntegrity before, during, and after the
+  // rebuild. Refusing it forces a full re-embed for an index that is already
+  // whole (#132). A pending window may hold partially persisted chunk rows, so
+  // it stays blocking, as does any in-progress incremental write.
+  const checkpoint = meta.embeddingCheckpoint;
+  const checkpointComplete =
+    checkpoint !== undefined &&
+    checkpoint.nodesProcessed === checkpoint.totalNodes &&
+    !checkpoint.pendingNodeIds?.length;
+  if (meta.incrementalInProgress || (checkpoint && !checkpointComplete)) {
     throw new Error(
       'Cannot repair VECTOR while index metadata records an incomplete analysis or embedding checkpoint.',
     );
@@ -1003,6 +1015,11 @@ const runFullAnalysisImpl = async (
       );
       repairedMeta = {
         ...existingMeta,
+        // A completed embedding checkpoint may pass the preflight (see
+        // assertVectorRepairPreflight); a successful repair must not persist
+        // the stale marker, or the next repair/resume re-enters recovery.
+        embeddingCheckpoint: undefined,
+        incrementalInProgress: undefined,
         repoPath,
         remoteUrl: repositoryRemoteUrl ?? existingMeta.remoteUrl,
         stats: {

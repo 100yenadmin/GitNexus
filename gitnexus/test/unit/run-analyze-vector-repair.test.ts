@@ -20,7 +20,7 @@ const brokenProbe = {
   vectorIndexReason: 'vector-index-missing-or-unqueryable' as const,
 };
 
-async function createIndexedFixture(embeddings = 3) {
+async function createIndexedFixture(embeddings = 3, metaExtras: Partial<RepoMeta> = {}) {
   const fixture = await createTempDir('gitnexus-vector-repair-');
   const paths = getStoragePaths(fixture.dbPath);
   await fs.mkdir(paths.storagePath, { recursive: true });
@@ -39,10 +39,20 @@ async function createIndexedFixture(embeddings = 3) {
         exactScanLimit: 20_000,
       },
     },
+    ...metaExtras,
   };
   await saveMeta(paths.storagePath, meta);
   return { fixture, paths, meta };
 }
+
+const completedCheckpoint = {
+  at: '2026-08-19T14:39:59.336Z',
+  nodesProcessed: 5,
+  totalNodes: 5,
+  chunksProcessed: 6,
+  model: 'voyage-code-3',
+  dimensions: 2048,
+} as const;
 
 async function importRepairSubject(options: {
   counts?: number[];
@@ -370,6 +380,80 @@ describe('runFullAnalysis VECTOR-only repair (#170)', () => {
         runFullAnalysis(indexed.fixture.dbPath, { repairVector: true }, { onProgress: () => {} }),
       ).rejects.toThrow(/lock or recovery state is present/i);
       expect(mocks.initLbugForMaintenance).not.toHaveBeenCalled();
+    } finally {
+      await indexed.fixture.cleanup();
+    }
+  });
+
+  it('refuses repair while an incremental analysis is in progress', async () => {
+    const indexed = await createIndexedFixture(3, {
+      incrementalInProgress: { startedAt: 1_787_151_443_267, toWriteCount: 0 },
+    });
+    try {
+      const { runFullAnalysis, mocks } = await importRepairSubject({});
+      await expect(
+        runFullAnalysis(indexed.fixture.dbPath, { repairVector: true }, { onProgress: () => {} }),
+      ).rejects.toThrow(/incomplete analysis or embedding checkpoint/i);
+      expect(mocks.initLbugForMaintenance).not.toHaveBeenCalled();
+    } finally {
+      await indexed.fixture.cleanup();
+    }
+  });
+
+  it('refuses repair while an embedding checkpoint has unprocessed nodes', async () => {
+    const indexed = await createIndexedFixture(3, {
+      embeddingCheckpoint: { ...completedCheckpoint, nodesProcessed: 3 },
+    });
+    try {
+      const { runFullAnalysis, mocks } = await importRepairSubject({});
+      await expect(
+        runFullAnalysis(indexed.fixture.dbPath, { repairVector: true }, { onProgress: () => {} }),
+      ).rejects.toThrow(/incomplete analysis or embedding checkpoint/i);
+      expect(mocks.initLbugForMaintenance).not.toHaveBeenCalled();
+    } finally {
+      await indexed.fixture.cleanup();
+    }
+  });
+
+  it('refuses repair while a complete-count checkpoint still has a pending window', async () => {
+    const indexed = await createIndexedFixture(3, {
+      embeddingCheckpoint: {
+        ...completedCheckpoint,
+        pendingNodeIds: ['Function:src/auth.ts:validateToken'],
+      },
+    });
+    try {
+      const { runFullAnalysis, mocks } = await importRepairSubject({});
+      await expect(
+        runFullAnalysis(indexed.fixture.dbPath, { repairVector: true }, { onProgress: () => {} }),
+      ).rejects.toThrow(/incomplete analysis or embedding checkpoint/i);
+      expect(mocks.initLbugForMaintenance).not.toHaveBeenCalled();
+    } finally {
+      await indexed.fixture.cleanup();
+    }
+  });
+
+  it('repairs through a completed embedding checkpoint and clears the marker (#132)', async () => {
+    const indexed = await createIndexedFixture(3, {
+      embeddingCheckpoint: { ...completedCheckpoint },
+    });
+    try {
+      const { runFullAnalysis, mocks } = await importRepairSubject({});
+      const result = await runFullAnalysis(
+        indexed.fixture.dbPath,
+        { repairVector: true },
+        { onProgress: () => {} },
+      );
+
+      expect(result.vectorRepairStatus).toBe('repaired');
+      expect(mocks.createVectorIndex).toHaveBeenCalledOnce();
+
+      const repaired = JSON.parse(
+        await fs.readFile(path.join(indexed.paths.storagePath, 'gitnexus.json'), 'utf8'),
+      );
+      expect(repaired.embeddingCheckpoint).toBeUndefined();
+      expect(repaired.incrementalInProgress).toBeUndefined();
+      expect(repaired.capabilities.vectorSearch.status).toBe('vector-index');
     } finally {
       await indexed.fixture.cleanup();
     }
