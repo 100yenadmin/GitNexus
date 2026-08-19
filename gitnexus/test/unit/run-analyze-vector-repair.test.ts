@@ -502,68 +502,11 @@ describe('runFullAnalysis VECTOR-only repair (#170)', () => {
     }
   });
 
-  it('refuses a completed checkpoint when embedding rows went missing after it', async () => {
-    const restoreEnv = pinDefaultEmbeddingIdentity();
-    // Metadata expects 5 rows; the mocked live table only holds 3.
-    const indexed = await createIndexedFixture(5, {
-      embeddingCheckpoint: { ...completedCheckpoint },
-    });
-    try {
-      const { runFullAnalysis, mocks } = await importRepairSubject({ counts: [3, 3, 3, 3] });
-      await expect(
-        runFullAnalysis(indexed.fixture.dbPath, { repairVector: true }, { onProgress: () => {} }),
-      ).rejects.toThrow(/expects at least 5 embedding rows but the table holds 3/i);
-      expect(mocks.initLbugForMaintenance).not.toHaveBeenCalled();
-
-      const untouched = JSON.parse(
-        await fs.readFile(path.join(indexed.paths.storagePath, 'gitnexus.json'), 'utf8'),
-      );
-      expect(untouched.embeddingCheckpoint).toMatchObject({
-        model: completedCheckpoint.model,
-      });
-      expect(untouched.stats.embeddings).toBe(5);
-    } finally {
-      restoreEnv();
-      await indexed.fixture.cleanup();
-    }
-  });
-
-  it('repairs when the live table holds MORE rows than the stale pre-finalize stats', async () => {
-    const restoreEnv = pinDefaultEmbeddingIdentity();
-    // The supported crash window: the run died between the last embedding
-    // write and finalize, so stats.embeddings still holds the OLD count (3)
-    // while the table already holds the completed checkpoint's rows (5).
-    // A deficit-only guard must let this repair; exact equality would refuse
-    // exactly the state this recovery path exists for.
-    const indexed = await createIndexedFixture(3, {
-      embeddingCheckpoint: { ...completedCheckpoint },
-    });
-    try {
-      const { runFullAnalysis, mocks } = await importRepairSubject({ counts: [5, 5, 5, 5] });
-      const result = await runFullAnalysis(
-        indexed.fixture.dbPath,
-        { repairVector: true },
-        { onProgress: () => {} },
-      );
-
-      expect(result.vectorRepairStatus).toBe('repaired');
-      expect(mocks.createVectorIndex).toHaveBeenCalledOnce();
-
-      const repaired = JSON.parse(
-        await fs.readFile(path.join(indexed.paths.storagePath, 'gitnexus.json'), 'utf8'),
-      );
-      expect(repaired.embeddingCheckpoint).toBeUndefined();
-      expect(repaired.stats.embeddings).toBe(5);
-    } finally {
-      restoreEnv();
-      await indexed.fixture.cleanup();
-    }
-  });
-
   it('refuses rather than returning not-indexed when ALL rows vanished after a completed checkpoint', async () => {
     const restoreEnv = pinDefaultEmbeddingIdentity();
-    // Metadata expects 5 rows; the mocked live table holds zero. Without the
-    // pre-zero-row guard this exits as a successful `not-indexed`.
+    // The completed checkpoint recorded embedded nodes; the mocked live table
+    // holds zero. Without the pre-zero-row guard this exits as a successful
+    // `not-indexed`.
     const indexed = await createIndexedFixture(5, {
       embeddingCheckpoint: { ...completedCheckpoint },
     });
@@ -571,7 +514,7 @@ describe('runFullAnalysis VECTOR-only repair (#170)', () => {
       const { runFullAnalysis, mocks } = await importRepairSubject({ counts: [0, 0, 0, 0] });
       await expect(
         runFullAnalysis(indexed.fixture.dbPath, { repairVector: true }, { onProgress: () => {} }),
-      ).rejects.toThrow(/expects at least 5 embedding rows but the table holds 0/i);
+      ).rejects.toThrow(/recorded 5 embedded nodes but the table holds no rows/i);
       expect(mocks.initLbugForMaintenance).not.toHaveBeenCalled();
 
       const untouched = JSON.parse(

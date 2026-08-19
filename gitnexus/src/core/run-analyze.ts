@@ -917,30 +917,29 @@ const runFullAnalysisImpl = async (
     stats = readOnlyPreflight.stats;
     embeddingCountBefore = readOnlyPreflight.embeddingCount;
 
-    // A completed checkpoint passed the preflight, so repair would clear it —
+    // A completed checkpoint passed the preflight, so repair will clear it —
     // but the integrity scan only proves the live rows are well-formed, not
     // that none went missing after the final checkpoint (a dirty-recovery
-    // discard can drop committed rows). stats.embeddings is the persisted
-    // floor from before the crash; refuse to certify a table that fell BELOW
-    // it and reconcile the count downward. A deficit-only comparison, not
-    // equality: stats.embeddings is finalized at run end, so in the supported
-    // crash window (died between the last embedding write and finalize) the
-    // live table legitimately holds MORE rows than the stale expectation —
-    // and the server checkpoint producer never persists a count at all. This
-    // must precede the zero-row branch below, or TOTAL row loss returns a
-    // successful `not-indexed` while metadata still expects a populated
-    // table. An operator who deliberately removed rows must update
-    // stats.embeddings alongside (the recovery playbook's existing contract).
+    // discard can drop committed rows). stats.embeddings cannot serve as the
+    // expectation: it is stale-low across the supported crash window (it is
+    // finalized at run end) and stale-high when re-embedding legitimately
+    // shrinks a node's chunk count (the server producer never persists a
+    // count at all) — review on #192 produced counterexamples in both
+    // directions. The only loss provable from the checkpoint alone is TOTAL
+    // loss: it records embedded nodes, so an empty table is wrong in every
+    // history. Refuse that here — before the zero-row branch below would
+    // report a successful `not-indexed` — and leave partial-loss detection
+    // to a persisted per-checkpoint row count (#194).
     if (
       existingMeta.embeddingCheckpoint &&
-      typeof existingMeta.stats?.embeddings === 'number' &&
-      embeddingCountBefore < existingMeta.stats.embeddings
+      existingMeta.embeddingCheckpoint.totalNodes > 0 &&
+      embeddingCountBefore === 0
     ) {
       throw new Error(
-        `Cannot repair VECTOR: metadata expects at least ${existingMeta.stats.embeddings} ` +
-          `embedding rows but the table holds ${embeddingCountBefore}. Rows were lost or removed ` +
-          'after the completed checkpoint; re-run analyze --embeddings to regenerate them, or ' +
-          'correct stats.embeddings if the removal was deliberate.',
+        `Cannot repair VECTOR: the completed embedding checkpoint recorded ` +
+          `${existingMeta.embeddingCheckpoint.totalNodes} embedded nodes but the table holds no ` +
+          'rows. The embedding table was lost after the checkpoint; re-run analyze --embeddings ' +
+          'to regenerate it.',
       );
     }
 
