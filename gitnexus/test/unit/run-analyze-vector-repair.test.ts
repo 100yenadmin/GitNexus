@@ -502,6 +502,41 @@ describe('runFullAnalysis VECTOR-only repair (#170)', () => {
     }
   });
 
+  it('clears a completed zero-node checkpoint on the not-indexed path (empty repository)', async () => {
+    const restoreEnv = pinDefaultEmbeddingIdentity();
+    // An empty repository's embed run completed trivially (totalNodes 0) and
+    // crashed before finalize. Repair must report not-indexed AND clear the
+    // checkpoint, or the repo stays permanently marked as interrupted.
+    const indexed = await createIndexedFixture(0, {
+      embeddingCheckpoint: {
+        ...completedCheckpoint,
+        nodesProcessed: 0,
+        totalNodes: 0,
+        chunksProcessed: 0,
+      },
+    });
+    try {
+      const { runFullAnalysis, mocks } = await importRepairSubject({ counts: [0, 0, 0, 0] });
+      const result = await runFullAnalysis(
+        indexed.fixture.dbPath,
+        { repairVector: true },
+        { onProgress: () => {} },
+      );
+
+      expect(result.vectorRepairStatus).toBe('not-indexed');
+      expect(mocks.initLbugForMaintenance).not.toHaveBeenCalled();
+
+      const cleared = JSON.parse(
+        await fs.readFile(path.join(indexed.paths.storagePath, 'gitnexus.json'), 'utf8'),
+      );
+      expect(cleared.embeddingCheckpoint).toBeUndefined();
+      expect(cleared.incrementalInProgress).toBeUndefined();
+    } finally {
+      restoreEnv();
+      await indexed.fixture.cleanup();
+    }
+  });
+
   it('refuses rather than returning not-indexed when ALL rows vanished after a completed checkpoint', async () => {
     const restoreEnv = pinDefaultEmbeddingIdentity();
     // The completed checkpoint recorded embedded nodes; the mocked live table

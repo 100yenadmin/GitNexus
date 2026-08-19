@@ -944,6 +944,17 @@ const runFullAnalysisImpl = async (
     }
 
     if (embeddingCountBefore === 0) {
+      // Only a zero-node completed checkpoint reaches here (a populated one
+      // threw above). Clear it before returning, or an empty repository stays
+      // permanently marked as interrupted and later repair/resume keeps
+      // observing stale recovery state.
+      if (existingMeta.embeddingCheckpoint) {
+        await saveMeta(canonicalMetaDir, {
+          ...existingMeta,
+          embeddingCheckpoint: undefined,
+          incrementalInProgress: undefined,
+        });
+      }
       progress('done', 100, 'No embeddings are indexed; VECTOR repair was not needed.');
       return {
         repoName:
