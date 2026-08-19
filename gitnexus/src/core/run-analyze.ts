@@ -936,6 +936,27 @@ const runFullAnalysisImpl = async (
       embeddingCountBefore,
     );
 
+    // A completed checkpoint passed the preflight, so repair will clear it —
+    // but the integrity scan only proves the live rows are well-formed, not
+    // that none went missing after the final checkpoint (a dirty-recovery
+    // discard can drop committed rows). stats.embeddings is the persisted
+    // expectation from the interrupted run; refuse to certify a smaller table
+    // and reconcile the count downward. An operator who deliberately removed
+    // rows must update stats.embeddings alongside (the recovery playbook's
+    // existing contract).
+    if (
+      existingMeta.embeddingCheckpoint &&
+      typeof existingMeta.stats?.embeddings === 'number' &&
+      existingMeta.stats.embeddings !== embeddingCountBefore
+    ) {
+      throw new Error(
+        `Cannot repair VECTOR: metadata expects ${existingMeta.stats.embeddings} embedding rows ` +
+          `but the table holds ${embeddingCountBefore}. Rows were lost or removed after the ` +
+          'completed checkpoint; re-run analyze --embeddings to regenerate them, or correct ' +
+          'stats.embeddings if the removal was deliberate.',
+      );
+    }
+
     const beforeProbe = await probeDoctorPool(canonicalPaths.lbugPath);
 
     try {
