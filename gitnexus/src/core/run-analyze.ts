@@ -443,10 +443,38 @@ export const assertVectorRepairPreflight = async (
 
   const meta = await loadMeta(path.dirname(paths.metaPath));
   if (!meta) throw new Error('Cannot repair VECTOR: index metadata is missing.');
-  if (meta.incrementalInProgress || meta.embeddingCheckpoint) {
+  // A checkpoint whose window is fully persisted (all nodes processed, no
+  // pending window) only means the run died between the last embedding write
+  // and finalize — the embedding table is complete, and the repair path still
+  // verifies it via inspectEmbeddingIntegrity before, during, and after the
+  // rebuild. Refusing it forces a full re-embed for an index that is already
+  // whole (#132). A pending window may hold partially persisted chunk rows, so
+  // it stays blocking, as does any in-progress incremental write.
+  const checkpoint = meta.embeddingCheckpoint;
+  const checkpointComplete =
+    checkpoint !== undefined &&
+    checkpoint.nodesProcessed === checkpoint.totalNodes &&
+    !checkpoint.pendingNodeIds?.length;
+  if (meta.incrementalInProgress || (checkpoint && !checkpointComplete)) {
     throw new Error(
       'Cannot repair VECTOR while index metadata records an incomplete analysis or embedding checkpoint.',
     );
+  }
+  if (checkpoint && checkpointComplete) {
+    // The checkpoint is the only durable record of which model produced the
+    // stored vectors. The resume path refuses a model/dimension mismatch, and
+    // repair clears the checkpoint on success — so repairing through a
+    // mismatched identity would build HNSW over incompatible rows AND erase
+    // the evidence. Mirror the resume-path guard before allowing either.
+    const identity = await resolveEmbeddingIdentity();
+    if (checkpoint.model !== identity.model || checkpoint.dimensions !== identity.dimensions) {
+      throw new Error(
+        `Cannot repair VECTOR: the completed embedding checkpoint records ${checkpoint.model} at ` +
+          `${checkpoint.dimensions} dimensions, but this run resolves ${identity.model} at ` +
+          `${identity.dimensions}. Restore the matching embedding configuration, or rebuild with ` +
+          'analyze --drop-embeddings --embeddings.',
+      );
+    }
   }
   return meta;
 };
@@ -889,7 +917,44 @@ const runFullAnalysisImpl = async (
     stats = readOnlyPreflight.stats;
     embeddingCountBefore = readOnlyPreflight.embeddingCount;
 
+    // A completed checkpoint passed the preflight, so repair will clear it —
+    // but the integrity scan only proves the live rows are well-formed, not
+    // that none went missing after the final checkpoint (a dirty-recovery
+    // discard can drop committed rows). stats.embeddings cannot serve as the
+    // expectation: it is stale-low across the supported crash window (it is
+    // finalized at run end) and stale-high when re-embedding legitimately
+    // shrinks a node's chunk count (the server producer never persists a
+    // count at all) — review on #192 produced counterexamples in both
+    // directions. The only loss provable from the checkpoint alone is TOTAL
+    // loss: it records embedded nodes, so an empty table is wrong in every
+    // history. Refuse that here — before the zero-row branch below would
+    // report a successful `not-indexed` — and leave partial-loss detection
+    // to a persisted per-checkpoint row count (#194).
+    if (
+      existingMeta.embeddingCheckpoint &&
+      existingMeta.embeddingCheckpoint.totalNodes > 0 &&
+      embeddingCountBefore === 0
+    ) {
+      throw new Error(
+        `Cannot repair VECTOR: the completed embedding checkpoint recorded ` +
+          `${existingMeta.embeddingCheckpoint.totalNodes} embedded nodes but the table holds no ` +
+          'rows. The embedding table was lost after the checkpoint; re-run analyze --embeddings ' +
+          'to regenerate it.',
+      );
+    }
+
     if (embeddingCountBefore === 0) {
+      // Only a zero-node completed checkpoint reaches here (a populated one
+      // threw above). Clear it before returning, or an empty repository stays
+      // permanently marked as interrupted and later repair/resume keeps
+      // observing stale recovery state.
+      if (existingMeta.embeddingCheckpoint) {
+        await saveMeta(canonicalMetaDir, {
+          ...existingMeta,
+          embeddingCheckpoint: undefined,
+          incrementalInProgress: undefined,
+        });
+      }
       progress('done', 100, 'No embeddings are indexed; VECTOR repair was not needed.');
       return {
         repoName:
@@ -1003,6 +1068,11 @@ const runFullAnalysisImpl = async (
       );
       repairedMeta = {
         ...existingMeta,
+        // A completed embedding checkpoint may pass the preflight (see
+        // assertVectorRepairPreflight); a successful repair must not persist
+        // the stale marker, or the next repair/resume re-enters recovery.
+        embeddingCheckpoint: undefined,
+        incrementalInProgress: undefined,
         repoPath,
         remoteUrl: repositoryRemoteUrl ?? existingMeta.remoteUrl,
         stats: {

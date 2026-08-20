@@ -20,7 +20,7 @@ const brokenProbe = {
   vectorIndexReason: 'vector-index-missing-or-unqueryable' as const,
 };
 
-async function createIndexedFixture(embeddings = 3) {
+async function createIndexedFixture(embeddings = 3, metaExtras: Partial<RepoMeta> = {}) {
   const fixture = await createTempDir('gitnexus-vector-repair-');
   const paths = getStoragePaths(fixture.dbPath);
   await fs.mkdir(paths.storagePath, { recursive: true });
@@ -39,9 +39,38 @@ async function createIndexedFixture(embeddings = 3) {
         exactScanLimit: 20_000,
       },
     },
+    ...metaExtras,
   };
   await saveMeta(paths.storagePath, meta);
   return { fixture, paths, meta };
+}
+
+// Matches the identity resolveEmbeddingIdentity() yields when no
+// GITNEXUS_EMBEDDING_* env is set (DEFAULT_EMBEDDING_CONFIG, local mode).
+const completedCheckpoint = {
+  at: '2026-08-19T14:39:59.336Z',
+  nodesProcessed: 5,
+  totalNodes: 5,
+  chunksProcessed: 6,
+  model: 'Snowflake/snowflake-arctic-embed-xs',
+  dimensions: 384,
+} as const;
+
+const EMBEDDING_ENV_KEYS = [
+  'GITNEXUS_EMBEDDING_MODEL',
+  'GITNEXUS_EMBEDDING_URL',
+  'GITNEXUS_EMBEDDING_DIMS',
+] as const;
+
+function pinDefaultEmbeddingIdentity() {
+  const saved = EMBEDDING_ENV_KEYS.map((key) => [key, process.env[key]] as const);
+  for (const key of EMBEDDING_ENV_KEYS) delete process.env[key];
+  return () => {
+    for (const [key, value] of saved) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  };
 }
 
 async function importRepairSubject(options: {
@@ -371,6 +400,193 @@ describe('runFullAnalysis VECTOR-only repair (#170)', () => {
       ).rejects.toThrow(/lock or recovery state is present/i);
       expect(mocks.initLbugForMaintenance).not.toHaveBeenCalled();
     } finally {
+      await indexed.fixture.cleanup();
+    }
+  });
+
+  it('refuses repair while an incremental analysis is in progress', async () => {
+    const indexed = await createIndexedFixture(3, {
+      incrementalInProgress: { startedAt: 1_787_151_443_267, toWriteCount: 0 },
+    });
+    try {
+      const { runFullAnalysis, mocks } = await importRepairSubject({});
+      await expect(
+        runFullAnalysis(indexed.fixture.dbPath, { repairVector: true }, { onProgress: () => {} }),
+      ).rejects.toThrow(/incomplete analysis or embedding checkpoint/i);
+      expect(mocks.initLbugForMaintenance).not.toHaveBeenCalled();
+    } finally {
+      await indexed.fixture.cleanup();
+    }
+  });
+
+  it('refuses repair while an embedding checkpoint has unprocessed nodes', async () => {
+    const indexed = await createIndexedFixture(3, {
+      embeddingCheckpoint: { ...completedCheckpoint, nodesProcessed: 3 },
+    });
+    try {
+      const { runFullAnalysis, mocks } = await importRepairSubject({});
+      await expect(
+        runFullAnalysis(indexed.fixture.dbPath, { repairVector: true }, { onProgress: () => {} }),
+      ).rejects.toThrow(/incomplete analysis or embedding checkpoint/i);
+      expect(mocks.initLbugForMaintenance).not.toHaveBeenCalled();
+    } finally {
+      await indexed.fixture.cleanup();
+    }
+  });
+
+  it('refuses repair while a complete-count checkpoint still has a pending window', async () => {
+    const indexed = await createIndexedFixture(3, {
+      embeddingCheckpoint: {
+        ...completedCheckpoint,
+        pendingNodeIds: ['Function:src/auth.ts:validateToken'],
+      },
+    });
+    try {
+      const { runFullAnalysis, mocks } = await importRepairSubject({});
+      await expect(
+        runFullAnalysis(indexed.fixture.dbPath, { repairVector: true }, { onProgress: () => {} }),
+      ).rejects.toThrow(/incomplete analysis or embedding checkpoint/i);
+      expect(mocks.initLbugForMaintenance).not.toHaveBeenCalled();
+    } finally {
+      await indexed.fixture.cleanup();
+    }
+  });
+
+  it('repairs through a completed embedding checkpoint and clears the marker (#132)', async () => {
+    const restoreEnv = pinDefaultEmbeddingIdentity();
+    const indexed = await createIndexedFixture(3, {
+      embeddingCheckpoint: { ...completedCheckpoint },
+    });
+    try {
+      const { runFullAnalysis, mocks } = await importRepairSubject({});
+      const result = await runFullAnalysis(
+        indexed.fixture.dbPath,
+        { repairVector: true },
+        { onProgress: () => {} },
+      );
+
+      expect(result.vectorRepairStatus).toBe('repaired');
+      expect(mocks.createVectorIndex).toHaveBeenCalledOnce();
+
+      const repaired = JSON.parse(
+        await fs.readFile(path.join(indexed.paths.storagePath, 'gitnexus.json'), 'utf8'),
+      );
+      expect(repaired.embeddingCheckpoint).toBeUndefined();
+      expect(repaired.incrementalInProgress).toBeUndefined();
+      expect(repaired.capabilities.vectorSearch.status).toBe('vector-index');
+    } finally {
+      restoreEnv();
+      await indexed.fixture.cleanup();
+    }
+  });
+
+  it('refuses a completed checkpoint whose model does not match this run', async () => {
+    const restoreEnv = pinDefaultEmbeddingIdentity();
+    // Model differs; dimensions match the run's resolved identity. Each field
+    // must block on its own — a guard requiring BOTH to differ would let a
+    // same-dimension model swap through.
+    const indexed = await createIndexedFixture(3, {
+      embeddingCheckpoint: { ...completedCheckpoint, model: 'voyage-code-3' },
+    });
+    try {
+      const { runFullAnalysis, mocks } = await importRepairSubject({});
+      await expect(
+        runFullAnalysis(indexed.fixture.dbPath, { repairVector: true }, { onProgress: () => {} }),
+      ).rejects.toThrow(/records voyage-code-3 at 384 dimensions/i);
+      expect(mocks.initLbugForMaintenance).not.toHaveBeenCalled();
+
+      const untouched = JSON.parse(
+        await fs.readFile(path.join(indexed.paths.storagePath, 'gitnexus.json'), 'utf8'),
+      );
+      expect(untouched.embeddingCheckpoint).toMatchObject({ model: 'voyage-code-3' });
+    } finally {
+      restoreEnv();
+      await indexed.fixture.cleanup();
+    }
+  });
+
+  it('refuses a completed checkpoint whose dimensions do not match this run', async () => {
+    const restoreEnv = pinDefaultEmbeddingIdentity();
+    // Dimensions differ; model matches the run's resolved identity.
+    const indexed = await createIndexedFixture(3, {
+      embeddingCheckpoint: { ...completedCheckpoint, dimensions: 2048 },
+    });
+    try {
+      const { runFullAnalysis, mocks } = await importRepairSubject({});
+      await expect(
+        runFullAnalysis(indexed.fixture.dbPath, { repairVector: true }, { onProgress: () => {} }),
+      ).rejects.toThrow(/at 2048 dimensions, but this run resolves/i);
+      expect(mocks.initLbugForMaintenance).not.toHaveBeenCalled();
+
+      const untouched = JSON.parse(
+        await fs.readFile(path.join(indexed.paths.storagePath, 'gitnexus.json'), 'utf8'),
+      );
+      expect(untouched.embeddingCheckpoint).toMatchObject({ dimensions: 2048 });
+    } finally {
+      restoreEnv();
+      await indexed.fixture.cleanup();
+    }
+  });
+
+  it('clears a completed zero-node checkpoint on the not-indexed path (empty repository)', async () => {
+    const restoreEnv = pinDefaultEmbeddingIdentity();
+    // An empty repository's embed run completed trivially (totalNodes 0) and
+    // crashed before finalize. Repair must report not-indexed AND clear the
+    // checkpoint, or the repo stays permanently marked as interrupted.
+    const indexed = await createIndexedFixture(0, {
+      embeddingCheckpoint: {
+        ...completedCheckpoint,
+        nodesProcessed: 0,
+        totalNodes: 0,
+        chunksProcessed: 0,
+      },
+    });
+    try {
+      const { runFullAnalysis, mocks } = await importRepairSubject({ counts: [0, 0, 0, 0] });
+      const result = await runFullAnalysis(
+        indexed.fixture.dbPath,
+        { repairVector: true },
+        { onProgress: () => {} },
+      );
+
+      expect(result.vectorRepairStatus).toBe('not-indexed');
+      expect(mocks.initLbugForMaintenance).not.toHaveBeenCalled();
+
+      const cleared = JSON.parse(
+        await fs.readFile(path.join(indexed.paths.storagePath, 'gitnexus.json'), 'utf8'),
+      );
+      expect(cleared.embeddingCheckpoint).toBeUndefined();
+      expect(cleared.incrementalInProgress).toBeUndefined();
+    } finally {
+      restoreEnv();
+      await indexed.fixture.cleanup();
+    }
+  });
+
+  it('refuses rather than returning not-indexed when ALL rows vanished after a completed checkpoint', async () => {
+    const restoreEnv = pinDefaultEmbeddingIdentity();
+    // The completed checkpoint recorded embedded nodes; the mocked live table
+    // holds zero. Without the pre-zero-row guard this exits as a successful
+    // `not-indexed`.
+    const indexed = await createIndexedFixture(5, {
+      embeddingCheckpoint: { ...completedCheckpoint },
+    });
+    try {
+      const { runFullAnalysis, mocks } = await importRepairSubject({ counts: [0, 0, 0, 0] });
+      await expect(
+        runFullAnalysis(indexed.fixture.dbPath, { repairVector: true }, { onProgress: () => {} }),
+      ).rejects.toThrow(/recorded 5 embedded nodes but the table holds no rows/i);
+      expect(mocks.initLbugForMaintenance).not.toHaveBeenCalled();
+
+      const untouched = JSON.parse(
+        await fs.readFile(path.join(indexed.paths.storagePath, 'gitnexus.json'), 'utf8'),
+      );
+      expect(untouched.embeddingCheckpoint).toMatchObject({
+        model: completedCheckpoint.model,
+      });
+      expect(untouched.stats.embeddings).toBe(5);
+    } finally {
+      restoreEnv();
       await indexed.fixture.cleanup();
     }
   });
