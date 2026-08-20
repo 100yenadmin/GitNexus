@@ -4,6 +4,23 @@ All notable changes to GitNexus will be documented in this file.
 
 ## [Unreleased]
 
+## [1.6.10-electric.10] - 2026-08-20
+
+### Fixed
+
+- `--repair-vector` now admits a COMPLETED embedding checkpoint (fully persisted window) instead
+  of forcing a full `--drop-embeddings` re-embed for an index whose vectors are already whole
+  (#192, field evidence on #132). Incomplete checkpoints and in-progress incremental writes
+  remain fail-closed.
+- A completed checkpoint must match the run's resolved embedding identity (model AND
+  dimensions), mirroring the resume-path guard; a same-dimension model swap can no longer
+  rebuild HNSW over incompatible rows while erasing the persisted model marker (#192).
+- Total embedding-table loss after a completed checkpoint is refused instead of returning a
+  successful `not-indexed`; a completed zero-node checkpoint is cleared on the not-indexed path
+  so empty repositories cannot stay marked as interrupted (#192).
+- A successful VECTOR repair clears `embeddingCheckpoint` and `incrementalInProgress` in the
+  committed metadata, so the stale marker cannot re-enter recovery on the next run (#192).
+
 ## [1.6.10-electric.9] - 2026-07-30
 
 ### Fixed
