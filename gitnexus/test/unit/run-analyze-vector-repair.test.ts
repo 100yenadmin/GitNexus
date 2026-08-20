@@ -480,22 +480,48 @@ describe('runFullAnalysis VECTOR-only repair (#170)', () => {
     }
   });
 
-  it('refuses a completed checkpoint whose embedding identity does not match this run', async () => {
+  it('refuses a completed checkpoint whose model does not match this run', async () => {
     const restoreEnv = pinDefaultEmbeddingIdentity();
+    // Model differs; dimensions match the run's resolved identity. Each field
+    // must block on its own — a guard requiring BOTH to differ would let a
+    // same-dimension model swap through.
     const indexed = await createIndexedFixture(3, {
-      embeddingCheckpoint: { ...completedCheckpoint, model: 'voyage-code-3', dimensions: 2048 },
+      embeddingCheckpoint: { ...completedCheckpoint, model: 'voyage-code-3' },
     });
     try {
       const { runFullAnalysis, mocks } = await importRepairSubject({});
       await expect(
         runFullAnalysis(indexed.fixture.dbPath, { repairVector: true }, { onProgress: () => {} }),
-      ).rejects.toThrow(/records voyage-code-3 at 2048 dimensions/i);
+      ).rejects.toThrow(/records voyage-code-3 at 384 dimensions/i);
       expect(mocks.initLbugForMaintenance).not.toHaveBeenCalled();
 
       const untouched = JSON.parse(
         await fs.readFile(path.join(indexed.paths.storagePath, 'gitnexus.json'), 'utf8'),
       );
       expect(untouched.embeddingCheckpoint).toMatchObject({ model: 'voyage-code-3' });
+    } finally {
+      restoreEnv();
+      await indexed.fixture.cleanup();
+    }
+  });
+
+  it('refuses a completed checkpoint whose dimensions do not match this run', async () => {
+    const restoreEnv = pinDefaultEmbeddingIdentity();
+    // Dimensions differ; model matches the run's resolved identity.
+    const indexed = await createIndexedFixture(3, {
+      embeddingCheckpoint: { ...completedCheckpoint, dimensions: 2048 },
+    });
+    try {
+      const { runFullAnalysis, mocks } = await importRepairSubject({});
+      await expect(
+        runFullAnalysis(indexed.fixture.dbPath, { repairVector: true }, { onProgress: () => {} }),
+      ).rejects.toThrow(/at 2048 dimensions, but this run resolves/i);
+      expect(mocks.initLbugForMaintenance).not.toHaveBeenCalled();
+
+      const untouched = JSON.parse(
+        await fs.readFile(path.join(indexed.paths.storagePath, 'gitnexus.json'), 'utf8'),
+      );
+      expect(untouched.embeddingCheckpoint).toMatchObject({ dimensions: 2048 });
     } finally {
       restoreEnv();
       await indexed.fixture.cleanup();
