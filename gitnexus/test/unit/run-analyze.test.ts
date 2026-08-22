@@ -150,6 +150,33 @@ describe('run-analyze module', () => {
       expect(result.alreadyUpToDate).toBe(true);
       expect(result.stats.embeddings).toBe(1);
       expect((await loadMeta(storagePath))?.stats?.embeddings).toBe(1);
+
+      const restamped = await loadMeta(storagePath);
+      if (!restamped) throw new Error('expected restamped metadata');
+      await saveMeta(storagePath, {
+        ...restamped,
+        stats: { ...restamped.stats, embeddings: 2 },
+      });
+      await expect(
+        runFullAnalysis(tmpRepo.dbPath, { incrementalOnly: true }, { onProgress: () => {} }),
+      ).rejects.toThrow(/verified embedding count requires a metadata restamp/i);
+      expect((await loadMeta(storagePath))?.stats?.embeddings).toBe(2);
+
+      const stalePositive = await runFullAnalysis(tmpRepo.dbPath, {}, { onProgress: () => {} });
+      expect(stalePositive.alreadyUpToDate).toBe(true);
+      expect(stalePositive.stats.embeddings).toBe(1);
+      expect((await loadMeta(storagePath))?.stats?.embeddings).toBe(1);
+
+      const { lbugPath } = getStoragePaths(tmpRepo.dbPath);
+      const { initLbug, executeQuery, closeLbug } =
+        await import('../../src/core/lbug/lbug-adapter.js');
+      await initLbug(lbugPath);
+      await executeQuery('MATCH (e:CodeEmbedding) DELETE e');
+      await closeLbug();
+      await expect(runFullAnalysis(tmpRepo.dbPath, {}, { onProgress: () => {} })).rejects.toThrow(
+        /lost all recorded embeddings/i,
+      );
+      expect((await loadMeta(storagePath))?.stats?.embeddings).toBe(1);
     } finally {
       await tmpRepo.cleanup();
     }

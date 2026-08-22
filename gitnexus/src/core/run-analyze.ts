@@ -1844,13 +1844,7 @@ const runFullAnalysisImpl = async (
           fastPathIntegrity = await withLbugDb(canonicalPaths.lbugPath, inspectEmbeddingIntegrity, {
             readOnly: true,
           });
-          assertEmbeddingIntegrity(
-            fastPathIntegrity,
-            'Already-up-to-date index',
-            recordedEmbeddingCount !== undefined && recordedEmbeddingCount > 0
-              ? recordedEmbeddingCount
-              : undefined,
-          );
+          assertEmbeddingIntegrity(fastPathIntegrity, 'Already-up-to-date index');
         } finally {
           // This return precedes the main pipeline's close-protected block.
           // This path is read-only, so it does not carry the large-write
@@ -1859,10 +1853,15 @@ const runFullAnalysisImpl = async (
           // that a read-only query cannot replay.
           await closeLbug();
         }
+        if ((recordedEmbeddingCount ?? 0) > 0 && fastPathIntegrity.validRows === 0) {
+          throw new Error(
+            'Already-up-to-date index lost all recorded embeddings; re-run analyze --embeddings.',
+          );
+        }
         let fastPathMeta = existingMeta;
         if (
           fastPathIntegrity.validRows > 0 &&
-          (recordedEmbeddingCount === undefined || recordedEmbeddingCount === 0)
+          recordedEmbeddingCount !== fastPathIntegrity.validRows
         ) {
           if (options.incrementalOnly) {
             incrementalOnlyStop('the verified embedding count requires a metadata restamp');

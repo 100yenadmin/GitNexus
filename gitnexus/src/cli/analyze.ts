@@ -1541,7 +1541,7 @@ const analyzeCommandImpl = async (
       // The fast path now performs a read-only embedding-integrity scan and can
       // initialize LadybugDB native handles. Give the outer lifecycle guard an
       // explicit success code; otherwise it must conservatively default to 1.
-      if (isLbugReady()) process.exitCode = 0;
+      if (isLbugReady()) process.exitCode ??= 0;
       return;
     }
 
