@@ -154,6 +154,13 @@ describe('read-only doctor CLI modes (#127, #133)', () => {
   it.each([
     ['malformed', '{', 'malformed'],
     ['non-array', '{}', 'not-array'],
+    ['null element', '[null]', 'malformed'],
+    ['missing fields', '[{}]', 'malformed'],
+    [
+      'non-string field',
+      '[{"name":7,"path":"x","storagePath":"x","indexedAt":"x","lastCommit":"x"}]',
+      'malformed',
+    ],
   ] as const)('fails closed for a %s registry', async (_label, contents, reason) => {
     await fs.writeFile(path.join(home.dbPath, 'registry.json'), contents);
 
@@ -170,7 +177,7 @@ describe('read-only doctor CLI modes (#127, #133)', () => {
     expect(`${result.stdout}${result.stderr}`).not.toContain(contents);
   });
 
-  it('fails closed for an unreadable registry and distinguishes a valid empty one', async () => {
+  it('fails closed for an unreadable registry', async () => {
     await fs.mkdir(path.join(home.dbPath, 'registry.json'));
     const unreadable = runDoctor(['--registry', '--json']);
     expect(unreadable.status).toBe(1);
@@ -179,25 +186,48 @@ describe('read-only doctor CLI modes (#127, #133)', () => {
       summary: { entries: 0 },
     });
     expect(`${unreadable.stdout}${unreadable.stderr}`).not.toContain(home.dbPath);
+  });
 
-    const emptyHome = await createTempDir();
-    try {
-      await fs.writeFile(path.join(emptyHome.dbPath, 'registry.json'), '[]');
-      const empty = spawnSync(
-        process.execPath,
-        [...CLI_SPAWN_PREFIX, 'doctor', '--registry', '--json'],
+  it('keeps a valid empty registry available', async () => {
+    await fs.writeFile(path.join(home.dbPath, 'registry.json'), '[]');
+    const result = runDoctor(['--registry', '--json']);
+    expect(result.status).toBe(0);
+    expect(JSON.parse(result.stdout)).toMatchObject({
+      registryRead: { status: 'available' },
+      summary: { entries: 0 },
+    });
+  });
+
+  it('diagnoses malformed HTTP dimensions through registry Doctor JSON', async () => {
+    const repoPath = path.join(home.dbPath, 'repo');
+    await fs.writeFile(
+      path.join(home.dbPath, 'registry.json'),
+      JSON.stringify([
         {
-          encoding: 'utf8',
-          env: { ...process.env, GITNEXUS_HOME: emptyHome.dbPath },
+          name: 'repo',
+          path: repoPath,
+          storagePath: path.join(repoPath, '.gitnexus'),
+          indexedAt: '2026-07-20T00:00:00.000Z',
+          lastCommit: 'a'.repeat(40),
+          stats: { embeddings: 1 },
         },
-      );
-      expect(empty.status).toBe(0);
-      expect(JSON.parse(empty.stdout)).toMatchObject({
-        registryRead: { status: 'available' },
-        summary: { entries: 0 },
+      ]),
+    );
+    for (const [embeddingUrl, dimensions] of [
+      ['https://embedding.example/v1', '384abc'],
+      ['https://embedding.example/v1?secret=1', '384'],
+      ['https://embedding.example/v1#frag', '384'],
+    ] as const) {
+      const result = runDoctor(['--registry', '--json'], {
+        GITNEXUS_EMBEDDING_URL: embeddingUrl,
+        GITNEXUS_EMBEDDING_MODEL: 'test-model',
+        GITNEXUS_EMBEDDING_DIMS: dimensions,
       });
-    } finally {
-      await emptyHome.cleanup();
+      expect(result.status).toBe(1);
+      const report = JSON.parse(result.stdout);
+      expect(report.entries[0].health.reasons).toContain('embedding-query-http-config-invalid');
+      expect(`${result.stdout}${result.stderr}`).not.toContain('embedding.example');
+      expect(`${result.stdout}${result.stderr}`).not.toContain('test-model');
     }
   });
 });
