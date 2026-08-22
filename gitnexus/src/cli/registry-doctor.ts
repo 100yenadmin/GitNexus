@@ -5,8 +5,9 @@ import {
   assertSafeStoragePath,
   getStoragePaths,
   loadMeta,
-  readRegistry,
+  readRegistryStrict,
   type RegistryEntry,
+  type RegistryReadFailure,
   type RepoMeta,
 } from '../storage/repo-manager.js';
 import {
@@ -15,6 +16,10 @@ import {
   type DoctorPoolProbe,
 } from './doctor-pool-probe.js';
 import type { EmbeddingIntegrityReport } from '../core/lbug/lbug-adapter.js';
+import {
+  getQueryEmbeddingRuntimeStatus,
+  type QueryEmbeddingRuntimeStatus,
+} from '../core/embeddings/runtime-support.js';
 
 export interface RegistryCounts {
   nodes: number | null;
@@ -145,6 +150,7 @@ export interface RegistryDoctorReport {
   mode: 'registry';
   readOnly: true;
   pathsShown: boolean;
+  registryRead: { status: 'available' } | { status: 'failed'; reason: RegistryReadFailure };
   summary: {
     entries: number;
     remoteIdentities: number;
@@ -177,6 +183,8 @@ export interface RegistryDoctorOptions {
   entries?: readonly RegistryEntry[];
   databaseProbe?: RegistryDatabaseProbe;
   capabilityProbe?: RegistryCapabilityProbe;
+  /** Provider-free query-runtime seam for deterministic semantic readiness. */
+  embeddingRuntimeProbe?: () => QueryEmbeddingRuntimeStatus;
   /** Injectable live-head seam for deterministic registry diagnostics. */
   headProbe?: (repoPath: string) => string;
 }
@@ -698,6 +706,8 @@ const inspectEntry = async (
   const countComparison = compareCounts(base.registry.counts, counts, availableCounts);
   const indexedSha = nonEmptySha(meta?.lastCommit);
   const freshness = freshnessFor(indexedSha, base.registry_sha, headSha);
+  const embeddings = database.status === 'available' ? database.counts.embeddings : 0;
+  const embeddingRuntime = (options.embeddingRuntimeProbe ?? getQueryEmbeddingRuntimeStatus)();
   const semanticReady =
     database.status === 'available' &&
     database.counts.embeddings > 0 &&
@@ -708,7 +718,8 @@ const inspectEntry = async (
     capabilities.source === 'active-probe' &&
     capabilities.graph === 'available' &&
     capabilities.fts === 'available' &&
-    capabilities.vectorSearch === 'vector-index';
+    capabilities.vectorSearch === 'vector-index' &&
+    embeddingRuntime.available;
   const reasons: string[] = [];
   const integrity = database.status === 'available' ? database.integrity.status : 'unavailable';
   if (integrity !== 'clean') reasons.push(`embedding-identity-${integrity}`);
@@ -719,9 +730,11 @@ const inspectEntry = async (
   if (capabilities.source !== 'active-probe') reasons.push('capabilities-unavailable');
   if (capabilities.graph !== 'available') reasons.push('graph-unavailable');
   if (capabilities.fts !== 'available') reasons.push('fts-unavailable');
-  const embeddings = database.status === 'available' ? database.counts.embeddings : 0;
   if (embeddings > 0 && capabilities.vectorSearch !== 'vector-index') {
     reasons.push('vector-index-unavailable');
+  }
+  if (embeddings > 0 && !embeddingRuntime.available) {
+    reasons.push(`embedding-query-${embeddingRuntime.reason ?? 'runtime-unavailable'}`);
   }
 
   return {
@@ -747,7 +760,10 @@ const inspectEntry = async (
 export async function buildRegistryDoctorReport(
   options: RegistryDoctorOptions = {},
 ): Promise<RegistryDoctorReport> {
-  const entries = options.entries ? [...options.entries] : await readRegistry();
+  const registryResult = options.entries
+    ? ({ status: 'available', entries: [...options.entries] } as const)
+    : await readRegistryStrict();
+  const entries = registryResult.status === 'available' ? registryResult.entries : [];
   const indexed = entries.map((entry, index) => ({ entry, entryPosition: index + 1 }));
 
   const remoteGroups = new Map<string, typeof indexed>();
@@ -813,6 +829,10 @@ export async function buildRegistryDoctorReport(
     mode: 'registry',
     readOnly: true,
     pathsShown: options.showPaths === true,
+    registryRead:
+      registryResult.status === 'available'
+        ? { status: 'available' }
+        : { status: 'failed', reason: registryResult.reason },
     summary: {
       entries: healthReports.length,
       remoteIdentities,

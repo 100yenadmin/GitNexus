@@ -10,17 +10,25 @@ const doctorPoolMocks = vi.hoisted(() => ({
 vi.mock('../../src/cli/doctor-pool-probe.js', () => doctorPoolMocks);
 
 import {
-  buildRegistryDoctorReport,
+  buildRegistryDoctorReport as buildRegistryDoctorReportImpl,
   isLegacyMissingChunkIndexError,
   probeRegistryDatabaseCounts,
   type RegistryDatabaseCounts,
+  type RegistryDoctorOptions,
 } from '../../src/cli/registry-doctor.js';
+import { getQueryEmbeddingRuntimeStatus } from '../../src/core/embeddings/runtime-support.js';
 import {
   INDEX_METADATA_FILE,
   type RegistryEntry,
   type RepoMeta,
 } from '../../src/storage/repo-manager.js';
 import { createTempDir } from '../helpers/test-db.js';
+
+const buildRegistryDoctorReport = (options: RegistryDoctorOptions = {}) =>
+  buildRegistryDoctorReportImpl({
+    embeddingRuntimeProbe: () => ({ available: true, mode: 'local', reason: null }),
+    ...options,
+  });
 
 const CAPABILITIES: NonNullable<RepoMeta['capabilities']> = {
   graph: { provider: 'ladybugdb', status: 'available' },
@@ -281,6 +289,98 @@ describe('doctor --registry read-only report (#133)', () => {
       freshness: 'unknown',
       reasons: ['freshness-unknown'],
     });
+  });
+
+  it('requires provider-free query embedding readiness for embedding-bearing entries', async () => {
+    const indexed = await createEntry(
+      fixture.dbPath,
+      'query-runtime-missing',
+      'QueryRuntimeMissing',
+      'https://github.com/owner/query-runtime-missing.git',
+      { nodes: 1, edges: 0, embeddings: 1 },
+    );
+    const report = await buildRegistryDoctorReport({
+      entries: [indexed.entry],
+      databaseProbe: async () => ({
+        nodes: 1,
+        edges: 0,
+        embeddings: 1,
+        integrity: cleanIntegrity(1),
+      }),
+      capabilityProbe: async () => ({
+        fts: true,
+        vector: true,
+        vectorIndex: true,
+        vectorIndexReason: null,
+        exercisedConnections: 8,
+        connectionCount: 8,
+        reason: null,
+      }),
+      headProbe: () => 'a'.repeat(40),
+      embeddingRuntimeProbe: () => ({
+        available: false,
+        mode: 'local',
+        reason: 'local-runtime-unavailable',
+      }),
+    });
+
+    expect(report.entries[0]?.health).toMatchObject({
+      state: 'degraded',
+      semantic_ready: false,
+      reasons: ['embedding-query-local-runtime-unavailable'],
+    });
+  });
+
+  it('reports a valid HTTP wrapper as provider-free runtime availability', () => {
+    const keys = [
+      'GITNEXUS_EMBEDDING_URL',
+      'GITNEXUS_EMBEDDING_MODEL',
+      'GITNEXUS_EMBEDDING_DIMS',
+      'GITNEXUS_EMBEDDING_MAX_ATTEMPTS',
+      'GITNEXUS_EMBEDDING_RETRY_CAP_MS',
+      'GITNEXUS_EMBEDDING_MIN_INTERVAL_MS',
+    ] as const;
+    const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+    try {
+      process.env.GITNEXUS_EMBEDDING_URL = 'https://embedding.example/v1';
+      process.env.GITNEXUS_EMBEDDING_MODEL = 'test-model';
+      process.env.GITNEXUS_EMBEDDING_DIMS = '384';
+      delete process.env.GITNEXUS_EMBEDDING_MAX_ATTEMPTS;
+      delete process.env.GITNEXUS_EMBEDDING_RETRY_CAP_MS;
+      delete process.env.GITNEXUS_EMBEDDING_MIN_INTERVAL_MS;
+
+      expect(getQueryEmbeddingRuntimeStatus()).toEqual({
+        available: true,
+        mode: 'http',
+        reason: null,
+      });
+      expect(JSON.stringify(getQueryEmbeddingRuntimeStatus())).not.toContain('embedding.example');
+      expect(JSON.stringify(getQueryEmbeddingRuntimeStatus())).not.toContain('test-model');
+    } finally {
+      for (const key of keys) {
+        if (previous[key] === undefined) delete process.env[key];
+        else process.env[key] = previous[key];
+      }
+    }
+  });
+
+  it('fails closed for invalid HTTP wrapper configuration without a provider call', () => {
+    const keys = ['GITNEXUS_EMBEDDING_URL', 'GITNEXUS_EMBEDDING_MODEL'] as const;
+    const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+    try {
+      process.env.GITNEXUS_EMBEDDING_URL = 'not-a-url';
+      process.env.GITNEXUS_EMBEDDING_MODEL = 'test-model';
+      expect(getQueryEmbeddingRuntimeStatus()).toEqual({
+        available: false,
+        mode: 'http',
+        reason: 'http-config-invalid',
+      });
+    } finally {
+      for (const key of keys) {
+        if (previous[key] === undefined) delete process.env[key];
+        else process.env[key] = previous[key];
+      }
+    }
   });
 
   it('keeps a graph-only index healthy when the embedding table is absent', async () => {
