@@ -1837,11 +1837,11 @@ const runFullAnalysisImpl = async (
           );
         } finally {
           // This return precedes the main pipeline's close-protected block.
-          // Long-lived callers need a real close; CLI callers checkpoint and
-          // leave native handles for the outer process-exit guard (#2264).
-          await (options.skipNativeCloseOnExit && !stagedPaths
-            ? closeLbugBeforeExit()
-            : closeLbug());
+          // This path is read-only, so it does not carry the large-write
+          // destructor risk that requires closeLbugBeforeExit elsewhere.
+          // Close for real so the next process never inherits shadow pages
+          // that a read-only query cannot replay.
+          await closeLbug();
         }
         let fastPathMeta = existingMeta;
         if (

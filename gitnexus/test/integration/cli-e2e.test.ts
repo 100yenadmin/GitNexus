@@ -344,6 +344,23 @@ describe('CLI end-to-end', () => {
     expect(fs.readFileSync(path.join(gitnexusDir, '.gitignore'), 'utf-8')).toBe('*\n');
   }, 60_000);
 
+  it('same-commit analyze leaves the index reopenable for read-only tools', () => {
+    const analyze = runCli('analyze', MINI_REPO, 30000);
+    expect(
+      analyze.status,
+      [`stdout: ${analyze.stdout}`, `stderr: ${analyze.stderr}`].join('\n'),
+    ).toBe(0);
+
+    const cypher = runCliRaw(
+      ['cypher', 'MATCH (n) RETURN n.name LIMIT 1', '--repo', 'mini-repo'],
+      MINI_REPO,
+    );
+    expect(cypher.status, [`stdout: ${cypher.stdout}`, `stderr: ${cypher.stderr}`].join('\n')).toBe(
+      0,
+    );
+    expect(() => JSON.parse(cypher.stdout.trim())).not.toThrow();
+  }, 60_000);
+
   // Regression guard for issue #1169 — analyze must produce BOTH a
   // meta.json AND a global-registry entry on success. The previous
   // failure mode on Windows was banner-only output + exit 0 with
