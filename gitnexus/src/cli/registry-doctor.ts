@@ -14,6 +14,7 @@ import {
   probeDoctorPool,
   type DoctorPoolProbe,
 } from './doctor-pool-probe.js';
+import type { EmbeddingIntegrityReport } from '../core/lbug/lbug-adapter.js';
 
 export interface RegistryCounts {
   nodes: number | null;
@@ -25,7 +26,12 @@ export interface RegistryDatabaseCounts {
   nodes: number;
   edges: number;
   embeddings: number;
+  integrity?: RegistryDatabaseIntegrity;
 }
+
+export type RegistryDatabaseIntegrity =
+  | ({ status: 'clean' | 'malformed' } & EmbeddingIntegrityReport)
+  | { status: 'unavailable'; reason: 'identity-scan-unavailable' };
 
 export type RegistryDatabaseProbe = (lbugPath: string) => Promise<RegistryDatabaseCounts>;
 
@@ -86,7 +92,11 @@ export interface RegistryEntryDoctorReport {
   registry: { counts: RegistryCounts };
   metadata: { status: 'available' | 'missing' | 'not-read'; counts: RegistryCounts };
   database:
-    | { status: 'available'; counts: RegistryDatabaseCounts }
+    | {
+        status: 'available';
+        counts: RegistryDatabaseCounts;
+        integrity: RegistryDatabaseIntegrity;
+      }
     | {
         status: 'skipped' | 'unavailable';
         reason:
@@ -107,6 +117,13 @@ export interface RegistryEntryDoctorReport {
   };
   sidecars: RegistrySidecarReport;
   capabilities: RegistryCapabilityReport;
+  health: {
+    state: 'healthy' | 'degraded' | 'quarantined';
+    reasons: string[];
+    semantic_ready: boolean;
+    freshness: 'current' | 'drifted' | 'unknown';
+    count_alignment: 'aligned' | 'drifted' | 'unknown';
+  };
 }
 
 export interface RegistryDoctorReport {
@@ -288,6 +305,7 @@ export const probeRegistryDatabaseCounts: RegistryDatabaseProbe = async (lbugPat
   });
   const connection = handle.conn as unknown as QueryConnectionLike;
   const tableName = (name: string): string => `\`${name.replace(/`/g, '``')}\``;
+  let counts: Omit<RegistryDatabaseCounts, 'integrity'>;
   try {
     let nodes = 0;
     for (const table of schema.NODE_TABLES) {
@@ -318,9 +336,21 @@ export const probeRegistryDatabaseCounts: RegistryDatabaseProbe = async (lbugPat
     } catch (error) {
       if (lbugConfig.classifyDeleteAllError(error) !== 'benign-missing-table') throw error;
     }
-    return { nodes, edges, embeddings };
+    counts = { nodes, edges, embeddings };
   } finally {
     await lbugConfig.closeLbugConnection(handle);
+  }
+
+  const adapter = await import('../core/lbug/lbug-adapter.js');
+  try {
+    const report = await adapter.withLbugDb(lbugPath, adapter.inspectEmbeddingIntegrity, {
+      readOnly: true,
+    });
+    const malformed =
+      adapter.embeddingIntegrityFailures(report) > 0 || report.physicalRows !== report.validRows;
+    return { ...counts, integrity: { status: malformed ? 'malformed' : 'clean', ...report } };
+  } finally {
+    await adapter.closeLbug();
   }
 };
 
@@ -411,6 +441,52 @@ const compareCounts = (
   };
 };
 
+const withHealth = (
+  report: Omit<RegistryEntryDoctorReport, 'health'>,
+  registryCommit: string,
+  metadataCommit?: string,
+): RegistryEntryDoctorReport => {
+  const freshness = !metadataCommit
+    ? 'unknown'
+    : metadataCommit === registryCommit
+      ? 'current'
+      : 'drifted';
+  const count_alignment =
+    report.countComparison.status === 'match'
+      ? 'aligned'
+      : report.countComparison.status === 'mismatch'
+        ? 'drifted'
+        : 'unknown';
+  const integrity =
+    report.database.status === 'available' ? report.database.integrity.status : 'unavailable';
+  const reasons: string[] = [];
+  if (report.storage.status === 'unsafe') reasons.push('unsafe-storage');
+  if (integrity !== 'clean') reasons.push(`embedding-identity-${integrity}`);
+  if (freshness !== 'current') reasons.push(`freshness-${freshness}`);
+  if (count_alignment !== 'aligned') reasons.push(`count-alignment-${count_alignment}`);
+  const embeddings = report.database.status === 'available' ? report.database.counts.embeddings : 0;
+  if (embeddings > 0 && report.capabilities.vectorSearch !== 'vector-index') {
+    reasons.push('semantic-index-unavailable');
+  }
+  const semantic_ready =
+    embeddings > 0 &&
+    integrity === 'clean' &&
+    freshness === 'current' &&
+    count_alignment === 'aligned' &&
+    report.capabilities.vectorSearch === 'vector-index';
+  const quarantined = report.storage.status === 'unsafe' || integrity === 'malformed';
+  return {
+    ...report,
+    health: {
+      state: quarantined ? 'quarantined' : reasons.length > 0 ? 'degraded' : 'healthy',
+      reasons,
+      semantic_ready,
+      freshness,
+      count_alignment,
+    },
+  };
+};
+
 const inspectEntry = async (
   entry: RegistryEntry,
   entryPosition: number,
@@ -435,7 +511,7 @@ const inspectEntry = async (
   try {
     assertSafeStoragePath(entry);
   } catch {
-    return {
+    const report: Omit<RegistryEntryDoctorReport, 'health'> = {
       ...base,
       storage: { status: 'unsafe', reason: 'path-mismatch' },
       metadata: { status: 'not-read', counts: emptyCounts() },
@@ -444,6 +520,7 @@ const inspectEntry = async (
       sidecars: uninspectedSidecars(),
       capabilities: unavailableCapabilities(),
     };
+    return withHealth(report, entry.lastCommit);
   }
 
   const storageState = await fileState(entry.storagePath);
@@ -457,7 +534,7 @@ const inspectEntry = async (
         : storageState.symbolicLink
           ? 'storage-symbolic-link'
           : 'storage-not-directory';
-    return {
+    const report: Omit<RegistryEntryDoctorReport, 'health'> = {
       ...base,
       storage: { status: 'unsafe', reason },
       metadata: { status: 'not-read', counts: emptyCounts() },
@@ -466,6 +543,7 @@ const inspectEntry = async (
       sidecars: uninspectedSidecars(),
       capabilities: unavailableCapabilities(),
     };
+    return withHealth(report, entry.lastCommit);
   }
 
   const { lbugPath } = getStoragePaths(entry.path);
@@ -493,7 +571,30 @@ const inspectEntry = async (
   } else {
     try {
       availableCounts = await (options.databaseProbe ?? probeRegistryDatabaseCounts)(lbugPath);
-      database = { status: 'available', counts: availableCounts };
+      let integrity = availableCounts.integrity ?? {
+        status: 'unavailable' as const,
+        reason: 'identity-scan-unavailable' as const,
+      };
+      const checkpoint = meta?.embeddingCheckpoint;
+      const durableIdentity = checkpoint && [
+        checkpoint.physicalRows,
+        checkpoint.validRows,
+        checkpoint.recoverableIdentitySha256,
+      ];
+      if (
+        integrity.status !== 'unavailable' &&
+        durableIdentity?.some((value) => value !== undefined) &&
+        (checkpoint!.physicalRows !== integrity.physicalRows ||
+          checkpoint!.validRows !== integrity.validRows ||
+          checkpoint!.recoverableIdentitySha256 !== integrity.recoverableIdentitySha256)
+      ) {
+        integrity = { ...integrity, status: 'malformed' };
+      }
+      database = {
+        status: 'available',
+        counts: availableCounts,
+        integrity,
+      };
     } catch (error) {
       const message = error instanceof Error ? error.message.toLowerCase() : String(error);
       database = {
@@ -518,15 +619,19 @@ const inspectEntry = async (
     }
   }
 
-  return {
-    ...base,
-    storage: { status: 'safe' },
-    metadata: { status: meta ? 'available' : 'missing', counts },
-    database,
-    countComparison: compareCounts(base.registry.counts, counts, availableCounts),
-    sidecars,
-    capabilities,
-  };
+  return withHealth(
+    {
+      ...base,
+      storage: { status: 'safe' },
+      metadata: { status: meta ? 'available' : 'missing', counts },
+      database,
+      countComparison: compareCounts(base.registry.counts, counts, availableCounts),
+      sidecars,
+      capabilities,
+    },
+    entry.lastCommit,
+    meta?.lastCommit,
+  );
 };
 
 export async function buildRegistryDoctorReport(

@@ -320,6 +320,9 @@ export const doctorCommand = async (
         console.log('  paths:                   hidden (use --show-paths to reveal)');
       }
     }
+    if (report.entries.some((entry) => entry.health.state !== 'healthy') && !process.exitCode) {
+      process.exitCode = 1;
+    }
     return;
   }
 

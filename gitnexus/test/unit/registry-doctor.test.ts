@@ -31,6 +31,23 @@ const CAPABILITIES: NonNullable<RepoMeta['capabilities']> = {
   },
 };
 
+const cleanIntegrity = (rows: number) => ({
+  status: 'clean' as const,
+  tablePresent: rows > 0,
+  physicalRows: rows,
+  validRows: rows,
+  recoverableRows: rows,
+  emptyIdRows: 0,
+  emptyNodeIdRows: 0,
+  invalidChunkRows: 0,
+  noncanonicalIdRows: 0,
+  duplicateIdRows: 0,
+  duplicateSemanticRows: 0,
+  orphanRows: 0,
+  wrongDimensionRows: 0,
+  recoverableIdentitySha256: 'a'.repeat(64),
+});
+
 interface FixtureEntry {
   entry: RegistryEntry;
   lbugPath: string;
@@ -131,13 +148,26 @@ describe('doctor --registry read-only report (#133)', () => {
       edges: 0,
       embeddings: 0,
     });
+    const localMetaPath = path.join(local.entry.storagePath, INDEX_METADATA_FILE);
+    const localMeta = JSON.parse(await fs.readFile(localMetaPath, 'utf8'));
+    await fs.writeFile(
+      localMetaPath,
+      JSON.stringify({
+        ...localMeta,
+        embeddingCheckpoint: {
+          physicalRows: 0,
+          validRows: 0,
+          recoverableIdentitySha256: 'b'.repeat(64),
+        },
+      }),
+    );
     duplicate.entry.stats = { nodes: 7, edges: 1, embeddings: 0 };
     local.entry.name = local.entry.path;
     const entries = [alpha.entry, duplicate.entry, local.entry];
     const liveCounts = new Map<string, RegistryDatabaseCounts>([
-      [alpha.lbugPath, { nodes: 10, edges: 5, embeddings: 3 }],
-      [duplicate.lbugPath, { nodes: 99, edges: 1, embeddings: 0 }],
-      [local.lbugPath, { nodes: 0, edges: 0, embeddings: 0 }],
+      [alpha.lbugPath, { nodes: 10, edges: 5, embeddings: 3, integrity: cleanIntegrity(3) }],
+      [duplicate.lbugPath, { nodes: 99, edges: 1, embeddings: 0, integrity: cleanIntegrity(0) }],
+      [local.lbugPath, { nodes: 0, edges: 0, embeddings: 0, integrity: cleanIntegrity(0) }],
     ]);
     const databaseProbe = vi.fn(async (lbugPath: string) => liveCounts.get(lbugPath)!);
     const before = await snapshotFiles(fixture.dbPath);
@@ -171,6 +201,10 @@ describe('doctor --registry read-only report (#133)', () => {
       registryVsDatabase: ['nodes'],
     });
     expect(report.entries[0]?.countComparison.status).toBe('match');
+    expect(report.entries[0]?.health.state).toBe('healthy');
+    expect(report.entries[0]?.health.semantic_ready).toBe(true);
+    expect(report.entries[1]?.health.state).toBe('degraded');
+    expect(report.entries[2]?.health.state).toBe('quarantined');
     expect(report.entries[2]?.identity).toEqual({ kind: 'local-path' });
     expect(report.entries[2]?.name).toBe('<path-like-alias>');
     expect(report.entries[0]?.capabilities.source).toBe('active-probe');
@@ -498,10 +532,11 @@ describe('doctor --registry read-only report (#133)', () => {
     }
 
     const before = await snapshotFiles(fixture.dbPath);
-    await expect(probeRegistryDatabaseCounts(lbugPath)).resolves.toEqual({
+    await expect(probeRegistryDatabaseCounts(lbugPath)).resolves.toMatchObject({
       nodes: 1,
       edges: 0,
       embeddings: 0,
+      integrity: { status: 'clean', physicalRows: 0, validRows: 0 },
     });
     expect(await snapshotFiles(fixture.dbPath)).toEqual(before);
   });
