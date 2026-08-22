@@ -289,6 +289,13 @@ const queryCount = async (connection: QueryConnectionLike, cypher: string): Prom
   }
 };
 
+const isLegacyMissingChunkIndexError = (error: unknown): boolean => {
+  const message = error instanceof Error ? error.message : String(error);
+  return /binder exception:\s*(?:column\s+chunkIndex\s+does not exist|cannot find property\s+chunkIndex\s+for\s+e\.?)/i.test(
+    message,
+  );
+};
+
 /** Open a clean index in LadybugDB's read-only mode and issue count queries. */
 export const probeRegistryDatabaseCounts: RegistryDatabaseProbe = async (lbugPath) => {
   const [adapter, lbugConfig, schema] = await Promise.all([
@@ -337,21 +344,28 @@ export const probeRegistryDatabaseCounts: RegistryDatabaseProbe = async (lbugPat
       embeddingTablePresent = false;
     }
     let embeddingDimensions: number | undefined;
-    let report: EmbeddingIntegrityReport;
+    let report: EmbeddingIntegrityReport | undefined;
     if (embeddingTablePresent) {
-      embeddingDimensions = await adapter.getStoredEmbeddingDimensions();
-      report = await adapter.inspectEmbeddingIntegrity(embeddingDimensions);
+      try {
+        embeddingDimensions = await adapter.getStoredEmbeddingDimensions();
+        report = await adapter.inspectEmbeddingIntegrity(embeddingDimensions);
+      } catch (error) {
+        if (!isLegacyMissingChunkIndexError(error)) throw error;
+      }
     } else {
       report = await adapter.inspectEmbeddingIntegrity();
     }
     const malformed =
-      adapter.embeddingIntegrityFailures(report) > 0 || report.physicalRows !== report.validRows;
+      report &&
+      (adapter.embeddingIntegrityFailures(report) > 0 || report.physicalRows !== report.validRows);
     return {
       nodes,
       edges,
       embeddings,
       embeddingDimensions,
-      integrity: { status: malformed ? 'malformed' : 'clean', ...report },
+      integrity: report
+        ? { status: malformed ? 'malformed' : 'clean', ...report }
+        : { status: 'unavailable', reason: 'identity-scan-unavailable' },
     };
   } finally {
     await adapter.closeLbug();
