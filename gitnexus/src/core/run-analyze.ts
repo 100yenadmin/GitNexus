@@ -1691,14 +1691,18 @@ const runFullAnalysisImpl = async (
       checkpointToVerify.recoverableIdentitySha256,
     ].some((value) => value !== undefined)
   ) {
-    const completedIntegrity = await withLbugDb(lbugPath, inspectEmbeddingIntegrity, {
-      readOnly: true,
-    });
-    assertCompletedCheckpointIdentity(
-      checkpointToVerify,
-      completedIntegrity,
-      'Completed embedding checkpoint',
-    );
+    try {
+      const completedIntegrity = await withLbugDb(lbugPath, inspectEmbeddingIntegrity, {
+        readOnly: true,
+      });
+      assertCompletedCheckpointIdentity(
+        checkpointToVerify,
+        completedIntegrity,
+        'Completed embedding checkpoint',
+      );
+    } finally {
+      await closeLbug();
+    }
   }
 
   // ── pdg-mode flip forces full writeback (#2099 F1) ─────────────────

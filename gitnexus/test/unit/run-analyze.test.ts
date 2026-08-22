@@ -382,6 +382,8 @@ describe('run-analyze module', () => {
         ),
       ).rejects.toThrow(/no longer matches the live embedding identities/i);
       expect(fetchMock).not.toHaveBeenCalled();
+      const { isLbugReady } = await import('../../src/core/lbug/lbug-adapter.js');
+      expect(isLbugReady()).toBe(false);
     } finally {
       vi.unstubAllGlobals();
       const restore = (key: string, value: string | undefined) => {
