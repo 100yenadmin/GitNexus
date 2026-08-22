@@ -18,7 +18,7 @@ import {
 } from '../../src/storage/repo-manager.js';
 import { taintModelVersion } from '../../src/core/ingestion/taint/typescript-model.js';
 import { createTempDir } from '../helpers/test-db.js';
-import { readEmbeddingNodeIds } from '../helpers/embedding-seed.js';
+import { readEmbeddingNodeIds, seedEmbeddingsForFiles } from '../helpers/embedding-seed.js';
 
 async function createReadableEmptyIndex(repoPath: string, branch?: string): Promise<void> {
   const { lbugPath } = getStoragePaths(repoPath, branch);
@@ -97,9 +97,59 @@ describe('run-analyze module', () => {
       expect(result.alreadyUpToDate).toBe(true);
       // A flat/primary index reports isPrimaryBranch true (#2106 R2).
       expect(result.isPrimaryBranch).toBe(true);
+      const { isLbugReady } = await import('../../src/core/lbug/lbug-adapter.js');
+      expect(isLbugReady()).toBe(false);
       await expect(
         fs.readFile(path.join(tmpRepo.dbPath, '.gitnexus', '.gitignore'), 'utf-8'),
       ).resolves.toBe('*\n');
+    } finally {
+      await tmpRepo.cleanup();
+    }
+  });
+
+  it('restamps a verified clean embedding count on the already-up-to-date fast path', async () => {
+    const tmpRepo = await createTempDir('gitnexus-run-analyze-fast-path-count-');
+    try {
+      await fs.writeFile(
+        path.join(tmpRepo.dbPath, 'index.ts'),
+        'export function fastPathCount() { return "verified"; }\n',
+      );
+      execSync('git init', { cwd: tmpRepo.dbPath, stdio: 'pipe' });
+      execSync('git add index.ts', { cwd: tmpRepo.dbPath, stdio: 'pipe' });
+      execSync('git -c user.name=test -c user.email=test@test commit -m init', {
+        cwd: tmpRepo.dbPath,
+        stdio: 'pipe',
+      });
+
+      const { runFullAnalysis } = await import('../../src/core/run-analyze.js');
+      await runFullAnalysis(
+        tmpRepo.dbPath,
+        { skipAgentsMd: true, skipSkills: true },
+        { onProgress: () => {} },
+      );
+      const seeded = await seedEmbeddingsForFiles(tmpRepo.dbPath, ['index.ts'], 1);
+      expect(seeded.get('index.ts')).toHaveLength(1);
+
+      const { storagePath } = getStoragePaths(tmpRepo.dbPath);
+      const completed = await loadMeta(storagePath);
+      if (!completed) throw new Error('expected completed metadata');
+      await saveMeta(storagePath, {
+        ...completed,
+        stats: { ...completed.stats, embeddings: 0 },
+      });
+
+      await expect(
+        runFullAnalysis(tmpRepo.dbPath, { incrementalOnly: true }, { onProgress: () => {} }),
+      ).rejects.toThrow(/verified embedding count requires a metadata restamp/i);
+      expect((await loadMeta(storagePath))?.stats?.embeddings).toBe(0);
+      const { isLbugReady } = await import('../../src/core/lbug/lbug-adapter.js');
+      expect(isLbugReady()).toBe(false);
+
+      const result = await runFullAnalysis(tmpRepo.dbPath, {}, { onProgress: () => {} });
+
+      expect(result.alreadyUpToDate).toBe(true);
+      expect(result.stats.embeddings).toBe(1);
+      expect((await loadMeta(storagePath))?.stats?.embeddings).toBe(1);
     } finally {
       await tmpRepo.cleanup();
     }

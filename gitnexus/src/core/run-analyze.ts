@@ -1823,18 +1823,40 @@ const runFullAnalysisImpl = async (
         options.allowDuplicateName === true && !(await isRepoRegistered(repoPath));
       if (!dirty && !healUnregistered) {
         const recordedEmbeddingCount = existingMeta.stats?.embeddings;
-        const fastPathIntegrity = await withLbugDb(
-          canonicalPaths.lbugPath,
-          inspectEmbeddingIntegrity,
-          { readOnly: true },
-        );
-        assertEmbeddingIntegrity(
-          fastPathIntegrity,
-          'Already-up-to-date index',
-          recordedEmbeddingCount !== undefined && recordedEmbeddingCount > 0
-            ? recordedEmbeddingCount
-            : undefined,
-        );
+        let fastPathIntegrity: EmbeddingIntegrityReport;
+        try {
+          fastPathIntegrity = await withLbugDb(canonicalPaths.lbugPath, inspectEmbeddingIntegrity, {
+            readOnly: true,
+          });
+          assertEmbeddingIntegrity(
+            fastPathIntegrity,
+            'Already-up-to-date index',
+            recordedEmbeddingCount !== undefined && recordedEmbeddingCount > 0
+              ? recordedEmbeddingCount
+              : undefined,
+          );
+        } finally {
+          // This return precedes the main pipeline's close-protected block.
+          // Long-lived callers need a real close; CLI callers checkpoint and
+          // leave native handles for the outer process-exit guard (#2264).
+          await (options.skipNativeCloseOnExit && !stagedPaths
+            ? closeLbugBeforeExit()
+            : closeLbug());
+        }
+        let fastPathMeta = existingMeta;
+        if (
+          fastPathIntegrity.validRows > 0 &&
+          (recordedEmbeddingCount === undefined || recordedEmbeddingCount === 0)
+        ) {
+          if (options.incrementalOnly) {
+            incrementalOnlyStop('the verified embedding count requires a metadata restamp');
+          }
+          fastPathMeta = {
+            ...existingMeta,
+            stats: { ...existingMeta.stats, embeddings: fastPathIntegrity.validRows },
+          };
+          await saveMeta(metaDir, fastPathMeta);
+        }
         // ── #2354: restamp the workspace label on a same-commit branch flip ──
         // The flat slot follows the checked-out working tree; a branch switch
         // at the SAME commit with a clean tree changes nothing the pipeline
@@ -1863,7 +1885,8 @@ const runFullAnalysisImpl = async (
           // documented Docker :ro workflow (#1549) — degrades to a warning.
           try {
             await adoptFlatBranchLabel(repoPath, branchLabel);
-            await saveMeta(metaDir, { ...existingMeta, branch: branchLabel });
+            fastPathMeta = { ...fastPathMeta, branch: branchLabel };
+            await saveMeta(metaDir, fastPathMeta);
           } catch (err) {
             // EACCES/EPERM also arise from ownership problems and transient
             // Windows locks, so keep the real error visible alongside the
@@ -1890,7 +1913,7 @@ const runFullAnalysisImpl = async (
             getInferredRepoName(repoPath) ??
             path.basename(resolveRepoIdentityRoot(repoPath)),
           repoPath,
-          stats: existingMeta.stats ?? {},
+          stats: fastPathMeta.stats ?? {},
           alreadyUpToDate: true,
           isPrimaryBranch: !placement.branch,
         };
