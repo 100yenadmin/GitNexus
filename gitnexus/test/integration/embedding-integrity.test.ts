@@ -188,7 +188,12 @@ withTestLbugDB(
       expect(scan.physicalRows).toBe(9);
       expect(scan.rejectedRows + scan.acceptedRows.length).toBe(scan.physicalRows);
       expect(scan.acceptedRows.map(({ id }) => id)).toEqual(['Function:good:0']);
-      expect(scan.acceptedRows[0]).toMatchObject({ id: 'Function:good:0', nodeId: 'Function:good', chunkIndex: 0, contentHash: 'good' });
+      expect(scan.acceptedRows[0]).toMatchObject({
+        id: 'Function:good:0',
+        nodeId: 'Function:good',
+        chunkIndex: 0,
+        contentHash: 'good',
+      });
       expect(scan.acceptedRows[0]?.embedding).toEqual(new Array(EMBEDDING_DIMS).fill(0.25));
       expect(scan.implicatedOwnerIds).toEqual([
         'Function:bad',
@@ -213,7 +218,22 @@ withTestLbugDB(
           'chunkIndex INT64, startLine INT64, endLine INT64, embedding FLOAT[], contentHash STRING)',
       );
       const vector = new Array(EMBEDDING_DIMS).fill(0.25);
-      const row = (id: string, nodeId: string, chunkIndex: number, embedding = vector, contentHash = id) => ({ rowKey: `${id}-${nodeId}`, id, nodeId, chunkIndex, startLine: 1, endLine: 2, embedding, contentHash });
+      const row = (
+        id: string,
+        nodeId: string,
+        chunkIndex: number,
+        embedding = vector,
+        contentHash = id,
+      ) => ({
+        rowKey: `${id}-${nodeId}`,
+        id,
+        nodeId,
+        chunkIndex,
+        startLine: 1,
+        endLine: 2,
+        embedding,
+        contentHash,
+      });
       await adapter.executeWithReusedStatement(
         'CREATE (e:CodeEmbedding {rowKey: $rowKey, id: $id, nodeId: $nodeId, chunkIndex: $chunkIndex, startLine: $startLine, endLine: $endLine, embedding: $embedding, contentHash: $contentHash})',
         [

@@ -1826,25 +1826,9 @@ export interface EmbeddingIntegrityReport {
   recoverableIdentitySha256: string;
 }
 
-export interface EmbeddingPreservationRow {
-  id: string;
-  nodeId: string;
-  chunkIndex: number;
-  startLine: number;
-  endLine: number;
-  embedding: number[];
-  contentHash?: string;
-}
+export type EmbeddingPreservationRow = CachedEmbedding & { id: string };
 
-export interface EmbeddingPreservationScan {
-  tablePresent: boolean;
-  physicalRows: number;
-  acceptedRows: EmbeddingPreservationRow[];
-  rejectedRows: number;
-  implicatedOwnerIds: string[];
-}
-
-export const scanEmbeddingPreservationRows = async (): Promise<EmbeddingPreservationScan> => {
+export const scanEmbeddingPreservationRows = async () => {
   if (!conn) throw new Error('LadybugDB not initialized. Call initLbug first.');
 
   return withConnLock(async () => {
@@ -1962,6 +1946,8 @@ export const scanEmbeddingPreservationRows = async (): Promise<EmbeddingPreserva
     };
   });
 };
+
+export type EmbeddingPreservationScan = Awaited<ReturnType<typeof scanEmbeddingPreservationRows>>;
 
 /**
  * Scan embedding identity without materializing vectors. This deliberately uses
