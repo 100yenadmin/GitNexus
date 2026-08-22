@@ -234,6 +234,38 @@ describe('doctor --registry read-only report (#133)', () => {
     expect(await snapshotFiles(fixture.dbPath)).toEqual(before);
   });
 
+  it('compares only identity fields present in a partial checkpoint', async () => {
+    const indexed = await createEntry(
+      fixture.dbPath,
+      'partial-checkpoint',
+      'PartialCheckpoint',
+      'https://github.com/owner/partial-checkpoint.git',
+      { nodes: 1, edges: 0, embeddings: 3 },
+    );
+    const metaPath = path.join(indexed.entry.storagePath, INDEX_METADATA_FILE);
+    const meta = JSON.parse(await fs.readFile(metaPath, 'utf8'));
+    await fs.writeFile(
+      metaPath,
+      JSON.stringify({
+        ...meta,
+        embeddingCheckpoint: { physicalRows: 3 },
+      }),
+    );
+
+    const report = await buildRegistryDoctorReport({
+      entries: [indexed.entry],
+      databaseProbe: async () => ({
+        nodes: 1,
+        edges: 0,
+        embeddings: 3,
+        integrity: cleanIntegrity(3),
+      }),
+    });
+
+    expect(report.entries[0]?.database.integrity?.status).toBe('clean');
+    expect(report.entries[0]?.health.state).toBe('healthy');
+  });
+
   it('does not open a database when WAL recovery state is present', async () => {
     const indexed = await createEntry(
       fixture.dbPath,

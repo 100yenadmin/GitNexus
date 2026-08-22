@@ -576,17 +576,14 @@ const inspectEntry = async (
         reason: 'identity-scan-unavailable' as const,
       };
       const checkpoint = meta?.embeddingCheckpoint;
-      const durableIdentity = checkpoint && [
-        checkpoint.physicalRows,
-        checkpoint.validRows,
-        checkpoint.recoverableIdentitySha256,
-      ];
       if (
         integrity.status !== 'unavailable' &&
-        durableIdentity?.some((value) => value !== undefined) &&
-        (checkpoint!.physicalRows !== integrity.physicalRows ||
-          checkpoint!.validRows !== integrity.validRows ||
-          checkpoint!.recoverableIdentitySha256 !== integrity.recoverableIdentitySha256)
+        checkpoint &&
+        ((checkpoint.physicalRows !== undefined &&
+          checkpoint.physicalRows !== integrity.physicalRows) ||
+          (checkpoint.validRows !== undefined && checkpoint.validRows !== integrity.validRows) ||
+          (checkpoint.recoverableIdentitySha256 !== undefined &&
+            checkpoint.recoverableIdentitySha256 !== integrity.recoverableIdentitySha256))
       ) {
         integrity = { ...integrity, status: 'malformed' };
       }
