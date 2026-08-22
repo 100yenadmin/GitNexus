@@ -54,6 +54,8 @@ export const getQueryEmbeddingRuntimeStatus = (): QueryEmbeddingRuntimeStatus =>
     try {
       const endpoint = new URL(configuredUrl);
       if (
+        configuredUrl.includes('?') ||
+        configuredUrl.includes('#') ||
         (endpoint.protocol !== 'http:' && endpoint.protocol !== 'https:') ||
         endpoint.username !== '' ||
         endpoint.password !== '' ||

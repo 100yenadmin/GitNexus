@@ -217,6 +217,8 @@ describe('read-only doctor CLI modes (#127, #133)', () => {
       ['https://embedding.example/v1', '384abc'],
       ['https://embedding.example/v1?secret=1', '384'],
       ['https://embedding.example/v1#frag', '384'],
+      ['https://embedding.example/v1?', '384'],
+      ['https://embedding.example/v1#', '384'],
     ] as const) {
       const result = runDoctor(['--registry', '--json'], {
         GITNEXUS_EMBEDDING_URL: embeddingUrl,

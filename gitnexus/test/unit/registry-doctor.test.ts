@@ -16,8 +16,10 @@ import {
   type RegistryDatabaseCounts,
   type RegistryDoctorOptions,
 } from '../../src/cli/registry-doctor.js';
+import { getQueryEmbeddingRuntimeStatus } from '../../src/core/embeddings/runtime-support.js';
 import {
   INDEX_METADATA_FILE,
+  readRegistryStrict,
   type RegistryEntry,
   type RepoMeta,
 } from '../../src/storage/repo-manager.js';
@@ -328,6 +330,71 @@ describe('doctor --registry read-only report (#133)', () => {
       semantic_ready: false,
       reasons: ['embedding-query-local-runtime-unavailable'],
     });
+  });
+
+  it('keeps a clean HTTP endpoint available but rejects raw query and fragment markers', () => {
+    const keys = [
+      'GITNEXUS_EMBEDDING_URL',
+      'GITNEXUS_EMBEDDING_MODEL',
+      'GITNEXUS_EMBEDDING_DIMS',
+    ] as const;
+    const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+    try {
+      process.env.GITNEXUS_EMBEDDING_MODEL = 'test-model';
+      process.env.GITNEXUS_EMBEDDING_DIMS = '384';
+      for (const suffix of ['', '?', '#']) {
+        process.env.GITNEXUS_EMBEDDING_URL = `https://embedding.example/v1${suffix}`;
+        expect(getQueryEmbeddingRuntimeStatus()).toEqual(
+          suffix === ''
+            ? { available: true, mode: 'http', reason: null }
+            : { available: false, mode: 'http', reason: 'http-config-invalid' },
+        );
+      }
+    } finally {
+      for (const key of keys) {
+        if (previous[key] === undefined) delete process.env[key];
+        else process.env[key] = previous[key];
+      }
+    }
+  });
+
+  it('rejects malformed registry stats values while accepting missing and zero stats', async () => {
+    const previousHome = process.env.GITNEXUS_HOME;
+    process.env.GITNEXUS_HOME = fixture.dbPath;
+    const base = {
+      name: 'stats-shape',
+      path: path.join(fixture.dbPath, 'repo'),
+      storagePath: path.join(fixture.dbPath, 'repo', '.gitnexus'),
+      indexedAt: '2026-07-20T00:00:00.000Z',
+      lastCommit: 'a'.repeat(40),
+    };
+    try {
+      for (const stats of [undefined, {}, { nodes: 0, edges: 0, embeddings: 0 }]) {
+        await fs.writeFile(
+          path.join(fixture.dbPath, 'registry.json'),
+          JSON.stringify([stats === undefined ? base : { ...base, stats }]),
+        );
+        expect((await readRegistryStrict()).status).toBe('available');
+      }
+
+      for (const [key, value] of [
+        ['files', true],
+        ['nodes', null],
+        ['edges', '1'],
+        ['communities', [1]],
+        ['processes', -1],
+        ['embeddings', Number.NaN],
+      ] as const) {
+        await fs.writeFile(
+          path.join(fixture.dbPath, 'registry.json'),
+          JSON.stringify([{ ...base, stats: { [key]: value } }]),
+        );
+        expect(await readRegistryStrict()).toEqual({ status: 'failed', reason: 'malformed' });
+      }
+    } finally {
+      if (previousHome === undefined) delete process.env.GITNEXUS_HOME;
+      else process.env.GITNEXUS_HOME = previousHome;
+    }
   });
 
   it('keeps a graph-only index healthy when the embedding table is absent', async () => {

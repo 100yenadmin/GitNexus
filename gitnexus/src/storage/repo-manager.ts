@@ -934,7 +934,24 @@ export type RegistryReadResult =
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
 
-const isStatsShape = (value: unknown): boolean => value === undefined || isRecord(value);
+const REGISTRY_STATS_KEYS = [
+  'files',
+  'nodes',
+  'edges',
+  'communities',
+  'processes',
+  'embeddings',
+] as const;
+
+const isFiniteNonnegativeNumber = (value: unknown): value is number =>
+  typeof value === 'number' && Number.isFinite(value) && value >= 0;
+
+const isStatsShape = (value: unknown): boolean =>
+  value === undefined ||
+  (isRecord(value) &&
+    REGISTRY_STATS_KEYS.every(
+      (key) => value[key] === undefined || isFiniteNonnegativeNumber(value[key]),
+    ));
 
 const isBranchSummaryShape = (value: unknown): boolean =>
   isRecord(value) &&
