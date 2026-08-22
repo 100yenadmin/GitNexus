@@ -14,7 +14,7 @@ const REPO: RegistryEntry = {
   lastCommit: 'test-head',
 };
 
-const identity = { model: MODEL, dimensions: 384 };
+const identity = { provider: 'local', model: MODEL, dimensions: 384 };
 const makeIntegrity = (digest: string): EmbeddingIntegrityReport =>
   ({
     physicalRows: 3,
@@ -197,6 +197,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     expect(state.runEmbeddingPipeline).toHaveBeenCalledOnce();
     expect(state.currentMeta.stats?.embeddings).toBe(3);
     expect(state.currentMeta.embeddingCheckpoint).toBeUndefined();
+    expect(state.currentMeta.embeddingIdentity).toEqual(identity);
   });
 
   it('persists completed-window identity before an interrupted finalization', async () => {
@@ -223,6 +224,9 @@ describe('POST /api/embed completed-checkpoint identity', () => {
 
     const persisted = (await state.loadMeta()).embeddingCheckpoint;
     expect(persisted).toMatchObject({
+      provider: identity.provider,
+      model: identity.model,
+      dimensions: identity.dimensions,
       nodesProcessed: 2,
       totalNodes: 4,
       chunksProcessed: 5,
