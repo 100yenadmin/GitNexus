@@ -17,6 +17,7 @@ import {
   type RepoMeta,
 } from '../../src/storage/repo-manager.js';
 import { taintModelVersion } from '../../src/core/ingestion/taint/typescript-model.js';
+import { httpEmbeddingProvider } from '../../src/core/embeddings/embedding-identity.js';
 import { createTempDir } from '../helpers/test-db.js';
 import { readEmbeddingNodeIds, seedEmbeddingsForFiles } from '../helpers/embedding-seed.js';
 
@@ -58,6 +59,15 @@ describe('run-analyze module', () => {
     expect(source).toMatch(
       /const completedIntegrity = await withLbugDb\(\s*lbugPath,\s*inspectEmbeddingIntegrity/,
     );
+  });
+
+  it('stamps the provider on new checkpoints while accepting legacy resumes', async () => {
+    const source = await fs.readFile(
+      path.join(__dirname, '..', '..', 'src', 'core', 'run-analyze.ts'),
+      'utf-8',
+    );
+    expect(source).toMatch(/checkpoint\.provider !== undefined/);
+    expect(source).toMatch(/provider: embeddingIdentity\.provider/);
   });
 
   it('creates .gitnexus/.gitignore on the already-up-to-date fast path (#1233)', async () => {
@@ -232,6 +242,9 @@ describe('run-analyze module', () => {
 
       const interrupted = await loadMeta(storagePath);
       expect(interrupted?.embeddingCheckpoint).toBeDefined();
+      expect(interrupted?.embeddingCheckpoint?.provider).toBe(
+        httpEmbeddingProvider('http://test:8080/v1'),
+      );
       expect(interrupted?.schemaVersion).toBe(INCREMENTAL_SCHEMA_VERSION);
     } finally {
       vi.unstubAllGlobals();
@@ -373,7 +386,8 @@ describe('run-analyze module', () => {
           nodesProcessed: 1,
           totalNodes: 2,
           chunksProcessed: 1,
-          model: 'different-model',
+          provider: httpEmbeddingProvider('http://other:8080/v1'),
+          model: 'test-model',
           dimensions: 384,
         },
       });

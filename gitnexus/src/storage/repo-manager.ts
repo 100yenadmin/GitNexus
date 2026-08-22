@@ -216,6 +216,8 @@ export interface RepoMeta {
     nodesProcessed: number;
     totalNodes: number;
     chunksProcessed: number;
+    /** Provider identity is optional so legacy checkpoints remain readable. */
+    provider?: string;
     model: string;
     dimensions: number;
     /** Physical rows durably visible after the completed checkpoint. */

@@ -139,6 +139,7 @@ import {
   validateEmbeddingTableRebuildMarker,
   writeEmbeddingTableRebuildMarker,
 } from './embeddings/rebuild-marker.js';
+import type { EmbeddingIdentity } from './embeddings/embedding-identity.js';
 import { generateAIContextFiles } from '../cli/ai-context.js';
 import { sanitizeDetectedBranch } from '../cli/analyze-config.js';
 import { EMBEDDING_TABLE_NAME, STALE_HASH_SENTINEL } from './lbug/schema.js';
@@ -319,11 +320,6 @@ export interface AnalyzeOptions {
    * Process exit reclaims the handles. Long-lived callers (MCP server, tests)
    * leave this unset so they get a real close. See `closeLbug`. */
   skipNativeCloseOnExit?: boolean;
-}
-
-interface EmbeddingIdentity {
-  model: string;
-  dimensions: number;
 }
 
 const resolveEmbeddingIdentity = async (): Promise<EmbeddingIdentity> => {
@@ -1576,13 +1572,16 @@ const runFullAnalysisImpl = async (
       embeddingIdentityForRun = await resolveEmbeddingIdentity();
       const checkpoint = existingMeta.embeddingCheckpoint;
       if (
+        (checkpoint.provider !== undefined &&
+          checkpoint.provider !== embeddingIdentityForRun.provider) ||
         checkpoint.model !== embeddingIdentityForRun.model ||
         checkpoint.dimensions !== embeddingIdentityForRun.dimensions
       ) {
         throw new Error(
-          `Cannot resume embedding checkpoint: it uses ${checkpoint.model} at ` +
-            `${checkpoint.dimensions} dimensions, but this run resolves ` +
-            `${embeddingIdentityForRun.model} at ${embeddingIdentityForRun.dimensions}. ` +
+          `Cannot resume embedding checkpoint: it uses ${checkpoint.provider ?? 'legacy'} / ` +
+            `${checkpoint.model} at ${checkpoint.dimensions} dimensions, but this run resolves ` +
+            `${embeddingIdentityForRun.provider} / ${embeddingIdentityForRun.model} at ` +
+            `${embeddingIdentityForRun.dimensions}. ` +
             'Restore the matching embedding configuration or pass --drop-embeddings to rebuild without it.',
         );
       }
@@ -3056,6 +3055,7 @@ const runFullAnalysisImpl = async (
           embeddingCheckpoint: {
             at: new Date().toISOString(),
             ...checkpoint,
+            provider: embeddingIdentity.provider,
             model: embeddingIdentity.model,
             dimensions: embeddingIdentity.dimensions,
             pendingNodeIds,

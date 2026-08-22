@@ -1807,13 +1807,15 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
               const priorCheckpoint = embeddingMeta.embeddingCheckpoint;
               if (
                 priorCheckpoint &&
-                (priorCheckpoint.model !== embeddingIdentity.model ||
+                ((priorCheckpoint.provider !== undefined &&
+                  priorCheckpoint.provider !== embeddingIdentity.provider) ||
+                  priorCheckpoint.model !== embeddingIdentity.model ||
                   priorCheckpoint.dimensions !== embeddingIdentity.dimensions)
               ) {
                 throw new Error(
-                  `Cannot resume embedding checkpoint: it uses ${priorCheckpoint.model} at ` +
-                    `${priorCheckpoint.dimensions} dimensions, but this run resolves ` +
-                    `${embeddingIdentity.model} at ${embeddingIdentity.dimensions}.`,
+                  `Cannot resume embedding checkpoint: it uses ${priorCheckpoint.provider ?? 'legacy'} / ` +
+                    `${priorCheckpoint.model} at ${priorCheckpoint.dimensions} dimensions, but this run resolves ` +
+                    `${embeddingIdentity.provider} / ${embeddingIdentity.model} at ${embeddingIdentity.dimensions}.`,
                 );
               }
               if (priorCheckpoint && !priorCheckpoint.pendingNodeIds?.length) {
