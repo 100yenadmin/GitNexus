@@ -17,7 +17,6 @@ export const embeddingIdentitySetDigest = (identities: ReadonlySet<string>): str
   }
   return digest.digest('hex');
 };
-
 export type EmbeddingPhysicalVectorInfo = Record<'kind' | 'dimensions' | 'finite' | 'sha256', any>;
 const token = (value: unknown): Buffer => {
   if (value === null || value === undefined) return Buffer.from(String(value));
@@ -59,7 +58,7 @@ export const embeddingPhysicalVectorInfo = (vector: unknown): EmbeddingPhysicalV
     const validLength = Number.isSafeInteger(length) && length >= 0;
     dimensions = validLength ? length : 0;
     values = validLength ? (vector as unknown as ArrayLike<unknown>) : undefined;
-    finite = validLength ? 'finite' : 'malformed';
+    finite = validLength && /^Float(?:16|32|64)Array$/.test(kind) ? 'finite' : 'malformed';
   } else if (vector !== null && vector !== undefined) {
     kind = typeof vector;
     finite = 'malformed';

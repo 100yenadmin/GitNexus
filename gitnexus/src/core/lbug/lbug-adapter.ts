@@ -1832,24 +1832,24 @@ export interface EmbeddingIntegrityReport {
 
 const projectionField = (row: any, name: string, index: number): unknown =>
   row && name in row ? row[name] : row?.[index];
-
 const normalizedText = (value: unknown): string =>
   value === null || value === undefined ? '' : String(value);
-
 const strictInteger = (value: unknown): number =>
-  typeof value === 'number' && Number.isSafeInteger(value)
-    ? value
+  Number.isSafeInteger(value)
+    ? (value as number)
     : typeof value === 'bigint' &&
         Number.isSafeInteger(Number(value)) &&
         BigInt(Number(value)) === value
       ? Number(value)
       : Number.NaN;
-
 const ownerLabelForNodeId = (nodeId: string): string => {
   const separator = nodeId.indexOf(':');
   return separator > 0 ? nodeId.slice(0, separator) : '';
 };
-
+export const isMissingContentHashError = (error: unknown): boolean =>
+  /^Binder exception:\s*Cannot find property contentHash\b/.test(
+    error instanceof Error ? error.message : String(error),
+  );
 const MAX_STORED_EMBEDDING_DIMENSIONS = 65_536;
 
 /** Read the vector width declared by this database's embedding table. */
@@ -2132,6 +2132,7 @@ export const scanEmbeddingPreservationRows = async (
  */
 export const inspectEmbeddingIntegrity = async (
   expectedDimensions: number = EMBEDDING_DIMS,
+  fullDigest = false,
 ): Promise<EmbeddingIntegrityReport> => {
   const c = conn;
   if (!c) throw new Error('LadybugDB not initialized. Call initLbug first.');
@@ -2201,13 +2202,7 @@ export const inspectEmbeddingIntegrity = async (
             semanticCounts.set(semanticKey, (semanticCounts.get(semanticKey) ?? 0) + 1);
           if (dimensions !== expectedDimensions) wrongDimensionRows++;
           if (!nodeIdEmpty) ownerCandidates.add(`${ownerLabelForNodeId(nodeId)}\0${nodeId}`);
-          rows.push({
-            id,
-            nodeId,
-            chunkIndex,
-            dimensions,
-            semanticKey,
-          });
+          rows.push({ id, nodeId, chunkIndex, dimensions, semanticKey });
         },
       );
     } catch (error) {
@@ -2285,6 +2280,7 @@ export const inspectEmbeddingIntegrity = async (
     }
 
     const physicalDigestRows = async (withHash: boolean): Promise<string[]> => {
+      if (!fullDigest) return [];
       const digests: string[] = [];
       const hashProjection = withHash ? ', e.contentHash AS contentHash' : '';
       await stream(
@@ -2295,9 +2291,6 @@ export const inspectEmbeddingIntegrity = async (
           const rawId = projectionField(row, 'id', 0);
           const rawNodeId = projectionField(row, 'nodeId', 1);
           const rawChunkIndex = projectionField(row, 'chunkIndex', 2);
-          const rawStartLine = projectionField(row, 'startLine', 3);
-          const rawEndLine = projectionField(row, 'endLine', 4);
-          const rawContentHash = withHash ? projectionField(row, 'contentHash', 6) : undefined;
           const id = normalizedText(rawId);
           const nodeId = normalizedText(rawNodeId);
           const chunkIndex = strictInteger(rawChunkIndex);
@@ -2338,12 +2331,12 @@ export const inspectEmbeddingIntegrity = async (
               nodeId,
               rawChunkIndex,
               chunkIndex,
-              rawStartLine,
-              startLine: strictInteger(rawStartLine),
-              rawEndLine,
-              endLine: strictInteger(rawEndLine),
-              contentHashPresent: withHash && rawContentHash !== undefined,
-              rawContentHash,
+              rawStartLine: projectionField(row, 'startLine', 3),
+              startLine: strictInteger(projectionField(row, 'startLine', 3)),
+              rawEndLine: projectionField(row, 'endLine', 4),
+              endLine: strictInteger(projectionField(row, 'endLine', 4)),
+              contentHashPresent: withHash && projectionField(row, 'contentHash', 6) !== undefined,
+              rawContentHash: withHash ? projectionField(row, 'contentHash', 6) : undefined,
               vector,
               ownerLabel: label,
               ownerState,
@@ -2354,13 +2347,13 @@ export const inspectEmbeddingIntegrity = async (
       );
       return digests;
     };
-    let physicalValidRows = 0;
-    let rowDigests: string[];
+    let physicalValidRows = fullDigest ? 0 : validRows;
+    let rowDigests: string[] = [];
     try {
       rowDigests = await physicalDigestRows(true);
     } catch (error) {
-      if (!(error instanceof Error ? error.message : String(error)).includes('contentHash'))
-        throw error;
+      if (!isMissingContentHashError(error)) throw error;
+      physicalValidRows = 0;
       rowDigests = await physicalDigestRows(false);
     }
     return {
@@ -2377,7 +2370,9 @@ export const inspectEmbeddingIntegrity = async (
       orphanRows,
       wrongDimensionRows,
       recoverableIdentitySha256: embeddingIdentitySetDigest(recoverable),
-      physicalRowsSha256: embeddingPhysicalRowsDigest(true, rows.length, rowDigests),
+      physicalRowsSha256: fullDigest
+        ? embeddingPhysicalRowsDigest(true, rows.length, rowDigests)
+        : '',
     };
   });
 };

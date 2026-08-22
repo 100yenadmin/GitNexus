@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { withTestLbugDB } from '../helpers/test-indexed-db.js';
 import { EMBEDDING_DIMS } from '../../src/core/lbug/schema.js';
 import { probeRegistryDatabaseCounts } from '../../src/cli/registry-doctor.js';
-import { embeddingPhysicalRowsDigest } from '../../src/core/embeddings/identity-digest.js';
+import * as d from '../../src/core/embeddings/identity-digest.js';
 
 describe('embedding writer identity preflight', () => {
   it('validates the whole batch before executing and prepares once per row', async () => {
@@ -102,8 +102,10 @@ withTestLbugDB(
         ),
       ).toBe(false);
       expect(
-        adapter.isMissingEmbeddingOwnerTableError(new Error('query result not found'), 'Class'),
-      ).toBe(false);
+        adapter.isMissingContentHashError(
+          new Error('Binder exception: Cannot find property contentHash'),
+        ),
+      ).toBe(true);
     });
 
     it('preserves counts when a present legacy table lacks chunkIndex', async () => {
@@ -216,7 +218,8 @@ withTestLbugDB(
     });
     it('tracks physical values, rejected state, owner state, and multiset order', async () => {
       const adapter = await import('../../src/core/lbug/lbug-adapter.js');
-      const read = () => adapter.inspectEmbeddingIntegrity();
+      const read = () => adapter.inspectEmbeddingIntegrity(EMBEDDING_DIMS, true);
+      const vi = d.embeddingPhysicalVectorInfo;
       const nonfinite = new Array(EMBEDDING_DIMS).fill(0.5);
       nonfinite[0] = Infinity;
       const base = await read();
@@ -254,9 +257,10 @@ withTestLbugDB(
       expect(rejected.physicalRowsSha256).not.toBe(vectorChanged.physicalRowsSha256);
       await adapter.executeQuery("CREATE (:File {id: 'File:bad'})");
       expect((await read()).physicalRowsSha256).not.toBe(rejected.physicalRowsSha256);
-      expect(embeddingPhysicalRowsDigest(true, 3, ['a', 'b', 'a'])).toBe(
-        embeddingPhysicalRowsDigest(true, 3, ['a', 'a', 'b']),
+      expect(d.embeddingPhysicalRowsDigest(true, 3, ['a', 'b', 'a'])).toBe(
+        d.embeddingPhysicalRowsDigest(true, 3, ['a', 'a', 'b']),
       );
+      expect(vi(new Int32Array(EMBEDDING_DIMS)).finite).toBe('malformed');
     });
   },
   {
