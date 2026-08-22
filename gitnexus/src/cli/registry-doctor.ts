@@ -32,9 +32,12 @@ export type RegistryDatabaseIntegrity =
   | ({ status: 'clean' | 'malformed' } & EmbeddingIntegrityReport)
   | { status: 'unavailable'; reason: 'identity-scan-unavailable' };
 
-export type RegistryDatabaseProbe = (
-  lbugPath: string,
-) => Promise<RegistryDatabaseCounts & { integrity?: RegistryDatabaseIntegrity }>;
+export type RegistryDatabaseProbe = (lbugPath: string) => Promise<
+  RegistryDatabaseCounts & {
+    integrity?: RegistryDatabaseIntegrity;
+    embeddingDimensions?: number;
+  }
+>;
 
 export interface RegistryCapabilityReport {
   source: 'active-probe' | 'unavailable';
@@ -333,15 +336,21 @@ export const probeRegistryDatabaseCounts: RegistryDatabaseProbe = async (lbugPat
       if (lbugConfig.classifyDeleteAllError(error) !== 'benign-missing-table') throw error;
       embeddingTablePresent = false;
     }
-    const report = embeddingTablePresent
-      ? await adapter.inspectEmbeddingIntegrity(await adapter.getStoredEmbeddingDimensions())
-      : await adapter.inspectEmbeddingIntegrity();
+    let embeddingDimensions: number | undefined;
+    let report: EmbeddingIntegrityReport;
+    if (embeddingTablePresent) {
+      embeddingDimensions = await adapter.getStoredEmbeddingDimensions();
+      report = await adapter.inspectEmbeddingIntegrity(embeddingDimensions);
+    } else {
+      report = await adapter.inspectEmbeddingIntegrity();
+    }
     const malformed =
       adapter.embeddingIntegrityFailures(report) > 0 || report.physicalRows !== report.validRows;
     return {
       nodes,
       edges,
       embeddings,
+      embeddingDimensions,
       integrity: { status: malformed ? 'malformed' : 'clean', ...report },
     };
   } finally {
@@ -517,9 +526,11 @@ const inspectEntry = async (
     database = { status: 'skipped', reason: 'recovery-state-present' };
   } else {
     try {
-      const { integrity: scannedIntegrity, ...scannedCounts } = await (
-        options.databaseProbe ?? probeRegistryDatabaseCounts
-      )(lbugPath);
+      const {
+        integrity: scannedIntegrity,
+        embeddingDimensions,
+        ...scannedCounts
+      } = await (options.databaseProbe ?? probeRegistryDatabaseCounts)(lbugPath);
       availableCounts = scannedCounts;
       let integrity =
         scannedIntegrity ??
@@ -528,8 +539,11 @@ const inspectEntry = async (
       if (
         integrity.status !== 'unavailable' &&
         checkpoint &&
-        ((checkpoint.physicalRows !== undefined &&
-          checkpoint.physicalRows !== integrity.physicalRows) ||
+        ((checkpoint.dimensions !== undefined &&
+          embeddingDimensions !== undefined &&
+          checkpoint.dimensions !== embeddingDimensions) ||
+          (checkpoint.physicalRows !== undefined &&
+            checkpoint.physicalRows !== integrity.physicalRows) ||
           (checkpoint.validRows !== undefined && checkpoint.validRows !== integrity.validRows) ||
           (checkpoint.recoverableIdentitySha256 !== undefined &&
             checkpoint.recoverableIdentitySha256 !== integrity.recoverableIdentitySha256))

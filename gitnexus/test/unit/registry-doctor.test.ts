@@ -231,11 +231,12 @@ describe('doctor --registry read-only report (#133)', () => {
       nodes: 1,
       edges: 0,
       embeddings: 3,
+      embeddingDimensions: 384,
       integrity: cleanIntegrity(3),
     });
     await fs.writeFile(
       metaPath,
-      JSON.stringify({ ...meta, embeddingCheckpoint: { physicalRows: 3 } }),
+      JSON.stringify({ ...meta, embeddingCheckpoint: { dimensions: 384, physicalRows: 3 } }),
     );
 
     const partial = await buildRegistryDoctorReport({ entries: [indexed.entry], databaseProbe });
@@ -249,7 +250,7 @@ describe('doctor --registry read-only report (#133)', () => {
 
     await fs.writeFile(
       metaPath,
-      JSON.stringify({ ...meta, embeddingCheckpoint: { physicalRows: 4 } }),
+      JSON.stringify({ ...meta, embeddingCheckpoint: { dimensions: 768, physicalRows: 3 } }),
     );
     const mismatched = await buildRegistryDoctorReport({ entries: [indexed.entry], databaseProbe });
     const mismatchedDatabase = mismatched.entries[0]?.database;
