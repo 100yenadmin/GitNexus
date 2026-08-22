@@ -327,14 +327,8 @@ interface EmbeddingIdentity {
 }
 
 const resolveEmbeddingIdentity = async (): Promise<EmbeddingIdentity> => {
-  const [{ getEmbeddingDimensions }, { resolveEmbeddingConfig }] = await Promise.all([
-    import('./embeddings/embedder.js'),
-    import('./embeddings/config.js'),
-  ]);
-  return {
-    model: process.env.GITNEXUS_EMBEDDING_MODEL ?? resolveEmbeddingConfig().modelId,
-    dimensions: getEmbeddingDimensions(),
-  };
+  const { getActiveEmbeddingIdentity } = await import('./embeddings/embedder.js');
+  return getActiveEmbeddingIdentity();
 };
 
 const embeddingIntegrityIsClean = (report: EmbeddingIntegrityReport): boolean =>
@@ -358,6 +352,36 @@ const assertEmbeddingIntegrity = (
   ) {
     throw new Error(
       `${context} failed embedding integrity validation (${embeddingIntegritySummary(report)}).`,
+    );
+  }
+};
+
+const assertCompletedCheckpointIdentity = (
+  checkpoint: NonNullable<RepoMeta['embeddingCheckpoint']>,
+  report: EmbeddingIntegrityReport,
+  context: string,
+): void => {
+  const values = [
+    checkpoint.physicalRows,
+    checkpoint.validRows,
+    checkpoint.recoverableIdentitySha256,
+  ];
+  if (values.every((value) => value === undefined)) return; // Legacy checkpoint.
+  if (
+    !Number.isSafeInteger(checkpoint.physicalRows) ||
+    !Number.isSafeInteger(checkpoint.validRows) ||
+    typeof checkpoint.recoverableIdentitySha256 !== 'string' ||
+    !/^[a-f0-9]{64}$/.test(checkpoint.recoverableIdentitySha256)
+  ) {
+    throw new Error(`${context} has an incomplete or malformed durable embedding identity.`);
+  }
+  assertEmbeddingIntegrity(report, context, checkpoint.physicalRows);
+  if (
+    report.validRows !== checkpoint.validRows ||
+    report.recoverableIdentitySha256 !== checkpoint.recoverableIdentitySha256
+  ) {
+    throw new Error(
+      `${context} no longer matches the live embedding identities (${embeddingIntegritySummary(report)}).`,
     );
   }
 };
@@ -916,6 +940,13 @@ const runFullAnalysisImpl = async (
 
     stats = readOnlyPreflight.stats;
     embeddingCountBefore = readOnlyPreflight.embeddingCount;
+    if (existingMeta.embeddingCheckpoint) {
+      assertCompletedCheckpointIdentity(
+        existingMeta.embeddingCheckpoint,
+        readOnlyPreflight.integrity,
+        'Cannot repair VECTOR: completed embedding checkpoint',
+      );
+    }
 
     // A completed checkpoint passed the preflight, so repair will clear it —
     // but the integrity scan only proves the live rows are well-formed, not
@@ -1552,7 +1583,22 @@ const runFullAnalysisImpl = async (
           `Cannot resume embedding checkpoint: it uses ${checkpoint.model} at ` +
             `${checkpoint.dimensions} dimensions, but this run resolves ` +
             `${embeddingIdentityForRun.model} at ${embeddingIdentityForRun.dimensions}. ` +
-            'Restore the matching embedding configuration or pass --drop-embeddings to rebuild without it.',
+          'Restore the matching embedding configuration or pass --drop-embeddings to rebuild without it.',
+        );
+      }
+      if (
+        checkpoint.nodesProcessed === checkpoint.totalNodes &&
+        !checkpoint.pendingNodeIds?.length
+      ) {
+        const completedIntegrity = await withLbugDb(
+          canonicalPaths.lbugPath,
+          inspectEmbeddingIntegrity,
+          { readOnly: true },
+        );
+        assertCompletedCheckpointIdentity(
+          checkpoint,
+          completedIntegrity,
+          'Completed embedding checkpoint',
         );
       }
       resumeEmbeddingCheckpoint = true;
@@ -1778,6 +1824,18 @@ const runFullAnalysisImpl = async (
       const healUnregistered =
         options.allowDuplicateName === true && !(await isRepoRegistered(repoPath));
       if (!dirty && !healUnregistered) {
+        if (Number(existingMeta.stats?.embeddings ?? 0) > 0) {
+          const fastPathIntegrity = await withLbugDb(
+            canonicalPaths.lbugPath,
+            inspectEmbeddingIntegrity,
+            { readOnly: true },
+          );
+          assertEmbeddingIntegrity(
+            fastPathIntegrity,
+            'Already-up-to-date index',
+            Number(existingMeta.stats!.embeddings),
+          );
+        }
         // ── #2354: restamp the workspace label on a same-commit branch flip ──
         // The flat slot follows the checked-out working tree; a branch switch
         // at the SAME commit with a clean tree changes nothing the pipeline
@@ -2923,6 +2981,7 @@ const runFullAnalysisImpl = async (
         },
         pendingNodeIds: string[],
         embeddings: number | undefined,
+        integrity?: EmbeddingIntegrityReport,
       ): Promise<void> => {
         const fileHashes: Record<string, string> = {};
         for (const [key, value] of newFileHashes) fileHashes[key] = value;
@@ -2954,6 +3013,9 @@ const runFullAnalysisImpl = async (
             model: embeddingIdentity.model,
             dimensions: embeddingIdentity.dimensions,
             pendingNodeIds,
+            physicalRows: integrity?.physicalRows,
+            validRows: integrity?.validRows,
+            recoverableIdentitySha256: integrity?.recoverableIdentitySha256,
           },
           pdg: resolvePdgConfig(options),
         });
@@ -2993,12 +3055,9 @@ const runFullAnalysisImpl = async (
           },
           onCheckpoint: async (checkpoint) => {
             await checkpointOnce();
-            const countResult = await executeQuery(
-              `MATCH (e:${EMBEDDING_TABLE_NAME}) RETURN count(e) AS cnt`,
-            );
-            const countRow = countResult?.[0];
-            const embeddings = Number(countRow?.cnt ?? countRow?.[0] ?? 0);
-            await saveEmbeddingCheckpoint(checkpoint, [], embeddings);
+            const integrity = await inspectEmbeddingIntegrity();
+            assertEmbeddingIntegrity(integrity, 'Completed embedding checkpoint');
+            await saveEmbeddingCheckpoint(checkpoint, [], integrity.validRows, integrity);
           },
         },
       );
@@ -3016,17 +3075,10 @@ const runFullAnalysisImpl = async (
     // ── Phase 5: Finalize (98–100%) ───────────────────────────────────
     progress('done', 98, 'Saving metadata...');
 
-    // Count embeddings in the index (cached + newly generated)
-    let embeddingCount = 0;
-    try {
-      const embResult = await executeQuery(
-        `MATCH (e:${EMBEDDING_TABLE_NAME}) RETURN count(e) AS cnt`,
-      );
-      const row = embResult?.[0];
-      embeddingCount = Number(row?.cnt ?? row?.[0] ?? 0);
-    } catch {
-      /* table may not exist if embeddings never ran */
-    }
+    // Finalization, metadata, and registration trust only canonical live rows.
+    const terminalIntegrity = await inspectEmbeddingIntegrity();
+    assertEmbeddingIntegrity(terminalIntegrity, 'Terminal embedding finalization');
+    const embeddingCount = terminalIntegrity.validRows;
 
     if (!embeddingSkipped && stats.nodes > 0 && embeddingCount === 0) {
       throw new Error(

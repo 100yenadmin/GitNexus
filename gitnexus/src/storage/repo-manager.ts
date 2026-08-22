@@ -218,6 +218,12 @@ export interface RepoMeta {
     chunksProcessed: number;
     model: string;
     dimensions: number;
+    /** Physical rows durably visible after the completed checkpoint. */
+    physicalRows?: number;
+    /** Canonical, unique, live-owner rows at the completed checkpoint. */
+    validRows?: number;
+    /** SHA-256 of the completed checkpoint's recoverable owner/chunk identities. */
+    recoverableIdentitySha256?: string;
     /**
      * Nodes in the current checkpoint window. Any of these may have only a
      * subset of their chunks persisted after an abrupt process termination,

@@ -80,6 +80,7 @@ async function importRepairSubject(options: {
   createError?: Error;
   missingEmbeddingTable?: boolean;
   malformedEmbeddingTable?: boolean;
+  identityDigest?: string;
   afterInitialPreflight?: () => Promise<void> | void;
 }) {
   const counts = [...(options.counts ?? [3, 3, 3, 3])];
@@ -121,6 +122,7 @@ async function importRepairSubject(options: {
     duplicateSemanticRows: 0,
     orphanRows: 0,
     wrongDimensionRows: 0,
+    recoverableIdentitySha256: options.identityDigest ?? 'a'.repeat(64),
   }));
   const registerRepo = vi.fn(async () => 'fixture-repo');
   const probeDoctorPool = vi.fn(async () => probes.shift() ?? healthyProbe);
@@ -474,6 +476,49 @@ describe('runFullAnalysis VECTOR-only repair (#170)', () => {
       expect(repaired.embeddingCheckpoint).toBeUndefined();
       expect(repaired.incrementalInProgress).toBeUndefined();
       expect(repaired.capabilities.vectorSearch.status).toBe('vector-index');
+    } finally {
+      restoreEnv();
+      await indexed.fixture.cleanup();
+    }
+  });
+
+  it('accepts the additive completed-checkpoint identity contract', async () => {
+    const restoreEnv = pinDefaultEmbeddingIdentity();
+    const indexed = await createIndexedFixture(3, {
+      embeddingCheckpoint: {
+        ...completedCheckpoint,
+        physicalRows: 3,
+        validRows: 3,
+        recoverableIdentitySha256: 'a'.repeat(64),
+      },
+    });
+    try {
+      const { runFullAnalysis } = await importRepairSubject({});
+      await expect(
+        runFullAnalysis(indexed.fixture.dbPath, { repairVector: true }, { onProgress: () => {} }),
+      ).resolves.toMatchObject({ vectorRepairStatus: 'repaired' });
+    } finally {
+      restoreEnv();
+      await indexed.fixture.cleanup();
+    }
+  });
+
+  it('refuses same-count completed checkpoints with a different identity digest', async () => {
+    const restoreEnv = pinDefaultEmbeddingIdentity();
+    const indexed = await createIndexedFixture(3, {
+      embeddingCheckpoint: {
+        ...completedCheckpoint,
+        physicalRows: 3,
+        validRows: 3,
+        recoverableIdentitySha256: 'b'.repeat(64),
+      },
+    });
+    try {
+      const { runFullAnalysis, mocks } = await importRepairSubject({});
+      await expect(
+        runFullAnalysis(indexed.fixture.dbPath, { repairVector: true }, { onProgress: () => {} }),
+      ).rejects.toThrow(/no longer matches the live embedding identities/i);
+      expect(mocks.initLbugForMaintenance).not.toHaveBeenCalled();
     } finally {
       restoreEnv();
       await indexed.fixture.cleanup();
