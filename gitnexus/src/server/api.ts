@@ -1796,8 +1796,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
             await withLbugDb(lbugPath, async () => {
               const { runEmbeddingPipeline } =
                 await import('../core/embeddings/embedding-pipeline.js');
-              const { getActiveEmbeddingIdentity } =
-                await import('../core/embeddings/embedder.js');
+              const { getActiveEmbeddingIdentity } = await import('../core/embeddings/embedder.js');
               const { inspectEmbeddingIntegrity, embeddingIntegrityFailures } =
                 await import('../core/lbug/lbug-adapter.js');
               const embeddingIdentity = getActiveEmbeddingIdentity();
@@ -1814,7 +1813,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                 throw new Error(
                   `Cannot resume embedding checkpoint: it uses ${priorCheckpoint.model} at ` +
                     `${priorCheckpoint.dimensions} dimensions, but this run resolves ` +
-                  `${embeddingIdentity.model} at ${embeddingIdentity.dimensions}.`,
+                    `${embeddingIdentity.model} at ${embeddingIdentity.dimensions}.`,
                 );
               }
               if (

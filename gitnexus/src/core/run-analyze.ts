@@ -1583,7 +1583,7 @@ const runFullAnalysisImpl = async (
           `Cannot resume embedding checkpoint: it uses ${checkpoint.model} at ` +
             `${checkpoint.dimensions} dimensions, but this run resolves ` +
             `${embeddingIdentityForRun.model} at ${embeddingIdentityForRun.dimensions}. ` +
-          'Restore the matching embedding configuration or pass --drop-embeddings to rebuild without it.',
+            'Restore the matching embedding configuration or pass --drop-embeddings to rebuild without it.',
         );
       }
       if (
