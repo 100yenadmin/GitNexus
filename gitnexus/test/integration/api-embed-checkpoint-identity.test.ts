@@ -43,7 +43,7 @@ const makeMeta = (digest: string): RepoMeta => ({
 const state = {
   currentMeta: makeMeta(MISMATCHED_DIGEST),
   liveIntegrity: makeIntegrity(LIVE_DIGEST),
-  runEmbeddingPipeline: vi.fn(async () => undefined),
+  runEmbeddingPipeline: vi.fn(async (..._args: unknown[]) => undefined),
   inspectEmbeddingIntegrity: vi.fn(async () => state.liveIntegrity),
   saveMeta: vi.fn(async (_storagePath: string, next: RepoMeta) => {
     state.currentMeta = next;
@@ -153,7 +153,8 @@ describe('POST /api/embed completed-checkpoint identity', () => {
   beforeEach(() => {
     state.currentMeta = makeMeta(MISMATCHED_DIGEST);
     state.liveIntegrity = makeIntegrity(LIVE_DIGEST);
-    state.runEmbeddingPipeline.mockClear();
+    state.runEmbeddingPipeline.mockReset();
+    state.runEmbeddingPipeline.mockResolvedValue(undefined);
     state.saveMeta.mockClear();
   });
 
@@ -196,5 +197,39 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     expect(state.runEmbeddingPipeline).toHaveBeenCalledOnce();
     expect(state.currentMeta.stats?.embeddings).toBe(3);
     expect(state.currentMeta.embeddingCheckpoint).toBeUndefined();
+  });
+
+  it('persists completed-window identity before an interrupted finalization', async () => {
+    state.currentMeta = makeMeta(LIVE_DIGEST);
+    state.runEmbeddingPipeline.mockImplementationOnce(async (...args: unknown[]) => {
+      const options = args[6] as {
+        onCheckpoint: (checkpoint: {
+          nodesProcessed: number;
+          totalNodes: number;
+          chunksProcessed: number;
+        }) => Promise<void>;
+      };
+      await options.onCheckpoint({ nodesProcessed: 2, totalNodes: 4, chunksProcessed: 5 });
+      throw new Error('simulated interruption after durable checkpoint');
+    });
+
+    const response = await fetch(`${baseUrl}/api/embed`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ repo: REPO.name }),
+    });
+    const { jobId } = (await response.json()) as { jobId: string };
+    expect((await waitForTerminalJob(baseUrl, jobId)).status).toBe('failed');
+
+    const persisted = (await state.loadMeta()).embeddingCheckpoint;
+    expect(persisted).toMatchObject({
+      nodesProcessed: 2,
+      totalNodes: 4,
+      chunksProcessed: 5,
+      physicalRows: 3,
+      validRows: 3,
+      recoverableIdentitySha256: LIVE_DIGEST,
+      pendingNodeIds: [],
+    });
   });
 });
