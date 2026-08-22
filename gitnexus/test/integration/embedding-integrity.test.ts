@@ -191,6 +191,29 @@ withTestLbugDB(
       });
     });
 
+    it('rejects a same-count snapshot with a different semantic identity set', async () => {
+      const adapter = await import('../../src/core/lbug/lbug-adapter.js');
+      const { createEmbeddingSnapshot, embeddingSnapshotMatchesIdentityDigest } =
+        await import('../../src/core/embeddings/cache-snapshot.js');
+      const snapshotPath = `${handle.tmpHandle.dbPath}/different-identity.jsonl`;
+      const source = { lastCommit: 'fixture', indexedAt: '2026-07-22T00:00:00.000Z' };
+      const info = await createEmbeddingSnapshot(snapshotPath, source, async () => [
+        {
+          nodeId: 'File:stale',
+          chunkIndex: 0,
+          startLine: 1,
+          endLine: 1,
+          embedding: new Array(EMBEDDING_DIMS).fill(0),
+          contentHash: 'stale',
+        },
+      ]);
+      const live = await adapter.inspectEmbeddingIntegrity();
+
+      expect(info.count).toBe(live.recoverableRows);
+      expect(embeddingSnapshotMatchesIdentityDigest(info, live.recoverableIdentitySha256)).toBe(
+        false,
+      );
+    });
     it('tracks physical values, rejected state, owner state, and multiset order', async () => {
       const adapter = await import('../../src/core/lbug/lbug-adapter.js');
       const read = () => adapter.inspectEmbeddingIntegrity();
@@ -233,29 +256,6 @@ withTestLbugDB(
       expect((await read()).physicalRowsSha256).not.toBe(rejected.physicalRowsSha256);
       expect(embeddingPhysicalRowsDigest(true, 3, ['a', 'b', 'a'])).toBe(
         embeddingPhysicalRowsDigest(true, 3, ['a', 'a', 'b']),
-      );
-    });
-    it('rejects a same-count snapshot with a different semantic identity set', async () => {
-      const adapter = await import('../../src/core/lbug/lbug-adapter.js');
-      const { createEmbeddingSnapshot, embeddingSnapshotMatchesIdentityDigest } =
-        await import('../../src/core/embeddings/cache-snapshot.js');
-      const snapshotPath = `${handle.tmpHandle.dbPath}/different-identity.jsonl`;
-      const source = { lastCommit: 'fixture', indexedAt: '2026-07-22T00:00:00.000Z' };
-      const info = await createEmbeddingSnapshot(snapshotPath, source, async () => [
-        {
-          nodeId: 'File:stale',
-          chunkIndex: 0,
-          startLine: 1,
-          endLine: 1,
-          embedding: new Array(EMBEDDING_DIMS).fill(0),
-          contentHash: 'stale',
-        },
-      ]);
-      const live = await adapter.inspectEmbeddingIntegrity();
-
-      expect(info.count).toBe(live.recoverableRows);
-      expect(embeddingSnapshotMatchesIdentityDigest(info, live.recoverableIdentitySha256)).toBe(
-        false,
       );
     });
   },
