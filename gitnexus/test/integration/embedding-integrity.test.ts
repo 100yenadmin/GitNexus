@@ -77,6 +77,22 @@ withTestLbugDB(
       await expect(buildVectorIndex()).rejects.toThrow(/refused malformed embedding rows/i);
     });
 
+    it('only tolerates an exact missing owner-table error', async () => {
+      const adapter = await import('../../src/core/lbug/lbug-adapter.js');
+      expect(
+        adapter.isMissingEmbeddingOwnerTableError(
+          new Error('Binder exception: Table Class does not exist.'),
+          'Class',
+        ),
+      ).toBe(true);
+      expect(
+        adapter.isMissingEmbeddingOwnerTableError(new Error('connection not found'), 'Class'),
+      ).toBe(false);
+      expect(
+        adapter.isMissingEmbeddingOwnerTableError(new Error('query result not found'), 'Class'),
+      ).toBe(false);
+    });
+
     it('preserves counts when a present legacy table lacks chunkIndex', async () => {
       const adapter = await import('../../src/core/lbug/lbug-adapter.js');
       const vector = new Array(EMBEDDING_DIMS).fill(0);

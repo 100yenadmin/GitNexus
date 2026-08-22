@@ -2221,7 +2221,7 @@ export const inspectEmbeddingIntegrity = async (
           if (id) ownerCandidates.delete(id);
         });
       } catch (error) {
-        if (classifyDeleteAllError(error) !== 'benign-missing-table') throw error;
+        if (!isMissingEmbeddingOwnerTableError(error, label)) throw error;
       }
     }
 
@@ -2835,6 +2835,13 @@ const embeddableLabelMatch = (): string =>
 const isMissingEmbeddingTableError = (err: unknown): boolean => {
   const msg = err instanceof Error ? err.message : String(err);
   return msg.includes(`Table ${EMBEDDING_TABLE_NAME} does not exist`);
+};
+
+export const isMissingEmbeddingOwnerTableError = (error: unknown, label: string): boolean => {
+  const message = (error instanceof Error ? error.message : String(error))
+    .replace(/`/g, '')
+    .toLowerCase();
+  return message.includes(`table ${label.toLowerCase()} does not exist`);
 };
 
 /**
