@@ -120,18 +120,30 @@ describe('read-only doctor CLI modes (#127, #133)', () => {
     );
 
     const hidden = runDoctor(['--registry', '--json']);
-    expect(hidden.status).toBe(0);
+    expect(hidden.status).toBe(1);
     expect(JSON.parse(hidden.stdout)).toMatchObject({
       mode: 'registry',
       readOnly: true,
       pathsShown: false,
       summary: { unsafeStorageEntries: 1 },
-      entries: [{ name: 'SafeAlias', storage: { status: 'unsafe' } }],
+      entries: [
+        {
+          name: 'SafeAlias',
+          storage: { status: 'unsafe' },
+          health: { state: 'quarantined', semantic_ready: false },
+        },
+      ],
     });
     expect(`${hidden.stdout}${hidden.stderr}`).not.toContain(secretPath);
 
+    const human = runDoctor(['--registry']);
+    expect(human.status).toBe(1);
+    expect(human.stdout).toContain('health quarantined:');
+    expect(human.stdout).toContain('health reason unsafe-storage: 1');
+    expect(`${human.stdout}${human.stderr}`).not.toContain(secretPath);
+
     const shown = runDoctor(['--registry', '--json', '--show-paths']);
-    expect(shown.status).toBe(0);
+    expect(shown.status).toBe(1);
     expect(JSON.parse(shown.stdout)).toMatchObject({
       pathsShown: true,
       entries: [{ path: secretPath }],
