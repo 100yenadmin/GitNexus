@@ -358,6 +358,30 @@ describe('run-analyze module', () => {
         ),
       ).rejects.toThrow('Cannot resume embedding checkpoint');
       expect(fetchMock).not.toHaveBeenCalled();
+
+      await saveMeta(storagePath, {
+        ...resumedPending,
+        embeddingCheckpoint: {
+          at: new Date().toISOString(),
+          nodesProcessed: 1,
+          totalNodes: 2,
+          chunksProcessed: 1,
+          model: 'test-model',
+          dimensions: 384,
+          pendingNodeIds: [],
+          physicalRows: 1,
+          validRows: 1,
+          recoverableIdentitySha256: '0'.repeat(64),
+        },
+      });
+      await expect(
+        runFullAnalysis(
+          tmpRepo.dbPath,
+          { skipAgentsMd: true, skipSkills: true },
+          { onProgress: () => {} },
+        ),
+      ).rejects.toThrow(/no longer matches the live embedding identities/i);
+      expect(fetchMock).not.toHaveBeenCalled();
     } finally {
       vi.unstubAllGlobals();
       const restore = (key: string, value: string | undefined) => {

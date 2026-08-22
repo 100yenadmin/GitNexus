@@ -29,8 +29,8 @@ const makeMeta = (digest: string): RepoMeta => ({
   stats: { embeddings: 3 },
   embeddingCheckpoint: {
     at: REPO.indexedAt,
-    nodesProcessed: 3,
-    totalNodes: 3,
+    nodesProcessed: 1,
+    totalNodes: 2,
     chunksProcessed: 3,
     ...identity,
     physicalRows: 3,
@@ -163,7 +163,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     exitSpy.mockRestore();
   });
 
-  it('rejects equal-count different-digest checkpoints before the pipeline', async () => {
+  it('rejects an equal-count different-digest completed window before the pipeline', async () => {
     const checkpointBefore = JSON.stringify(state.currentMeta.embeddingCheckpoint);
     const response = await fetch(`${baseUrl}/api/embed`, {
       method: 'POST',

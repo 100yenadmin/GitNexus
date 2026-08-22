@@ -1586,19 +1586,6 @@ const runFullAnalysisImpl = async (
             'Restore the matching embedding configuration or pass --drop-embeddings to rebuild without it.',
         );
       }
-      if (
-        checkpoint.nodesProcessed === checkpoint.totalNodes &&
-        !checkpoint.pendingNodeIds?.length
-      ) {
-        const completedIntegrity = await withLbugDb(lbugPath, inspectEmbeddingIntegrity, {
-          readOnly: true,
-        });
-        assertCompletedCheckpointIdentity(
-          checkpoint,
-          completedIntegrity,
-          'Completed embedding checkpoint',
-        );
-      }
       resumeEmbeddingCheckpoint = true;
       pendingEmbeddingNodeIds = new Set(checkpoint.pendingNodeIds ?? []);
       log(
@@ -1687,6 +1674,31 @@ const runFullAnalysisImpl = async (
           'could neither be moved aside nor removed:',
       });
     }
+  }
+
+  // Checkpoint windows are durable boundaries even before the final window.
+  // Validate any completed (no-pending) window that carries identity proof,
+  // but only after dirty-recovery sidecars have been quarantined: opening the
+  // database before that point can replay a poisoned interrupted WAL.
+  const checkpointToVerify = existingMeta?.embeddingCheckpoint;
+  if (
+    resumeEmbeddingCheckpoint &&
+    checkpointToVerify &&
+    !checkpointToVerify.pendingNodeIds?.length &&
+    [
+      checkpointToVerify.physicalRows,
+      checkpointToVerify.validRows,
+      checkpointToVerify.recoverableIdentitySha256,
+    ].some((value) => value !== undefined)
+  ) {
+    const completedIntegrity = await withLbugDb(lbugPath, inspectEmbeddingIntegrity, {
+      readOnly: true,
+    });
+    assertCompletedCheckpointIdentity(
+      checkpointToVerify,
+      completedIntegrity,
+      'Completed embedding checkpoint',
+    );
   }
 
   // ── pdg-mode flip forces full writeback (#2099 F1) ─────────────────
@@ -1855,7 +1867,16 @@ const runFullAnalysisImpl = async (
             ...existingMeta,
             stats: { ...existingMeta.stats, embeddings: fastPathIntegrity.validRows },
           };
-          await saveMeta(metaDir, fastPathMeta);
+          try {
+            await saveMeta(metaDir, fastPathMeta);
+          } catch (err) {
+            if (!isReadOnlyFilesystemError(err)) throw err;
+            log(
+              `Warning: could not restamp the verified embedding count ` +
+                `(${(err as Error).message} — storage may be read-only (#1549)); ` +
+                'using the verified live count for this read-only run.',
+            );
+          }
         }
         // ── #2354: restamp the workspace label on a same-commit branch flip ──
         // The flat slot follows the checked-out working tree; a branch switch

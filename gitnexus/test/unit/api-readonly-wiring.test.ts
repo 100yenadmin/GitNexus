@@ -79,10 +79,8 @@ describe('api read-only endpoint wiring', () => {
     expect(embedSection?.[0]).toContain('saveMeta');
   });
 
-  it('/api/embed guards completed-checkpoint fields when no checkpoint exists', async () => {
+  it('/api/embed guards completed-window fields when no checkpoint exists', async () => {
     const source = await readSource();
-    expect(source).toMatch(
-      /if \(\s*priorCheckpoint\s*&&\s*priorCheckpoint\.nodesProcessed === priorCheckpoint\.totalNodes/,
-    );
+    expect(source).toMatch(/if \(priorCheckpoint && !priorCheckpoint\.pendingNodeIds\?\.length\)/);
   });
 });

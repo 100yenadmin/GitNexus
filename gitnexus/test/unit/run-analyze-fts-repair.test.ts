@@ -11,6 +11,20 @@ import { createTempDir } from '../helpers/test-db.js';
 
 const SIMULATED_MISSING_FTS_INDEX_NAME = 'File.file_fts';
 const PLACEHOLDER_GRAPH_STORE_CONTENT = 'fixture';
+const cleanEmbeddingIntegrity = (rows: number) => ({
+  physicalRows: rows,
+  validRows: rows,
+  recoverableRows: rows,
+  emptyIdRows: 0,
+  emptyNodeIdRows: 0,
+  invalidChunkRows: 0,
+  noncanonicalIdRows: 0,
+  duplicateIdRows: 0,
+  duplicateSemanticRows: 0,
+  orphanRows: 0,
+  wrongDimensionRows: 0,
+  recoverableIdentitySha256: 'a'.repeat(64),
+});
 
 const createPlaceholderGraphStore = async (lbugPath: string): Promise<void> => {
   // Repair mode gates on existence before `initLbug` takes over open/validate.
@@ -272,6 +286,8 @@ describe('runFullAnalysis FTS repair and verification failure paths', () => {
       executeQuery: vi.fn(async () => []),
       executeWithReusedStatement: vi.fn(async () => []),
       closeLbug: vi.fn(async () => undefined),
+      inspectEmbeddingIntegrity: vi.fn(async () => cleanEmbeddingIntegrity(0)),
+      embeddingIntegrityFailures: vi.fn(() => 0),
       // Full-rebuild wipe is loud now (#2409, tri-review 4669518496 P2-4) —
       // run-analyze calls this on every full-path analyze.
       wipeLbugDbFiles: vi.fn(async () => undefined),
@@ -337,6 +353,8 @@ describe('runFullAnalysis FTS repair and verification failure paths', () => {
       executeQuery: vi.fn(async () => []),
       executeWithReusedStatement: vi.fn(async () => []),
       closeLbug: vi.fn(async () => undefined),
+      inspectEmbeddingIntegrity: vi.fn(async () => cleanEmbeddingIntegrity(0)),
+      embeddingIntegrityFailures: vi.fn(() => 0),
       // Full-rebuild wipe is loud now (#2409, tri-review 4669518496 P2-4) —
       // run-analyze calls this on every full-path analyze.
       wipeLbugDbFiles: vi.fn(async () => undefined),
@@ -531,6 +549,8 @@ describe('runFullAnalysis FTS repair and verification failure paths', () => {
       executeQuery: vi.fn(async () => []),
       executeWithReusedStatement: vi.fn(async () => []),
       closeLbug: vi.fn(async () => undefined),
+      inspectEmbeddingIntegrity: vi.fn(async () => cleanEmbeddingIntegrity(0)),
+      embeddingIntegrityFailures: vi.fn(() => 0),
       // Full-rebuild wipe is loud now (#2409, tri-review 4669518496 P2-4) —
       // run-analyze calls this on every full-path analyze.
       wipeLbugDbFiles: vi.fn(async () => undefined),
@@ -603,6 +623,8 @@ describe('runFullAnalysis FTS repair and verification failure paths', () => {
       executeQuery: vi.fn(async () => []),
       executeWithReusedStatement: vi.fn(async () => []),
       closeLbug: vi.fn(async () => undefined),
+      inspectEmbeddingIntegrity: vi.fn(async () => cleanEmbeddingIntegrity(0)),
+      embeddingIntegrityFailures: vi.fn(() => 0),
       // Full-rebuild wipe is loud now (#2409, tri-review 4669518496 P2-4) —
       // run-analyze calls this on every full-path analyze.
       wipeLbugDbFiles: vi.fn(async () => undefined),
@@ -720,6 +742,8 @@ describe('runFullAnalysis wipe-and-restore vector-index stamp (tri-review 466951
       ),
       executeWithReusedStatement,
       closeLbug: vi.fn(async () => undefined),
+      inspectEmbeddingIntegrity: vi.fn(async () => cleanEmbeddingIntegrity(1)),
+      embeddingIntegrityFailures: vi.fn(() => 0),
       // Full-rebuild wipe is loud now (#2409, tri-review 4669518496 P2-4) —
       // run-analyze calls this on every full-path analyze.
       wipeLbugDbFiles: vi.fn(async () => undefined),
@@ -859,6 +883,8 @@ describe('runFullAnalysis wipe-and-restore vector-index stamp (tri-review 466951
       ),
       executeWithReusedStatement: vi.fn(async () => undefined),
       closeLbug: vi.fn(async () => undefined),
+      inspectEmbeddingIntegrity: vi.fn(async () => cleanEmbeddingIntegrity(4)),
+      embeddingIntegrityFailures: vi.fn(() => 0),
       wipeLbugDbFiles: vi.fn(async () => undefined),
       loadCachedEmbeddings: vi.fn(async () => ({
         embeddingNodeIds: new Set([restoredNodeId, pendingNodeId]),
@@ -995,6 +1021,9 @@ describe('runFullAnalysis dirty-recovery parking failure fails fast (this shippi
   });
 
   it('all-fail park + explicit --embeddings: rejects with LbugWipeError before any DB open, dirty flag survives', async () => {
+    const withLbugDb = vi.fn(async (_path: string, operation: () => Promise<unknown>) =>
+      operation(),
+    );
     const loadCachedEmbeddings = vi.fn(async () => ({
       embeddingNodeIds: new Set<string>(),
       embeddings: [],
@@ -1015,6 +1044,9 @@ describe('runFullAnalysis dirty-recovery parking failure fails fast (this shippi
       executeQuery: vi.fn(async () => []),
       executeWithReusedStatement: vi.fn(async () => []),
       closeLbug: vi.fn(async () => undefined),
+      withLbugDb,
+      inspectEmbeddingIntegrity: vi.fn(async () => cleanEmbeddingIntegrity(3)),
+      embeddingIntegrityFailures: vi.fn(() => 0),
       wipeLbugDbFiles: vi.fn(async () => undefined),
       loadCachedEmbeddings,
       deleteNodesForFile: vi.fn(async () => undefined),
@@ -1070,6 +1102,18 @@ describe('runFullAnalysis dirty-recovery parking failure fails fast (this shippi
           toWriteCount: 5,
           phase: 'load-graph',
         },
+        embeddingCheckpoint: {
+          at: new Date().toISOString(),
+          nodesProcessed: 2,
+          totalNodes: 2,
+          chunksProcessed: 2,
+          model: 'Snowflake/snowflake-arctic-embed-xs',
+          dimensions: EMBEDDING_DIMS,
+          pendingNodeIds: [],
+          physicalRows: 3,
+          validRows: 3,
+          recoverableIdentitySha256: 'a'.repeat(64),
+        },
       });
       await createPlaceholderGraphStore(lbugPath);
       // A leftover WAL from the crash…
@@ -1122,6 +1166,7 @@ describe('runFullAnalysis dirty-recovery parking failure fails fast (this shippi
       expect(rejection).toMatchObject({
         message: expect.stringMatching(/stop any GitNexus MCP or serve process/i),
       });
+      expect(withLbugDb).not.toHaveBeenCalled();
       // The preservation open is the ONLY loadCachedEmbeddings call site —
       // not called means the DB was never opened before the throw…
       expect(loadCachedEmbeddings).not.toHaveBeenCalled();

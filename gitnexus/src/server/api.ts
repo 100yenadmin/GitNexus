@@ -1816,11 +1816,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                     `${embeddingIdentity.model} at ${embeddingIdentity.dimensions}.`,
                 );
               }
-              if (
-                priorCheckpoint &&
-                priorCheckpoint.nodesProcessed === priorCheckpoint.totalNodes &&
-                !priorCheckpoint.pendingNodeIds?.length
-              ) {
+              if (priorCheckpoint && !priorCheckpoint.pendingNodeIds?.length) {
                 const proof = [
                   priorCheckpoint.physicalRows,
                   priorCheckpoint.validRows,
