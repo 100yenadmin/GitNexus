@@ -488,12 +488,13 @@ export const assertVectorRepairPreflight = async (
     // the evidence. Mirror the resume-path guard before allowing either.
     const identity = await resolveEmbeddingIdentity();
     if (
-      (checkpoint.provider !== undefined && checkpoint.provider !== identity.provider) ||
+      checkpoint.provider === undefined ||
+      checkpoint.provider !== identity.provider ||
       checkpoint.model !== identity.model ||
       checkpoint.dimensions !== identity.dimensions
     ) {
       throw new Error(
-        `Cannot repair VECTOR: the completed embedding checkpoint records ${checkpoint.provider ?? 'legacy'} / ` +
+        `Cannot repair VECTOR: the completed embedding checkpoint records ${checkpoint.provider ?? 'unknown-provider'} / ` +
           `${checkpoint.model} at ${checkpoint.dimensions} dimensions, but this run resolves ` +
           `${identity.provider} / ${identity.model} at ${identity.dimensions}. Restore the matching ` +
           'embedding configuration, or rebuild with analyze --drop-embeddings --embeddings.',
@@ -1576,13 +1577,13 @@ const runFullAnalysisImpl = async (
       embeddingIdentityForRun = await resolveEmbeddingIdentity();
       const checkpoint = existingMeta.embeddingCheckpoint;
       if (
-        (checkpoint.provider !== undefined &&
-          checkpoint.provider !== embeddingIdentityForRun.provider) ||
+        checkpoint.provider === undefined ||
+        checkpoint.provider !== embeddingIdentityForRun.provider ||
         checkpoint.model !== embeddingIdentityForRun.model ||
         checkpoint.dimensions !== embeddingIdentityForRun.dimensions
       ) {
         throw new Error(
-          `Cannot resume embedding checkpoint: it uses ${checkpoint.provider ?? 'legacy'} / ` +
+          `Cannot resume embedding checkpoint: it uses ${checkpoint.provider ?? 'unknown-provider'} / ` +
             `${checkpoint.model} at ${checkpoint.dimensions} dimensions, but this run resolves ` +
             `${embeddingIdentityForRun.provider} / ${embeddingIdentityForRun.model} at ` +
             `${embeddingIdentityForRun.dimensions}. ` +

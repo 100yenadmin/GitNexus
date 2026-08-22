@@ -61,16 +61,17 @@ describe('run-analyze module', () => {
     );
   });
 
-  it('stamps the provider on new checkpoints while accepting legacy resumes', async () => {
+  it('stamps the provider on new checkpoints and rejects unknown legacy resumes', async () => {
     const source = await fs.readFile(
       path.join(__dirname, '..', '..', 'src', 'core', 'run-analyze.ts'),
       'utf-8',
     );
-    expect(source).toMatch(/checkpoint\.provider !== undefined/);
+    expect(source).toMatch(/checkpoint\.provider === undefined/);
     expect(source).toMatch(/provider: embeddingIdentity\.provider/);
+    expect(source).toMatch(/unknown-provider/);
   });
 
-  it('refuses a completed VECTOR repair checkpoint with a provider mismatch but accepts legacy metadata', async () => {
+  it('refuses completed VECTOR repair checkpoints with mismatched or unknown providers', async () => {
     const tmpRepo = await createTempDir('gitnexus-run-analyze-vector-repair-identity-');
     const saved = {
       url: process.env.GITNEXUS_EMBEDDING_URL,
@@ -84,12 +85,13 @@ describe('run-analyze module', () => {
       const { storagePath, lbugPath } = getStoragePaths(tmpRepo.dbPath);
       await fs.mkdir(storagePath, { recursive: true });
       await fs.writeFile(lbugPath, '');
+      const otherProvider = httpEmbeddingProvider('http://other:8080/v1');
       const checkpoint = {
         at: new Date().toISOString(),
         nodesProcessed: 1,
         totalNodes: 1,
         chunksProcessed: 1,
-        provider: httpEmbeddingProvider('http://other:8080/v1'),
+        provider: otherProvider,
         model: 'test-model',
         dimensions: 384,
       };
@@ -102,7 +104,7 @@ describe('run-analyze module', () => {
 
       const { assertVectorRepairPreflight } = await import('../../src/core/run-analyze.js');
       await expect(assertVectorRepairPreflight(tmpRepo.dbPath)).rejects.toThrow(
-        /completed embedding checkpoint records .*other.* but this run resolves/i,
+        new RegExp(`completed embedding checkpoint records ${otherProvider} /`),
       );
 
       await saveMeta(storagePath, {
@@ -111,8 +113,20 @@ describe('run-analyze module', () => {
         indexedAt: new Date().toISOString(),
         embeddingCheckpoint: { ...checkpoint, provider: undefined },
       });
+      await expect(assertVectorRepairPreflight(tmpRepo.dbPath)).rejects.toThrow(/unknown-provider/);
+      expect((await loadMeta(storagePath))?.embeddingCheckpoint?.provider).toBeUndefined();
+
+      await saveMeta(storagePath, {
+        repoPath: tmpRepo.dbPath,
+        lastCommit: 'test-commit',
+        indexedAt: new Date().toISOString(),
+        embeddingCheckpoint: {
+          ...checkpoint,
+          provider: httpEmbeddingProvider('http://test:8080/v1'),
+        },
+      });
       await expect(assertVectorRepairPreflight(tmpRepo.dbPath)).resolves.toMatchObject({
-        embeddingCheckpoint: { provider: undefined },
+        embeddingCheckpoint: { provider: httpEmbeddingProvider('http://test:8080/v1') },
       });
     } finally {
       const restore = (key: string, value: string | undefined) => {
@@ -368,6 +382,7 @@ describe('run-analyze module', () => {
       const completed = await loadMeta(storagePath);
       expect(completed).not.toBeNull();
       if (!completed) throw new Error('expected completed metadata');
+      const currentProvider = httpEmbeddingProvider('http://test:8080/v1');
       await saveMeta(storagePath, {
         ...completed,
         embeddingCheckpoint: {
@@ -380,6 +395,28 @@ describe('run-analyze module', () => {
         },
       } as RepoMeta);
       fetchMock.mockClear();
+      await expect(
+        runFullAnalysis(
+          tmpRepo.dbPath,
+          { skipAgentsMd: true, skipSkills: true },
+          { onProgress: () => {} },
+        ),
+      ).rejects.toThrow(/unknown-provider/);
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect((await loadMeta(storagePath))?.embeddingCheckpoint?.provider).toBeUndefined();
+
+      await saveMeta(storagePath, {
+        ...completed,
+        embeddingCheckpoint: {
+          at: new Date().toISOString(),
+          nodesProcessed: 1,
+          totalNodes: 1,
+          chunksProcessed: 1,
+          provider: currentProvider,
+          model: 'test-model',
+          dimensions: 384,
+        },
+      } as RepoMeta);
       const logs: string[] = [];
 
       const resumed = await runFullAnalysis(
@@ -409,6 +446,7 @@ describe('run-analyze module', () => {
           nodesProcessed: 0,
           totalNodes: 1,
           chunksProcessed: 0,
+          provider: currentProvider,
           model: 'test-model',
           dimensions: 384,
           pendingNodeIds: [pendingNodeId],
@@ -463,6 +501,7 @@ describe('run-analyze module', () => {
           nodesProcessed: 1,
           totalNodes: 2,
           chunksProcessed: 1,
+          provider: currentProvider,
           model: 'test-model',
           dimensions: 384,
           pendingNodeIds: [],
