@@ -174,7 +174,9 @@ describe('read-only doctor CLI modes (#127, #133)', () => {
       summary: { entries: 0 },
     });
     expect(`${result.stdout}${result.stderr}`).not.toContain(home.dbPath);
-    expect(`${result.stdout}${result.stderr}`).not.toContain(contents);
+    if (contents !== '{' && contents !== '{}') {
+      expect(`${result.stdout}${result.stderr}`).not.toContain(contents);
+    }
   });
 
   it('fails closed for an unreadable registry', async () => {
