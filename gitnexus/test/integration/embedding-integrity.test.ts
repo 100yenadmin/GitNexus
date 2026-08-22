@@ -175,3 +175,90 @@ withTestLbugDB(
     },
   },
 );
+
+withTestLbugDB(
+  'embedding-preservation-stream',
+  () => {
+    it('emits only deterministic accepted rows in bounded batches under the WAL driver', async () => {
+      const adapter = await import('../../src/core/lbug/lbug-adapter.js');
+      const { markWalDriverActive } = await import('../../src/core/lbug/wal-driver-state.js');
+      const snapshot = () =>
+        adapter.executeQuery('MATCH (e:CodeEmbedding) RETURN e ORDER BY e.rowKey');
+      const before = await snapshot();
+      const retained: Array<readonly { id: string }[]> = [];
+      let firstReport: Awaited<ReturnType<typeof adapter.scanEmbeddingPreservationRows>>;
+      markWalDriverActive(true);
+      try {
+        firstReport = await adapter.scanEmbeddingPreservationRows({
+          onBatch: (batch) => retained.push(batch),
+        });
+      } finally {
+        markWalDriverActive(false);
+      }
+      const secondBatches: string[][] = [];
+      const secondReport = await adapter.scanEmbeddingPreservationRows({
+        onBatch: (batch) => {
+          expect(batch.every((row) => row.contentHash === undefined)).toBe(true);
+          secondBatches.push(batch.map((row) => row.id));
+        },
+      });
+      const scans = [retained.map((batch) => batch.map((row) => row.id)), secondBatches];
+      const after = await snapshot();
+
+      expect(firstReport).toMatchObject({ physicalRows: 265, acceptedRows: 257, rejectedRows: 8 });
+      expect(secondReport).toEqual(firstReport);
+      expect(firstReport.implicatedOwnerIds.join(',')).toBe(
+        'Function:bad,Function:cross,Function:dup-a,Function:dup-b,Function:null,Function:semantic,Trait:legacy',
+      );
+      expect(firstReport.missingOwnerLabels).toEqual(['Trait']);
+      expect(scans[0]?.map((batch) => batch.length)).toEqual([256, 1]);
+      expect(scans[1]).toEqual(scans[0]);
+      expect(scans[0]?.flat()).toEqual([...scans[0]!.flat()].sort());
+      expect(after).toEqual(before);
+    });
+  },
+  {
+    seed: [
+      "CREATE (:Function {id: 'Function:bad'}), (:Function {id: 'Function:dup-a'}), (:Function {id: 'Function:dup-b'}), (:Function {id: 'Function:null'}), (:Function {id: 'Function:semantic'}), (:Class {id: 'Function:cross'}), (:Trait {id: 'Trait:legacy'})",
+    ],
+    beforeFTS: async () => {
+      const adapter = await import('../../src/core/lbug/lbug-adapter.js');
+      await adapter.executeQuery('DROP TABLE CodeEmbedding');
+      await adapter.executeQuery('DROP TABLE CodeRelation');
+      await adapter.executeQuery('DROP TABLE Trait');
+      await adapter.executeQuery(
+        'CREATE NODE TABLE CodeEmbedding (rowKey STRING PRIMARY KEY, id STRING, nodeId STRING, chunkIndex INT64, startLine INT64, endLine INT64, embedding FLOAT[])',
+      );
+      const vector = new Array(EMBEDDING_DIMS).fill(0.25);
+      await adapter.executeWithReusedStatement(
+        'CREATE (:Function {id: $id})',
+        Array.from({ length: 1_281 }, (_, index) => ({
+          id: `Function:${index < 257 ? 'bulk' : 'unused'}-${index}`,
+        })),
+      );
+      const row = (id: string, nodeId: string, chunkIndex: number, embedding = vector) => ({
+        rowKey: `${id}-${nodeId}`,
+        id,
+        nodeId,
+        chunkIndex,
+        embedding,
+      });
+      await adapter.executeWithReusedStatement(
+        'CREATE (e:CodeEmbedding {rowKey: $rowKey, id: $id, nodeId: $nodeId, chunkIndex: $chunkIndex, startLine: 1, endLine: 2, embedding: $embedding})',
+        [
+          ...Array.from({ length: 257 }, (_, index) =>
+            row(`Function:bulk-${index}:0`, `Function:bulk-${index}`, 0),
+          ),
+          row('Function:bad:0', 'Function:bad', 0, [Infinity, ...vector.slice(1)]),
+          row('shared', 'Function:dup-a', 0),
+          row('shared', 'Function:dup-b', 0),
+          row('Function:semantic:0', 'Function:semantic', 0),
+          row('other', 'Function:semantic', 0),
+          row('Function:null:0', 'Function:null', 0, [null, ...vector.slice(1)] as number[]),
+          row('Function:cross:0', 'Function:cross', 0),
+          row('Trait:legacy:0', 'Trait:legacy', 0),
+        ],
+      );
+    },
+  },
+);
