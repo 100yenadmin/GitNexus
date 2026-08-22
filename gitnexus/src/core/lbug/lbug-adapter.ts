@@ -1826,6 +1826,266 @@ export interface EmbeddingIntegrityReport {
   recoverableIdentitySha256: string;
 }
 
+interface EmbeddingPreservationObservation {
+  id: string;
+  nodeId: string;
+  chunkIndex: number;
+  dimensions: number;
+  finite: boolean;
+}
+
+export type EmbeddingPreservationRow = CachedEmbedding &
+  Pick<EmbeddingPreservationObservation, 'id' | 'dimensions' | 'finite'>;
+
+export interface EmbeddingPreservationScanOptions {
+  onBatch?: (batch: readonly EmbeddingPreservationRow[]) => void | Promise<void>;
+  batchSize?: number;
+}
+
+export interface EmbeddingPreservationScan {
+  tablePresent: boolean;
+  physicalRows: number;
+  acceptedRows: number;
+  rejectedRows: number;
+  implicatedOwnerIds: string[];
+  missingOwnerLabels: string[];
+}
+
+/** Locked two-pass scan: classify metadata first, then emit bounded vector batches. */
+export const scanEmbeddingPreservationRows = async (
+  options: EmbeddingPreservationScanOptions = {},
+): Promise<EmbeddingPreservationScan> => {
+  const c = conn;
+  if (!c) throw new Error('LadybugDB not initialized. Call initLbug first.');
+  const batchSize = options.batchSize ?? 256;
+  if (!Number.isSafeInteger(batchSize) || batchSize <= 0 || batchSize > 256) {
+    throw new Error('Embedding preservation batchSize must be an integer in [1, 256]');
+  }
+
+  return withConnLock(async () => {
+    const ownerLabels = new Set<string>([...EMBEDDABLE_LABELS, 'File']);
+    const observations: EmbeddingPreservationObservation[] = [];
+    const idCounts = new Map<string, number>();
+    const semanticCounts = new Map<string, number>();
+    const ownerIdsByLabel = new Map<string, Set<string>>();
+    const ownerLabel = (nodeId: string): string => {
+      const separator = nodeId.indexOf(':');
+      return separator > 0 ? nodeId.slice(0, separator) : '';
+    };
+    const semanticKey = (nodeId: string, chunkIndex: number): string =>
+      nodeId.trim() && Number.isSafeInteger(chunkIndex) && chunkIndex >= 0
+        ? embeddingSemanticIdentity(nodeId, chunkIndex)
+        : '';
+    let hasContentHash = true;
+    let physicalRows = 0;
+    const empty = (tablePresent: boolean): EmbeddingPreservationScan => ({
+      tablePresent,
+      physicalRows: 0,
+      acceptedRows: 0,
+      rejectedRows: 0,
+      implicatedOwnerIds: [],
+      missingOwnerLabels: [],
+    });
+    const readRows = async (
+      query: string,
+      accept: (row: any) => void | Promise<void>,
+    ): Promise<void> => {
+      const raw = await c.query(query);
+      const results = Array.isArray(raw) ? raw : [raw];
+      let failed = false;
+      try {
+        for (const result of results) {
+          while (await result.hasNext()) await accept(await result.getNext());
+        }
+      } catch (error) {
+        failed = true;
+        throw error;
+      } finally {
+        try {
+          await drainQueryResult(results);
+        } catch (error) {
+          if (!failed) throw error;
+        }
+      }
+    };
+    const readFirstPass = async (withHash: boolean): Promise<void> => {
+      const hashProjection = withHash ? ', e.contentHash AS contentHash' : '';
+      await readRows(
+        `MATCH (e:${EMBEDDING_TABLE_NAME}) RETURN e.id AS id, e.nodeId AS nodeId, ` +
+          `e.chunkIndex AS chunkIndex, e.startLine AS startLine, e.endLine AS endLine, ` +
+          `e.embedding AS embedding${hashProjection}`,
+        async (row) => {
+          const id = String(row.id ?? row[0] ?? '');
+          const nodeId = String(row.nodeId ?? row[1] ?? '');
+          const rawChunk = row.chunkIndex ?? row[2];
+          const chunkIndex =
+            rawChunk === null ||
+            rawChunk === undefined ||
+            (typeof rawChunk === 'string' && rawChunk.trim() === '')
+              ? Number.NaN
+              : Number(rawChunk);
+          const vector = row.embedding ?? row[5];
+          const values =
+            Array.isArray(vector) || ArrayBuffer.isView(vector)
+              ? Array.from(vector as ArrayLike<unknown>, Number)
+              : [];
+          const observation: EmbeddingPreservationObservation = {
+            id,
+            nodeId,
+            chunkIndex,
+            dimensions: values.length,
+            finite: values.every(Number.isFinite),
+          };
+          observations.push(observation);
+          physicalRows++;
+          idCounts.set(id, (idCounts.get(id) ?? 0) + 1);
+          const key = semanticKey(nodeId, chunkIndex);
+          if (key) semanticCounts.set(key, (semanticCounts.get(key) ?? 0) + 1);
+          const label = ownerLabel(nodeId);
+          if (ownerLabels.has(label)) {
+            let ids = ownerIdsByLabel.get(label);
+            if (!ids) ownerIdsByLabel.set(label, (ids = new Set()));
+            ids.add(nodeId);
+          }
+        },
+      );
+    };
+
+    try {
+      await readFirstPass(true);
+    } catch (error) {
+      if (isMissingEmbeddingTableError(error)) return empty(false);
+      const message = error instanceof Error ? error.message : String(error);
+      if (
+        !isMissingColumnOrTableError(message) &&
+        !message.includes('Cannot find property contentHash')
+      ) {
+        throw error;
+      }
+      observations.length = 0;
+      idCounts.clear();
+      semanticCounts.clear();
+      ownerIdsByLabel.clear();
+      physicalRows = 0;
+      hasContentHash = false;
+      try {
+        await readFirstPass(false);
+      } catch (fallbackError) {
+        if (isMissingEmbeddingTableError(fallbackError)) return empty(false);
+        throw fallbackError;
+      }
+    }
+
+    const liveOwners = new Map<string, Set<string>>();
+    const missingOwnerLabels = new Set<string>();
+    for (const label of ownerIdsByLabel.keys()) {
+      const ids = new Set<string>();
+      liveOwners.set(label, ids);
+      try {
+        await readRows(`MATCH (n:${escapeTableName(label)}) RETURN n.id AS id`, (row) => {
+          const id = String(row.id ?? row[0] ?? '');
+          if (id) ids.add(id);
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (!isMissingColumnOrTableError(message)) throw error;
+        missingOwnerLabels.add(label);
+      }
+    }
+
+    const implicated = new Set<string>();
+    const acceptedIds = new Set<string>();
+    for (const row of observations) {
+      const label = ownerLabel(row.nodeId);
+      const chunkValid = Number.isSafeInteger(row.chunkIndex) && row.chunkIndex >= 0;
+      const semantic = semanticKey(row.nodeId, row.chunkIndex);
+      const ownerPresent =
+        ownerLabels.has(label) &&
+        !missingOwnerLabels.has(label) &&
+        liveOwners.get(label)?.has(row.nodeId) === true;
+      const canonical =
+        row.id.trim() !== '' &&
+        row.nodeId.trim() !== '' &&
+        chunkValid &&
+        row.id === `${row.nodeId}:${row.chunkIndex}`;
+      const defective =
+        !canonical || !row.finite || row.dimensions !== EMBEDDING_DIMS || !ownerPresent;
+      if (
+        row.nodeId.trim() &&
+        (defective ||
+          (idCounts.get(row.id) ?? 0) > 1 ||
+          (semantic !== '' && (semanticCounts.get(semantic) ?? 0) > 1))
+      ) {
+        implicated.add(row.nodeId);
+      }
+    }
+    for (const row of observations) {
+      const label = ownerLabel(row.nodeId);
+      const chunkValid = Number.isSafeInteger(row.chunkIndex) && row.chunkIndex >= 0;
+      const semantic = semanticKey(row.nodeId, row.chunkIndex);
+      if (
+        row.id.trim() !== '' &&
+        row.nodeId.trim() !== '' &&
+        chunkValid &&
+        row.finite &&
+        row.dimensions === EMBEDDING_DIMS &&
+        row.id === `${row.nodeId}:${row.chunkIndex}` &&
+        (idCounts.get(row.id) ?? 0) === 1 &&
+        (semanticCounts.get(semantic) ?? 0) === 1 &&
+        ownerLabels.has(label) &&
+        !missingOwnerLabels.has(label) &&
+        liveOwners.get(label)?.has(row.nodeId) === true &&
+        !implicated.has(row.nodeId)
+      )
+        acceptedIds.add(row.id);
+    }
+
+    const pending: EmbeddingPreservationRow[] = [];
+    let acceptedRows = 0;
+    const hashProjection = hasContentHash ? ', e.contentHash AS contentHash' : '';
+    await readRows(
+      `MATCH (e:${EMBEDDING_TABLE_NAME}) RETURN e.id AS id, e.nodeId AS nodeId, ` +
+        `e.chunkIndex AS chunkIndex, e.startLine AS startLine, e.endLine AS endLine, ` +
+        `e.embedding AS embedding${hashProjection} ORDER BY e.id`,
+      async (row) => {
+        const id = String(row.id ?? row[0] ?? '');
+        if (!acceptedIds.has(id)) return;
+        const vector = row.embedding ?? row[5];
+        const embedding =
+          Array.isArray(vector) || ArrayBuffer.isView(vector)
+            ? Array.from(vector as ArrayLike<unknown>, Number)
+            : [];
+        const hash = hasContentHash ? (row.contentHash ?? row[6]) : undefined;
+        pending.push({
+          id,
+          nodeId: String(row.nodeId ?? row[1] ?? ''),
+          chunkIndex: Number(row.chunkIndex ?? row[2]),
+          startLine: Number(row.startLine ?? row[3] ?? 0),
+          endLine: Number(row.endLine ?? row[4] ?? 0),
+          dimensions: embedding.length,
+          finite: embedding.every(Number.isFinite),
+          embedding,
+          ...(hash === null || hash === undefined ? {} : { contentHash: String(hash) }),
+        });
+        acceptedRows++;
+        if (pending.length === batchSize) {
+          await options.onBatch?.(pending);
+          pending.length = 0;
+        }
+      },
+    );
+    if (pending.length > 0) await options.onBatch?.(pending);
+    return {
+      tablePresent: true,
+      physicalRows,
+      acceptedRows,
+      rejectedRows: physicalRows - acceptedRows,
+      implicatedOwnerIds: [...implicated].sort(),
+      missingOwnerLabels: [...missingOwnerLabels].sort(),
+    };
+  });
+};
+
 /**
  * Scan embedding identity without materializing vectors. This deliberately uses
  * streamed projections instead of primary-key equality: corrupted LadybugDB

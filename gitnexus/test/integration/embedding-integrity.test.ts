@@ -175,3 +175,89 @@ withTestLbugDB(
     },
   },
 );
+
+withTestLbugDB(
+  'embedding-preservation-stream',
+  () => {
+    it('emits only deterministic accepted rows in bounded batches under the WAL driver', async () => {
+      const adapter = await import('../../src/core/lbug/lbug-adapter.js');
+      const { markWalDriverActive } = await import('../../src/core/lbug/wal-driver-state.js');
+      const snapshot = () =>
+        adapter.executeQuery('MATCH (e:CodeEmbedding) RETURN e ORDER BY e.rowKey');
+      const before = await snapshot();
+      const scans: string[][][] = [];
+      let firstReport: Awaited<ReturnType<typeof adapter.scanEmbeddingPreservationRows>>;
+      markWalDriverActive(true);
+      try {
+        const batches: string[][] = [];
+        firstReport = await adapter.scanEmbeddingPreservationRows({
+          onBatch: (batch) => batches.push(batch.map((row) => row.id)),
+        });
+        scans.push(batches);
+      } finally {
+        markWalDriverActive(false);
+      }
+      const secondBatches: string[][] = [];
+      const secondReport = await adapter.scanEmbeddingPreservationRows({
+        onBatch: (batch) => {
+          expect(batch.every((row) => row.contentHash === undefined)).toBe(true);
+          secondBatches.push(batch.map((row) => row.id));
+        },
+      });
+      scans.push(secondBatches);
+      const after = await snapshot();
+
+      expect([firstReport, secondReport]).toEqual([
+        expect.objectContaining({ physicalRows: 264, acceptedRows: 257, rejectedRows: 7 }),
+        expect.objectContaining({ physicalRows: 264, acceptedRows: 257, rejectedRows: 7 }),
+      ]);
+      expect(firstReport.implicatedOwnerIds.join(',')).toBe(
+        'Function:bad,Function:cross,Function:dup-a,Function:dup-b,Function:semantic,Trait:legacy',
+      );
+      expect(firstReport.missingOwnerLabels).toEqual(['Trait']);
+      expect(scans[0]?.map((batch) => batch.length)).toEqual([256, 1]);
+      expect(scans[1]).toEqual(scans[0]);
+      expect(scans[0]?.flat()).toEqual([...scans[0]!.flat()].sort());
+      expect(after).toEqual(before);
+    });
+  },
+  {
+    seed: [
+      "CREATE (:Function {id: 'Function:bulk'}), (:Function {id: 'Function:bad'}), (:Function {id: 'Function:dup-a'}), (:Function {id: 'Function:dup-b'}), (:Function {id: 'Function:semantic'}), (:Class {id: 'Function:cross'}), (:Trait {id: 'Trait:legacy'})",
+    ],
+    beforeFTS: async () => {
+      const adapter = await import('../../src/core/lbug/lbug-adapter.js');
+      await adapter.executeQuery('DROP TABLE CodeEmbedding');
+      await adapter.executeQuery('DROP TABLE CodeRelation');
+      await adapter.executeQuery('DROP TABLE Trait');
+      await adapter.executeQuery(
+        'CREATE NODE TABLE CodeEmbedding (rowKey STRING PRIMARY KEY, id STRING, nodeId STRING, chunkIndex INT64, startLine INT64, endLine INT64, embedding FLOAT[])',
+      );
+      const vector = new Array(EMBEDDING_DIMS).fill(0.25);
+      const row = (id: string, nodeId: string, chunkIndex: number, embedding = vector) => ({
+        rowKey: `${id}-${nodeId}`,
+        id,
+        nodeId,
+        chunkIndex,
+        startLine: chunkIndex + 1,
+        endLine: chunkIndex + 2,
+        embedding,
+      });
+      await adapter.executeWithReusedStatement(
+        'CREATE (e:CodeEmbedding {rowKey: $rowKey, id: $id, nodeId: $nodeId, chunkIndex: $chunkIndex, startLine: $startLine, endLine: $endLine, embedding: $embedding})',
+        [
+          ...Array.from({ length: 257 }, (_, index) =>
+            row(`Function:bulk:${index}`, 'Function:bulk', index),
+          ),
+          row('Function:bad:0', 'Function:bad', 0, [Infinity, ...vector.slice(1)]),
+          row('shared', 'Function:dup-a', 0),
+          row('shared', 'Function:dup-b', 0),
+          row('Function:semantic:0', 'Function:semantic', 0),
+          row('other', 'Function:semantic', 0),
+          row('Function:cross:0', 'Function:cross', 0),
+          row('Trait:legacy:0', 'Trait:legacy', 0),
+        ],
+      );
+    },
+  },
+);
