@@ -1847,7 +1847,7 @@ const ownerLabelForNodeId = (nodeId: string): string => {
   return separator > 0 ? nodeId.slice(0, separator) : '';
 };
 export const isMissingContentHashError = (error: unknown): boolean =>
-  /^Binder exception:\s*Cannot find property contentHash\b/.test(
+  /^Binder exception:\s*Cannot find property contentHash(?: for e)?\.?$/.test(
     error instanceof Error ? error.message : String(error),
   );
 const MAX_STORED_EMBEDDING_DIMENSIONS = 65_536;
