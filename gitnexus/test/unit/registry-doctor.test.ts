@@ -31,6 +31,23 @@ const CAPABILITIES: NonNullable<RepoMeta['capabilities']> = {
   },
 };
 
+const cleanIntegrity = (rows: number) => ({
+  status: 'clean' as const,
+  tablePresent: true,
+  physicalRows: rows,
+  validRows: rows,
+  recoverableRows: rows,
+  emptyIdRows: 0,
+  emptyNodeIdRows: 0,
+  invalidChunkRows: 0,
+  noncanonicalIdRows: 0,
+  duplicateIdRows: 0,
+  duplicateSemanticRows: 0,
+  orphanRows: 0,
+  wrongDimensionRows: 0,
+  recoverableIdentitySha256: 'a'.repeat(64),
+});
+
 interface FixtureEntry {
   entry: RegistryEntry;
   lbugPath: string;
@@ -198,6 +215,49 @@ describe('doctor --registry read-only report (#133)', () => {
     expect(withPaths.entries[0]?.path).toBe(alpha.entry.path);
     expect(JSON.stringify(withPaths)).toContain(fixture.dbPath);
     expect(await snapshotFiles(fixture.dbPath)).toEqual(before);
+  });
+
+  it('uses one authoritative integrity status and compares only defined checkpoint fields', async () => {
+    const indexed = await createEntry(
+      fixture.dbPath,
+      'partial-checkpoint',
+      'PartialCheckpoint',
+      'https://github.com/owner/partial-checkpoint.git',
+      { nodes: 1, edges: 0, embeddings: 3 },
+    );
+    const metaPath = path.join(indexed.entry.storagePath, INDEX_METADATA_FILE);
+    const meta = JSON.parse(await fs.readFile(metaPath, 'utf8'));
+    const databaseProbe = async () => ({
+      nodes: 1,
+      edges: 0,
+      embeddings: 3,
+      integrity: cleanIntegrity(3),
+    });
+    await fs.writeFile(
+      metaPath,
+      JSON.stringify({ ...meta, embeddingCheckpoint: { physicalRows: 3 } }),
+    );
+
+    const partial = await buildRegistryDoctorReport({ entries: [indexed.entry], databaseProbe });
+    const partialDatabase = partial.entries[0]?.database;
+    expect(partialDatabase).toMatchObject({
+      integrity: { status: 'clean' },
+      counts: { nodes: 1, edges: 0, embeddings: 3 },
+    });
+    if (!partialDatabase || partialDatabase.status !== 'available') throw new Error('scan failed');
+    expect('integrity' in partialDatabase.counts).toBe(false);
+
+    await fs.writeFile(
+      metaPath,
+      JSON.stringify({ ...meta, embeddingCheckpoint: { physicalRows: 4 } }),
+    );
+    const mismatched = await buildRegistryDoctorReport({ entries: [indexed.entry], databaseProbe });
+    const mismatchedDatabase = mismatched.entries[0]?.database;
+    if (!mismatchedDatabase || mismatchedDatabase.status !== 'available') {
+      throw new Error('scan failed');
+    }
+    expect(mismatchedDatabase.integrity.status).toBe('malformed');
+    expect('integrity' in mismatchedDatabase.counts).toBe(false);
   });
 
   it('does not open a database when WAL recovery state is present', async () => {
@@ -498,11 +558,17 @@ describe('doctor --registry read-only report (#133)', () => {
     }
 
     const before = await snapshotFiles(fixture.dbPath);
-    await expect(probeRegistryDatabaseCounts(lbugPath)).resolves.toEqual({
+    await expect(probeRegistryDatabaseCounts(lbugPath)).resolves.toMatchObject({
       nodes: 1,
       edges: 0,
       embeddings: 0,
+      integrity: { status: 'clean', physicalRows: 0, validRows: 0 },
     });
     expect(await snapshotFiles(fixture.dbPath)).toEqual(before);
+
+    await fs.writeFile(`${lbugPath}.wal`, 'unmatched wal');
+    const withWal = await snapshotFiles(fixture.dbPath);
+    await expect(probeRegistryDatabaseCounts(lbugPath)).rejects.toThrow(/sidecar state/i);
+    expect(await snapshotFiles(fixture.dbPath)).toEqual(withWal);
   });
 });

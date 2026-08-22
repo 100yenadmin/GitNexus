@@ -48,6 +48,8 @@ withTestLbugDB(
           { ...row, embedding: vector, contentHash: 'fixture' },
         ]);
       }
+      await adapter.executeQuery('DROP TABLE CodeRelation');
+      await adapter.executeQuery('DROP TABLE Class');
 
       await expect(adapter.inspectEmbeddingIntegrity()).resolves.toMatchObject({
         tablePresent: true,
@@ -60,6 +62,12 @@ withTestLbugDB(
         duplicateSemanticRows: 1,
         orphanRows: 1,
         wrongDimensionRows: 0,
+      });
+      await expect(adapter.getStoredEmbeddingDimensions()).resolves.toBe(EMBEDDING_DIMS);
+      await expect(adapter.inspectEmbeddingIntegrity(EMBEDDING_DIMS + 1)).resolves.toMatchObject({
+        validRows: 0,
+        recoverableRows: 0,
+        wrongDimensionRows: 5,
       });
     });
 
