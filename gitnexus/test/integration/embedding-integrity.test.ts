@@ -101,11 +101,11 @@ withTestLbugDB(
           'Class',
         ),
       ).toBe(false);
-      expect(
+      const isMissingContentHash = (suffix: string) =>
         adapter.isMissingContentHashError(
-          new Error('Binder exception: Cannot find property contentHash'),
-        ),
-      ).toBe(true);
+          new Error(`Binder exception: Cannot find property ${suffix}`),
+        );
+      expect(['contentHash', 'contentHash text'].map(isMissingContentHash)).toEqual([true, false]);
     });
 
     it('preserves counts when a present legacy table lacks chunkIndex', async () => {
