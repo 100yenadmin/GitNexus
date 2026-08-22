@@ -1826,6 +1826,143 @@ export interface EmbeddingIntegrityReport {
   recoverableIdentitySha256: string;
 }
 
+export interface EmbeddingPreservationRow {
+  id: string;
+  nodeId: string;
+  chunkIndex: number;
+  startLine: number;
+  endLine: number;
+  embedding: number[];
+  contentHash?: string;
+}
+
+export interface EmbeddingPreservationScan {
+  tablePresent: boolean;
+  physicalRows: number;
+  acceptedRows: EmbeddingPreservationRow[];
+  rejectedRows: number;
+  implicatedOwnerIds: string[];
+}
+
+export const scanEmbeddingPreservationRows = async (): Promise<EmbeddingPreservationScan> => {
+  if (!conn) throw new Error('LadybugDB not initialized. Call initLbug first.');
+
+  return withConnLock(async () => {
+    type ScannedRow = EmbeddingPreservationRow;
+    const rows: ScannedRow[] = [];
+    const idCounts = new Map<string, number>();
+    const semanticCounts = new Map<string, number>();
+    const semantic = (row: ScannedRow): string | undefined =>
+      row.nodeId.trim() && Number.isSafeInteger(row.chunkIndex) && row.chunkIndex >= 0
+        ? embeddingSemanticIdentity(row.nodeId, row.chunkIndex)
+        : undefined;
+
+    try {
+      await streamQuery(
+        `MATCH (e:${EMBEDDING_TABLE_NAME}) RETURN e.id AS id, e.nodeId AS nodeId, ` +
+          `e.chunkIndex AS chunkIndex, e.startLine AS startLine, e.endLine AS endLine, ` +
+          `e.embedding AS embedding, e.contentHash AS contentHash`,
+        (row) => {
+          const id = String(row.id ?? row[0] ?? '');
+          const nodeId = String(row.nodeId ?? row[1] ?? '');
+          const rawChunk = row.chunkIndex ?? row[2];
+          const chunkIndex =
+            rawChunk === null ||
+            rawChunk === undefined ||
+            (typeof rawChunk === 'string' && rawChunk.trim() === '')
+              ? Number.NaN
+              : Number(rawChunk);
+          const vector = row.embedding ?? row[5];
+          const embedding =
+            Array.isArray(vector) || ArrayBuffer.isView(vector)
+              ? Array.from(vector as ArrayLike<unknown>, Number)
+              : [];
+          const contentHash = row.contentHash ?? row[6];
+          const scanned: ScannedRow = {
+            id,
+            nodeId,
+            chunkIndex,
+            startLine: Number(row.startLine ?? row[3] ?? 0),
+            endLine: Number(row.endLine ?? row[4] ?? 0),
+            embedding,
+            ...(contentHash === null || contentHash === undefined
+              ? {}
+              : { contentHash: String(contentHash) }),
+          };
+          rows.push(scanned);
+          idCounts.set(id, (idCounts.get(id) ?? 0) + 1);
+          const key = semantic(scanned);
+          if (key) semanticCounts.set(key, (semanticCounts.get(key) ?? 0) + 1);
+        },
+      );
+    } catch (error) {
+      if (isMissingEmbeddingTableError(error))
+        return {
+          tablePresent: false,
+          physicalRows: 0,
+          acceptedRows: [],
+          rejectedRows: 0,
+          implicatedOwnerIds: [],
+        };
+      throw error;
+    }
+
+    const liveOwnerIds = new Set<string>();
+    for (const label of [...EMBEDDABLE_LABELS, 'File'] as const) {
+      await streamQuery(`MATCH (n:${escapeTableName(label)}) RETURN n.id AS id`, (row) => {
+        const id = String(row.id ?? row[0] ?? '');
+        if (id.trim()) liveOwnerIds.add(id);
+      });
+    }
+
+    const implicated = new Set<string>();
+    for (const row of rows) {
+      const idEmpty = row.id.trim().length === 0;
+      const nodeIdEmpty = row.nodeId.trim().length === 0;
+      const chunkValid = Number.isSafeInteger(row.chunkIndex) && row.chunkIndex >= 0;
+      const dimensionsValid = row.embedding.length === EMBEDDING_DIMS;
+      const canonical =
+        !idEmpty && !nodeIdEmpty && chunkValid && row.id === `${row.nodeId}:${row.chunkIndex}`;
+      const orphan = !nodeIdEmpty && !liveOwnerIds.has(row.nodeId);
+      const key = semantic(row);
+      const defective =
+        idEmpty || nodeIdEmpty || !chunkValid || !canonical || orphan || !dimensionsValid;
+      if (
+        row.nodeId.trim() &&
+        (defective || idCounts.get(row.id)! > 1 || (!!key && semanticCounts.get(key)! > 1))
+      ) {
+        implicated.add(row.nodeId);
+      }
+    }
+
+    const acceptedRows = rows
+      .filter((row) => {
+        const key = semantic(row);
+        return (
+          row.id.trim() &&
+          row.nodeId.trim() &&
+          Number.isSafeInteger(row.chunkIndex) &&
+          row.chunkIndex >= 0 &&
+          row.embedding.length === EMBEDDING_DIMS &&
+          liveOwnerIds.has(row.nodeId) &&
+          row.id === `${row.nodeId}:${row.chunkIndex}` &&
+          idCounts.get(row.id) === 1 &&
+          !!key &&
+          semanticCounts.get(key) === 1 &&
+          !implicated.has(row.nodeId)
+        );
+      })
+      .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+    return {
+      tablePresent: true,
+      physicalRows: rows.length,
+      acceptedRows,
+      rejectedRows: rows.length - acceptedRows.length,
+      implicatedOwnerIds: [...implicated].sort(),
+    };
+  });
+};
+
 /**
  * Scan embedding identity without materializing vectors. This deliberately uses
  * streamed projections instead of primary-key equality: corrupted LadybugDB

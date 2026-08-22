@@ -175,3 +175,59 @@ withTestLbugDB(
     },
   },
 );
+
+withTestLbugDB(
+  'embedding-preservation-scan',
+  () => {
+    it('returns only deterministic, byte-preservable rows and implicated owners', async () => {
+      const adapter = await import('../../src/core/lbug/lbug-adapter.js');
+      const before = await adapter.executeQuery('MATCH (e:CodeEmbedding) RETURN e');
+      const scan = await adapter.scanEmbeddingPreservationRows();
+      const after = await adapter.executeQuery('MATCH (e:CodeEmbedding) RETURN e');
+
+      expect(scan.physicalRows).toBe(9);
+      expect(scan.rejectedRows + scan.acceptedRows.length).toBe(scan.physicalRows);
+      expect(scan.acceptedRows.map(({ id }) => id)).toEqual(['Function:good:0']);
+      expect(scan.acceptedRows[0]).toMatchObject({ id: 'Function:good:0', nodeId: 'Function:good', chunkIndex: 0, contentHash: 'good' });
+      expect(scan.acceptedRows[0]?.embedding).toEqual(new Array(EMBEDDING_DIMS).fill(0.25));
+      expect(scan.implicatedOwnerIds).toEqual([
+        'Function:bad',
+        'Function:duplicate-a',
+        'Function:duplicate-b',
+        'Function:invalid',
+        'Function:missing',
+        'Function:semantic',
+      ]);
+      expect(after).toEqual(before);
+    });
+  },
+  {
+    seed: [
+      "CREATE (:Function {id: 'Function:good'}), (:Function {id: 'Function:semantic'}), (:Function {id: 'Function:bad'}), (:Function {id: 'Function:duplicate-a'}), (:Function {id: 'Function:duplicate-b'}), (:Function {id: 'Function:invalid'})",
+    ],
+    beforeFTS: async () => {
+      const adapter = await import('../../src/core/lbug/lbug-adapter.js');
+      await adapter.executeQuery('DROP TABLE CodeEmbedding');
+      await adapter.executeQuery(
+        'CREATE NODE TABLE CodeEmbedding (rowKey STRING PRIMARY KEY, id STRING, nodeId STRING, ' +
+          'chunkIndex INT64, startLine INT64, endLine INT64, embedding FLOAT[], contentHash STRING)',
+      );
+      const vector = new Array(EMBEDDING_DIMS).fill(0.25);
+      const row = (id: string, nodeId: string, chunkIndex: number, embedding = vector, contentHash = id) => ({ rowKey: `${id}-${nodeId}`, id, nodeId, chunkIndex, startLine: 1, endLine: 2, embedding, contentHash });
+      await adapter.executeWithReusedStatement(
+        'CREATE (e:CodeEmbedding {rowKey: $rowKey, id: $id, nodeId: $nodeId, chunkIndex: $chunkIndex, startLine: $startLine, endLine: $endLine, embedding: $embedding, contentHash: $contentHash})',
+        [
+          row('Function:good:0', 'Function:good', 0, vector, 'good'),
+          row('shared', 'Function:duplicate-a', 0, vector, 'a'),
+          row('shared', 'Function:duplicate-b', 0, vector, 'b'),
+          row('Function:semantic:0', 'Function:semantic', 0, vector, 's1'),
+          row('semantic-copy', 'Function:semantic', 0, vector, 's2'),
+          row('wrong', 'Function:bad', 0, vector.slice(0, -1), 'bad'),
+          row('Function:missing:0', 'Function:missing', 0, vector, 'missing'),
+          row('Function:invalid:-1', 'Function:invalid', -1, vector, 'invalid'),
+          row('blank-owner', '', 0, vector, 'blank'),
+        ],
+      );
+    },
+  },
+);
