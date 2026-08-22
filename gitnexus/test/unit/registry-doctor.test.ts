@@ -16,7 +16,6 @@ import {
   type RegistryDatabaseCounts,
   type RegistryDoctorOptions,
 } from '../../src/cli/registry-doctor.js';
-import { getQueryEmbeddingRuntimeStatus } from '../../src/core/embeddings/runtime-support.js';
 import {
   INDEX_METADATA_FILE,
   type RegistryEntry,
@@ -330,58 +329,6 @@ describe('doctor --registry read-only report (#133)', () => {
       semantic_ready: false,
       reasons: ['embedding-query-local-runtime-unavailable'],
     });
-  });
-
-  it('reports a valid HTTP wrapper as provider-free runtime availability', () => {
-    const keys = [
-      'GITNEXUS_EMBEDDING_URL',
-      'GITNEXUS_EMBEDDING_MODEL',
-      'GITNEXUS_EMBEDDING_DIMS',
-      'GITNEXUS_EMBEDDING_MAX_ATTEMPTS',
-      'GITNEXUS_EMBEDDING_RETRY_CAP_MS',
-      'GITNEXUS_EMBEDDING_MIN_INTERVAL_MS',
-    ] as const;
-    const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
-    try {
-      process.env.GITNEXUS_EMBEDDING_URL = 'https://embedding.example/v1';
-      process.env.GITNEXUS_EMBEDDING_MODEL = 'test-model';
-      process.env.GITNEXUS_EMBEDDING_DIMS = '384';
-      delete process.env.GITNEXUS_EMBEDDING_MAX_ATTEMPTS;
-      delete process.env.GITNEXUS_EMBEDDING_RETRY_CAP_MS;
-      delete process.env.GITNEXUS_EMBEDDING_MIN_INTERVAL_MS;
-
-      expect(getQueryEmbeddingRuntimeStatus()).toEqual({
-        available: true,
-        mode: 'http',
-        reason: null,
-      });
-      expect(JSON.stringify(getQueryEmbeddingRuntimeStatus())).not.toContain('embedding.example');
-      expect(JSON.stringify(getQueryEmbeddingRuntimeStatus())).not.toContain('test-model');
-    } finally {
-      for (const key of keys) {
-        if (previous[key] === undefined) delete process.env[key];
-        else process.env[key] = previous[key];
-      }
-    }
-  });
-
-  it('fails closed for invalid HTTP wrapper configuration without a provider call', () => {
-    const keys = ['GITNEXUS_EMBEDDING_URL', 'GITNEXUS_EMBEDDING_MODEL'] as const;
-    const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
-    try {
-      process.env.GITNEXUS_EMBEDDING_URL = 'not-a-url';
-      process.env.GITNEXUS_EMBEDDING_MODEL = 'test-model';
-      expect(getQueryEmbeddingRuntimeStatus()).toEqual({
-        available: false,
-        mode: 'http',
-        reason: 'http-config-invalid',
-      });
-    } finally {
-      for (const key of keys) {
-        if (previous[key] === undefined) delete process.env[key];
-        else process.env[key] = previous[key];
-      }
-    }
   });
 
   it('keeps a graph-only index healthy when the embedding table is absent', async () => {

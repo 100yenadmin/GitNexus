@@ -56,7 +56,9 @@ export const getQueryEmbeddingRuntimeStatus = (): QueryEmbeddingRuntimeStatus =>
       if (
         (endpoint.protocol !== 'http:' && endpoint.protocol !== 'https:') ||
         endpoint.username !== '' ||
-        endpoint.password !== ''
+        endpoint.password !== '' ||
+        endpoint.search !== '' ||
+        endpoint.hash !== ''
       ) {
         return { available: false, mode: 'http', reason: 'http-config-invalid' };
       }

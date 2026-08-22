@@ -964,13 +964,29 @@ export type RegistryReadResult =
   | { status: 'available'; entries: RegistryEntry[] }
   | { status: 'failed'; reason: RegistryReadFailure };
 
-/**
- * Read the global registry while preserving failures for read-only diagnostics.
- * The long-standing readRegistry() helper intentionally remains fail-open for
- * callers that use an absent registry as an empty one; Doctor needs this strict
- * result so corruption or permission loss cannot look like a healthy empty
- * registry.
- */
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value);
+
+const isStatsShape = (value: unknown): boolean => value === undefined || isRecord(value);
+
+const isBranchSummaryShape = (value: unknown): boolean =>
+  isRecord(value) &&
+  typeof value.branch === 'string' &&
+  typeof value.indexedAt === 'string' &&
+  typeof value.lastCommit === 'string' &&
+  isStatsShape(value.stats);
+
+const isRegistryEntryShape = (value: unknown): value is RegistryEntry =>
+  isRecord(value) &&
+  ['name', 'path', 'storagePath', 'indexedAt', 'lastCommit'].every(
+    (key) => typeof value[key] === 'string',
+  ) &&
+  (value.remoteUrl === undefined || typeof value.remoteUrl === 'string') &&
+  (value.branch === undefined || typeof value.branch === 'string') &&
+  isStatsShape(value.stats) &&
+  (value.branches === undefined ||
+    (Array.isArray(value.branches) && value.branches.every(isBranchSummaryShape)));
+
 export const readRegistryStrict = async (): Promise<RegistryReadResult> => {
   let raw: string;
   try {
@@ -985,9 +1001,9 @@ export const readRegistryStrict = async (): Promise<RegistryReadResult> => {
   } catch {
     return { status: 'failed', reason: 'malformed' };
   }
-  return Array.isArray(data)
-    ? { status: 'available', entries: data as RegistryEntry[] }
-    : { status: 'failed', reason: 'not-array' };
+  if (!Array.isArray(data)) return { status: 'failed', reason: 'not-array' };
+  if (!data.every(isRegistryEntryShape)) return { status: 'failed', reason: 'malformed' };
+  return { status: 'available', entries: data };
 };
 
 /**

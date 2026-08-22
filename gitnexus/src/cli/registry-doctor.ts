@@ -10,11 +10,7 @@ import {
   type RegistryReadFailure,
   type RepoMeta,
 } from '../storage/repo-manager.js';
-import {
-  EXPECTED_POOL_CONNECTIONS,
-  probeDoctorPool,
-  type DoctorPoolProbe,
-} from './doctor-pool-probe.js';
+import type { DoctorPoolProbe } from './doctor-pool-probe.js';
 import type { EmbeddingIntegrityReport } from '../core/lbug/lbug-adapter.js';
 import {
   getQueryEmbeddingRuntimeStatus,
@@ -69,6 +65,13 @@ export interface RegistryHealthReport {
  * Typed integration seam for the production non-recovering read-pool probe.
  */
 export type RegistryCapabilityProbe = (lbugPath: string) => Promise<DoctorPoolProbe>;
+
+const EXPECTED_POOL_CONNECTIONS = 8;
+
+const probeRegistryDoctorPool: RegistryCapabilityProbe = async (lbugPath) => {
+  const { probeDoctorPool } = await import('./doctor-pool-probe.js');
+  return probeDoctorPool(lbugPath);
+};
 
 interface FileState {
   status: 'absent' | 'present' | 'inaccessible';
@@ -551,6 +554,7 @@ const inspectEntry = async (
     registry_sha: nonEmptySha(entry.lastCommit),
     head_sha: null,
   };
+  const embeddingRuntime = (options.embeddingRuntimeProbe ?? getQueryEmbeddingRuntimeStatus)();
   const unavailableComparison = compareCounts(base.registry.counts, emptyCounts(), null);
 
   try {
@@ -702,7 +706,7 @@ const inspectEntry = async (
   if (availableCounts) {
     try {
       capabilities = liveCapabilities(
-        await (options.capabilityProbe ?? probeDoctorPool)(lbugPath),
+        await (options.capabilityProbe ?? probeRegistryDoctorPool)(lbugPath),
         availableCounts.embeddings,
       );
     } catch {
@@ -714,7 +718,8 @@ const inspectEntry = async (
   const indexedSha = nonEmptySha(meta?.lastCommit);
   const freshness = freshnessFor(indexedSha, base.registry_sha, headSha);
   const embeddings = database.status === 'available' ? database.counts.embeddings : 0;
-  const embeddingRuntime = (options.embeddingRuntimeProbe ?? getQueryEmbeddingRuntimeStatus)();
+  const embeddingBearing =
+    embeddings > 0 || (base.registry.counts.embeddings ?? counts.embeddings ?? 0) > 0;
   const semanticReady =
     database.status === 'available' &&
     database.counts.embeddings > 0 &&
@@ -740,7 +745,7 @@ const inspectEntry = async (
   if (embeddings > 0 && capabilities.vectorSearch !== 'vector-index') {
     reasons.push('vector-index-unavailable');
   }
-  if (embeddings > 0 && !embeddingRuntime.available) {
+  if (embeddingBearing && !embeddingRuntime.available) {
     reasons.push(`embedding-query-${embeddingRuntime.reason ?? 'runtime-unavailable'}`);
   }
 
