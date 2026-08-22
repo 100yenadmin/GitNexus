@@ -481,6 +481,7 @@ export const assertVectorRepairPreflight = async (
     );
   }
   if (checkpoint && checkpointComplete) {
+    if (checkpoint.provider === undefined && checkpoint.totalNodes === 0) return meta;
     // The checkpoint is the only durable record of which model produced the
     // stored vectors. The resume path refuses a model/dimension mismatch, and
     // repair clears the checkpoint on success — so repairing through a
@@ -942,6 +943,13 @@ const runFullAnalysisImpl = async (
     stats = readOnlyPreflight.stats;
     embeddingCountBefore = readOnlyPreflight.embeddingCount;
     if (existingMeta.embeddingCheckpoint) {
+      if (existingMeta.embeddingCheckpoint.provider === undefined && embeddingCountBefore > 0) {
+        throw new Error(
+          'Cannot repair VECTOR: the completed embedding checkpoint has unknown-provider ' +
+            'provenance while the table contains rows. Re-run analyze with ' +
+            '--force --drop-embeddings --embeddings.',
+        );
+      }
       assertCompletedCheckpointIdentity(
         existingMeta.embeddingCheckpoint,
         readOnlyPreflight.integrity,

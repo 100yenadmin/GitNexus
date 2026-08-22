@@ -14,7 +14,7 @@ const REPO: RegistryEntry = {
   lastCommit: 'test-head',
 };
 
-const identity = { model: MODEL, dimensions: 384 };
+const identity = { provider: 'api-checkpoint-test-provider', model: MODEL, dimensions: 384 };
 const makeIntegrity = (digest: string): EmbeddingIntegrityReport =>
   ({
     physicalRows: 3,
@@ -197,6 +197,26 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     expect(state.runEmbeddingPipeline).toHaveBeenCalledOnce();
     expect(state.currentMeta.stats?.embeddings).toBe(3);
     expect(state.currentMeta.embeddingCheckpoint).toBeUndefined();
+  });
+
+  it('gives legacy checkpoints an explicit recovery action instead of a blind retry', async () => {
+    state.currentMeta.embeddingCheckpoint = {
+      ...state.currentMeta.embeddingCheckpoint!,
+      provider: undefined,
+    };
+    const before = JSON.stringify(state.currentMeta.embeddingCheckpoint);
+    const response = await fetch(`${baseUrl}/api/embed`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ repo: REPO.name }),
+    });
+    const { jobId } = (await response.json()) as { jobId: string };
+    const job = await waitForTerminalJob(baseUrl, jobId);
+
+    expect(job.error).toMatch(/unknown-provider/);
+    expect(job.error).toMatch(/do not retry POST \/api\/embed/i);
+    expect(job.error).toMatch(/gitnexus analyze --force --drop-embeddings --embeddings/);
+    expect(JSON.stringify(state.currentMeta.embeddingCheckpoint)).toBe(before);
   });
 
   it('persists completed-window identity before an interrupted finalization', async () => {
