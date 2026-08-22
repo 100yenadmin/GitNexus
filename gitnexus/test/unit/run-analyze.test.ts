@@ -17,6 +17,7 @@ import {
   type RepoMeta,
 } from '../../src/storage/repo-manager.js';
 import { taintModelVersion } from '../../src/core/ingestion/taint/typescript-model.js';
+import { httpEmbeddingProvider } from '../../src/core/embeddings/embedding-identity.js';
 import { createTempDir } from '../helpers/test-db.js';
 import { readEmbeddingNodeIds, seedEmbeddingsForFiles } from '../helpers/embedding-seed.js';
 
@@ -232,6 +233,9 @@ describe('run-analyze module', () => {
 
       const interrupted = await loadMeta(storagePath);
       expect(interrupted?.embeddingCheckpoint).toBeDefined();
+      expect(interrupted?.embeddingCheckpoint?.provider).toBe(
+        httpEmbeddingProvider('http://test:8080/v1'),
+      );
       expect(interrupted?.schemaVersion).toBe(INCREMENTAL_SCHEMA_VERSION);
     } finally {
       vi.unstubAllGlobals();
@@ -299,6 +303,11 @@ describe('run-analyze module', () => {
       const completed = await loadMeta(storagePath);
       expect(completed).not.toBeNull();
       if (!completed) throw new Error('expected completed metadata');
+      expect(completed.embeddingIdentity).toEqual({
+        provider: httpEmbeddingProvider('http://test:8080/v1'),
+        model: 'test-model',
+        dimensions: 384,
+      });
       await saveMeta(storagePath, {
         ...completed,
         embeddingCheckpoint: {

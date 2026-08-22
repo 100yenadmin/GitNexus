@@ -57,6 +57,7 @@ import { UPLOAD_ROOT } from './upload-paths.js';
 import { sweepStaleUploads } from './upload-sweep.js';
 import { isRfc1918PrivateIpv4 } from './private-ip.js';
 import { logger, flushLoggerSync } from '../core/logger.js';
+import { resolveDurableEmbeddingIdentity } from '../core/embeddings/embedding-identity.js';
 
 const _require = createRequire(import.meta.url);
 const pkg = _require('../../package.json');
@@ -1800,6 +1801,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
               const { inspectEmbeddingIntegrity, embeddingIntegrityFailures } =
                 await import('../core/lbug/lbug-adapter.js');
               const embeddingIdentity = getActiveEmbeddingIdentity();
+              let generatedEmbeddingIdentity: typeof embeddingIdentity | undefined;
               let embeddingMeta = await loadMeta(entry.storagePath);
               if (!embeddingMeta) {
                 throw new Error('Repository metadata is missing; run gitnexus analyze first');
@@ -1807,13 +1809,20 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
               const priorCheckpoint = embeddingMeta.embeddingCheckpoint;
               if (
                 priorCheckpoint &&
-                (priorCheckpoint.model !== embeddingIdentity.model ||
+                ((priorCheckpoint.provider !== undefined &&
+                  priorCheckpoint.provider !== embeddingIdentity.provider) ||
+                  priorCheckpoint.model !== embeddingIdentity.model ||
                   priorCheckpoint.dimensions !== embeddingIdentity.dimensions)
               ) {
+                const checkpointLabel = priorCheckpoint.provider
+                  ? `${priorCheckpoint.provider} / ${priorCheckpoint.model}`
+                  : priorCheckpoint.model;
                 throw new Error(
-                  `Cannot resume embedding checkpoint: it uses ${priorCheckpoint.model} at ` +
+                  `Cannot resume embedding checkpoint: it uses ` +
+                    `${checkpointLabel} at ` +
                     `${priorCheckpoint.dimensions} dimensions, but this run resolves ` +
-                    `${embeddingIdentity.model} at ${embeddingIdentity.dimensions}.`,
+                    `${embeddingIdentity.provider} / ${embeddingIdentity.model} at ` +
+                    `${embeddingIdentity.dimensions}.`,
                 );
               }
               if (priorCheckpoint && !priorCheckpoint.pendingNodeIds?.length) {
@@ -1874,7 +1883,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                   `[embed] ${existingEmbeddings.size} nodes already embedded — incremental run with content-hash comparison`,
                 );
               }
-              await runEmbeddingPipeline(
+              const embeddingResult = await runEmbeddingPipeline(
                 executeQuery,
                 executeWithReusedStatement,
                 (p) => {
@@ -1918,6 +1927,9 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                   },
                 },
               );
+              if (embeddingResult?.nodesProcessed > 0) {
+                generatedEmbeddingIdentity = embeddingIdentity;
+              }
 
               // Flush WAL so subsequent /api/search requests see the new
               // embeddings immediately (#1149). In the CLI path closeLbug()
@@ -1935,6 +1947,11 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                 ...embeddingMeta,
                 stats: { ...embeddingMeta.stats, embeddings: terminalIntegrity.validRows },
                 embeddingCheckpoint: undefined,
+                embeddingIdentity: resolveDurableEmbeddingIdentity(
+                  terminalIntegrity.validRows,
+                  generatedEmbeddingIdentity,
+                  embeddingMeta.embeddingIdentity,
+                ),
               };
               await saveMeta(entry.storagePath, embeddingMeta);
             });

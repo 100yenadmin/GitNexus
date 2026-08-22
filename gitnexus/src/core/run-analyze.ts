@@ -139,6 +139,10 @@ import {
   validateEmbeddingTableRebuildMarker,
   writeEmbeddingTableRebuildMarker,
 } from './embeddings/rebuild-marker.js';
+import {
+  resolveDurableEmbeddingIdentity,
+  type EmbeddingIdentity,
+} from './embeddings/embedding-identity.js';
 import { generateAIContextFiles } from '../cli/ai-context.js';
 import { sanitizeDetectedBranch } from '../cli/analyze-config.js';
 import { EMBEDDING_TABLE_NAME, STALE_HASH_SENTINEL } from './lbug/schema.js';
@@ -321,11 +325,6 @@ export interface AnalyzeOptions {
   skipNativeCloseOnExit?: boolean;
 }
 
-interface EmbeddingIdentity {
-  model: string;
-  dimensions: number;
-}
-
 const resolveEmbeddingIdentity = async (): Promise<EmbeddingIdentity> => {
   const { getActiveEmbeddingIdentity } = await import('./embeddings/embedder.js');
   return getActiveEmbeddingIdentity();
@@ -491,10 +490,18 @@ export const assertVectorRepairPreflight = async (
     // mismatched identity would build HNSW over incompatible rows AND erase
     // the evidence. Mirror the resume-path guard before allowing either.
     const identity = await resolveEmbeddingIdentity();
-    if (checkpoint.model !== identity.model || checkpoint.dimensions !== identity.dimensions) {
+    if (
+      (checkpoint.provider !== undefined && checkpoint.provider !== identity.provider) ||
+      checkpoint.model !== identity.model ||
+      checkpoint.dimensions !== identity.dimensions
+    ) {
+      const checkpointLabel = checkpoint.provider
+        ? `${checkpoint.provider} / ${checkpoint.model}`
+        : checkpoint.model;
       throw new Error(
-        `Cannot repair VECTOR: the completed embedding checkpoint records ${checkpoint.model} at ` +
-          `${checkpoint.dimensions} dimensions, but this run resolves ${identity.model} at ` +
+        `Cannot repair VECTOR: the completed embedding checkpoint records ` +
+          `${checkpointLabel} at ${checkpoint.dimensions} ` +
+          `dimensions, but this run resolves ${identity.provider} / ${identity.model} at ` +
           `${identity.dimensions}. Restore the matching embedding configuration, or rebuild with ` +
           'analyze --drop-embeddings --embeddings.',
       );
@@ -1568,6 +1575,7 @@ const runFullAnalysisImpl = async (
   let resumeEmbeddingCheckpoint = false;
   let pendingEmbeddingNodeIds = new Set<string>();
   let embeddingIdentityForRun: EmbeddingIdentity | undefined;
+  let generatedEmbeddingIdentity: EmbeddingIdentity | undefined;
   if (existingMeta?.embeddingCheckpoint) {
     if (options.dropEmbeddings) {
       log('Discarding the interrupted embedding checkpoint (--drop-embeddings).');
@@ -1576,12 +1584,18 @@ const runFullAnalysisImpl = async (
       embeddingIdentityForRun = await resolveEmbeddingIdentity();
       const checkpoint = existingMeta.embeddingCheckpoint;
       if (
+        (checkpoint.provider !== undefined &&
+          checkpoint.provider !== embeddingIdentityForRun.provider) ||
         checkpoint.model !== embeddingIdentityForRun.model ||
         checkpoint.dimensions !== embeddingIdentityForRun.dimensions
       ) {
+        const checkpointLabel = checkpoint.provider
+          ? `${checkpoint.provider} / ${checkpoint.model}`
+          : checkpoint.model;
         throw new Error(
-          `Cannot resume embedding checkpoint: it uses ${checkpoint.model} at ` +
-            `${checkpoint.dimensions} dimensions, but this run resolves ` +
+          `Cannot resume embedding checkpoint: it uses ` +
+            `${checkpointLabel} at ${checkpoint.dimensions} ` +
+            `dimensions, but this run resolves ${embeddingIdentityForRun.provider} / ` +
             `${embeddingIdentityForRun.model} at ${embeddingIdentityForRun.dimensions}. ` +
             'Restore the matching embedding configuration or pass --drop-embeddings to rebuild without it.',
         );
@@ -3056,6 +3070,7 @@ const runFullAnalysisImpl = async (
           embeddingCheckpoint: {
             at: new Date().toISOString(),
             ...checkpoint,
+            provider: embeddingIdentity.provider,
             model: embeddingIdentity.model,
             dimensions: embeddingIdentity.dimensions,
             pendingNodeIds,
@@ -3107,6 +3122,9 @@ const runFullAnalysisImpl = async (
           },
         },
       );
+      if (embeddingResult.nodesProcessed > 0) {
+        generatedEmbeddingIdentity = embeddingIdentity;
+      }
       if (embeddingResult.semanticMode === 'exact-scan') {
         semanticMode = 'exact-scan';
         log(
@@ -3225,6 +3243,14 @@ const runFullAnalysisImpl = async (
       cacheKeys: [...parseCache.usedKeys],
       incrementalInProgress: undefined as RepoMeta['incrementalInProgress'],
       embeddingCheckpoint: undefined,
+      // Preserve the prior identity on retention-only runs. Legacy metadata
+      // may have no identity; absence remains unknown rather than inferred
+      // from the current process configuration.
+      embeddingIdentity: resolveDurableEmbeddingIdentity(
+        embeddingCount,
+        generatedEmbeddingIdentity,
+        existingMeta?.embeddingIdentity,
+      ),
       // The effective pdg config this run's DB rows were built under
       // (#2099 F1). `undefined` on pdg-off runs — this meta is a fresh
       // literal (no spread of existingMeta), so omission is what CLEARS the

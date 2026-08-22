@@ -75,6 +75,36 @@ describe('HTTP embedding backend', () => {
   });
 
   describe('core embedder HTTP path', () => {
+    it('derives a deterministic redacted transport identity', async () => {
+      process.env.GITNEXUS_EMBEDDING_URL =
+        'https://user:secret@example.com/v1/?token=query#fragment';
+      process.env.GITNEXUS_EMBEDDING_MODEL = 'test-model';
+
+      const { getActiveEmbeddingIdentity } = await import('../../src/core/embeddings/embedder.js');
+      const first = getActiveEmbeddingIdentity();
+
+      process.env.GITNEXUS_EMBEDDING_URL = 'https://example.com/v1';
+      const equivalent = getActiveEmbeddingIdentity();
+      expect(equivalent.provider).toBe(first.provider);
+      expect(first.provider).not.toContain('secret');
+      expect(first.provider).not.toContain('query');
+      expect(first.provider).not.toContain('fragment');
+
+      process.env.GITNEXUS_EMBEDDING_URL = 'https://example.com/v2';
+      expect(getActiveEmbeddingIdentity().provider).not.toBe(first.provider);
+    });
+
+    it('uses an explicit local provider identity outside HTTP mode', async () => {
+      delete process.env.GITNEXUS_EMBEDDING_URL;
+      delete process.env.GITNEXUS_EMBEDDING_MODEL;
+      const { getActiveEmbeddingIdentity } = await import('../../src/core/embeddings/embedder.js');
+      expect(getActiveEmbeddingIdentity()).toMatchObject({
+        provider: 'local',
+        model: 'Snowflake/snowflake-arctic-embed-xs',
+        dimensions: 384,
+      });
+    });
+
     it('sends correct request payload', async () => {
       process.env.GITNEXUS_EMBEDDING_URL = 'http://test:8080/v1';
       process.env.GITNEXUS_EMBEDDING_MODEL = 'test-model';

@@ -39,6 +39,7 @@ import {
   isEffectiveCudaAvailable,
 } from './onnxruntime-node-resolver.js';
 import { logger } from '../logger.js';
+import { httpEmbeddingProvider, type EmbeddingIdentity } from './embedding-identity.js';
 
 // Module-level state for singleton pattern
 let embedderInstance: FeatureExtractionPipeline | null = null;
@@ -282,10 +283,14 @@ export const getEmbeddingDimensions = (): number => {
 };
 
 /** Identity of the transport that embedText/embedBatch will actually use. */
-export const getActiveEmbeddingIdentity = (): { model: string; dimensions: number } => ({
-  model: isHttpMode() ? process.env.GITNEXUS_EMBEDDING_MODEL! : resolveEmbeddingConfig().modelId,
-  dimensions: getEmbeddingDimensions(),
-});
+export const getActiveEmbeddingIdentity = (): EmbeddingIdentity => {
+  const httpMode = isHttpMode();
+  return {
+    provider: httpMode ? httpEmbeddingProvider(process.env.GITNEXUS_EMBEDDING_URL!) : 'local',
+    model: httpMode ? process.env.GITNEXUS_EMBEDDING_MODEL! : resolveEmbeddingConfig().modelId,
+    dimensions: getEmbeddingDimensions(),
+  };
+};
 
 /**
  * Get the embedder instance (throws if not initialized)

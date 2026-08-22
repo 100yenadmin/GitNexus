@@ -33,6 +33,7 @@ import {
   resolveBranchPlacement,
   type BranchSummary,
 } from './branch-index.js';
+import type { EmbeddingIdentity } from '../core/embeddings/embedding-identity.js';
 
 // Re-export the #2106 branch primitives (extracted to branch-index.ts, R10) so
 // existing `repo-manager` import sites and tests keep working unchanged.
@@ -216,6 +217,8 @@ export interface RepoMeta {
     nodesProcessed: number;
     totalNodes: number;
     chunksProcessed: number;
+    /** Provider identity is absent on legacy checkpoints. */
+    provider?: string;
     model: string;
     dimensions: number;
     /** Physical rows durably visible after the completed checkpoint. */
@@ -232,6 +235,8 @@ export interface RepoMeta {
      */
     pendingNodeIds?: string[];
   };
+  /** Transport identity for the vectors currently retained in the index. */
+  embeddingIdentity?: EmbeddingIdentity;
   /**
    * Name of the git branch this index represents (#2106). Absent for the
    * default/legacy single-branch case so the flat metadata file stays
