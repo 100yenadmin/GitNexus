@@ -11,6 +11,7 @@ vi.mock('../../src/cli/doctor-pool-probe.js', () => doctorPoolMocks);
 
 import {
   buildRegistryDoctorReport,
+  isLegacyMissingChunkIndexError,
   probeRegistryDatabaseCounts,
   type RegistryDatabaseCounts,
 } from '../../src/cli/registry-doctor.js';
@@ -126,6 +127,14 @@ describe('doctor --registry read-only report (#133)', () => {
 
   afterEach(async () => {
     await fixture.cleanup();
+  });
+
+  it('rejects prefixed runtime errors as legacy chunkIndex compatibility', () => {
+    expect(
+      isLegacyMissingChunkIndexError(
+        new Error('Runtime exception: Binder exception: Column chunkIndex does not exist'),
+      ),
+    ).toBe(false);
   });
 
   it('reports canonical remote and alias collisions, count drift, and local-only entries', async () => {

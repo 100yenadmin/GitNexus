@@ -290,9 +290,9 @@ const queryCount = async (connection: QueryConnectionLike, cypher: string): Prom
   }
 };
 
-const isLegacyMissingChunkIndexError = (error: unknown): boolean => {
+export const isLegacyMissingChunkIndexError = (error: unknown): boolean => {
   const message = error instanceof Error ? error.message : String(error);
-  return /binder exception:\s*(?:column\s+chunkIndex\s+does not exist|cannot find property\s+chunkIndex\s+for\s+e\.?)$/i.test(
+  return /^binder exception:\s*(?:column\s+chunkIndex\s+does not exist|cannot find property\s+chunkIndex\s+for\s+e\.?)$/i.test(
     message.trim(),
   );
 };
