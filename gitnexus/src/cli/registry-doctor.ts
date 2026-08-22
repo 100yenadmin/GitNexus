@@ -701,6 +701,7 @@ const inspectEntry = async (
   const semanticReady =
     database.status === 'available' &&
     database.counts.embeddings > 0 &&
+    meta?.embeddingCheckpoint === undefined &&
     freshness === 'current' &&
     countAlignmentFor(countComparison) === 'aligned' &&
     database.integrity.status === 'clean' &&
@@ -784,7 +785,9 @@ export async function buildRegistryDoctorReport(
   for (const { entry, entryPosition } of indexed) {
     reports.push(await inspectEntry(entry, entryPosition, options));
   }
-  const remoteCollisionPositions = new Set(remotes.flatMap((collision) => collision.entryPositions));
+  const remoteCollisionPositions = new Set(
+    remotes.flatMap((collision) => collision.entryPositions),
+  );
   const aliasCollisionPositions = new Set(aliases.flatMap((collision) => collision.entryPositions));
   const healthReports = reports.map((report) => {
     const reasons = [...report.health.reasons];
@@ -799,10 +802,13 @@ export async function buildRegistryDoctorReport(
         ...report.health,
         state: collision ? ('quarantined' as const) : report.health.state,
         reasons: uniqueReasons(reasons),
+        semantic_ready: collision ? false : report.health.semantic_ready,
       },
     };
   });
-  const remoteIdentities = healthReports.filter((report) => report.identity.kind === 'remote').length;
+  const remoteIdentities = healthReports.filter(
+    (report) => report.identity.kind === 'remote',
+  ).length;
   return {
     mode: 'registry',
     readOnly: true,
@@ -813,16 +819,19 @@ export async function buildRegistryDoctorReport(
       localOnlyEntries: healthReports.length - remoteIdentities,
       remoteCollisionGroups: remotes.length,
       aliasCollisionGroups: aliases.length,
-      countMismatches: healthReports.filter((report) => report.countComparison.status === 'mismatch')
-        .length,
+      countMismatches: healthReports.filter(
+        (report) => report.countComparison.status === 'mismatch',
+      ).length,
       recoveryStateEntries: healthReports.filter(
         (report) =>
           report.sidecars.state !== 'clean' &&
           report.sidecars.state !== 'lock-present' &&
           report.sidecars.state !== 'not-inspected',
       ).length,
-      lockedEntries: healthReports.filter((report) => report.sidecars.lock.status === 'present').length,
-      unsafeStorageEntries: healthReports.filter((report) => report.storage.status === 'unsafe').length,
+      lockedEntries: healthReports.filter((report) => report.sidecars.lock.status === 'present')
+        .length,
+      unsafeStorageEntries: healthReports.filter((report) => report.storage.status === 'unsafe')
+        .length,
     },
     collisions: { remotes, aliases },
     entries: healthReports,

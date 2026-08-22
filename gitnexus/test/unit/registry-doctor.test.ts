@@ -199,6 +199,8 @@ describe('doctor --registry read-only report (#133)', () => {
     expect(report.entries[0]?.countComparison.status).toBe('match');
     expect(report.entries[0]?.health.state).toBe('quarantined');
     expect(report.entries[1]?.health.state).toBe('quarantined');
+    expect(report.entries[0]?.health.semantic_ready).toBe(false);
+    expect(report.entries[1]?.health.semantic_ready).toBe(false);
     expect(report.entries[0]?.health.reasons).toEqual(
       expect.arrayContaining(['remote-collision', 'alias-collision']),
     );
@@ -333,6 +335,41 @@ describe('doctor --registry read-only report (#133)', () => {
     expect(report.entries[0]?.countComparison.status).toBe('partial');
     expect(report.summary.recoveryStateEntries).toBe(1);
     expect(await snapshotFiles(fixture.dbPath)).toEqual(before);
+  });
+
+  it('does not claim semantic readiness while an embedding checkpoint is present', async () => {
+    const indexed = await createEntry(
+      fixture.dbPath,
+      'checkpoint-health',
+      'CheckpointHealth',
+      'https://github.com/owner/checkpoint-health.git',
+      { nodes: 1, edges: 0, embeddings: 3 },
+    );
+    const metaPath = path.join(indexed.entry.storagePath, INDEX_METADATA_FILE);
+    const meta = JSON.parse(await fs.readFile(metaPath, 'utf8'));
+    const databaseProbe = async () => ({
+      nodes: 1,
+      edges: 0,
+      embeddings: 3,
+      embeddingDimensions: 384,
+      integrity: cleanIntegrity(3),
+    });
+    for (const embeddingCheckpoint of [
+      { nodesProcessed: 1, totalNodes: 3, dimensions: 384 },
+      { nodesProcessed: 3, totalNodes: 3, dimensions: 384 },
+    ]) {
+      await fs.writeFile(metaPath, JSON.stringify({ ...meta, embeddingCheckpoint }));
+      const report = await buildRegistryDoctorReport({
+        entries: [indexed.entry],
+        databaseProbe,
+        headProbe: () => 'a'.repeat(40),
+      });
+      expect(report.entries[0]?.health).toMatchObject({
+        state: 'degraded',
+        semantic_ready: false,
+        reasons: ['embedding-checkpoint-present'],
+      });
+    }
   });
 
   it('marks partial and total-loss durable checkpoints malformed', async () => {
