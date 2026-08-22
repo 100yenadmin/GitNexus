@@ -22,6 +22,7 @@ import {
   getStoragePath,
   registryPathEquals,
   type RegistryEntry,
+  type RepoMeta,
 } from '../storage/repo-manager.js';
 import {
   executeQuery,
