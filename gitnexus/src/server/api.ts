@@ -60,6 +60,12 @@ import { logger, flushLoggerSync } from '../core/logger.js';
 
 const _require = createRequire(import.meta.url);
 const pkg = _require('../../package.json');
+const isEmptyLegacyCheckpoint = (checkpoint?: RepoMeta['embeddingCheckpoint']): boolean =>
+  !!checkpoint &&
+  checkpoint.provider === undefined &&
+  checkpoint.nodesProcessed === 0 &&
+  checkpoint.totalNodes === 0 &&
+  !checkpoint.pendingNodeIds?.length;
 
 /**
  * Determine whether an HTTP Origin header value is allowed by CORS policy.
@@ -1796,15 +1802,23 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
             await withLbugDb(lbugPath, async () => {
               const { runEmbeddingPipeline } =
                 await import('../core/embeddings/embedding-pipeline.js');
-              const { getActiveEmbeddingIdentity } = await import('../core/embeddings/embedder.js');
               const { inspectEmbeddingIntegrity, embeddingIntegrityFailures } =
                 await import('../core/lbug/lbug-adapter.js');
-              const embeddingIdentity = getActiveEmbeddingIdentity();
               let embeddingMeta = await loadMeta(entry.storagePath);
               if (!embeddingMeta) {
                 throw new Error('Repository metadata is missing; run gitnexus analyze first');
               }
               const priorCheckpoint = embeddingMeta.embeddingCheckpoint;
+              if (isEmptyLegacyCheckpoint(priorCheckpoint)) {
+                const integrity = await inspectEmbeddingIntegrity();
+                if (integrity.physicalRows === 0) {
+                  embeddingMeta = { ...embeddingMeta, embeddingCheckpoint: undefined };
+                  await saveMeta(entry.storagePath, embeddingMeta);
+                  return;
+                }
+              }
+              const { getActiveEmbeddingIdentity } = await import('../core/embeddings/embedder.js');
+              const embeddingIdentity = getActiveEmbeddingIdentity();
               if (
                 priorCheckpoint &&
                 (priorCheckpoint.provider === undefined ||

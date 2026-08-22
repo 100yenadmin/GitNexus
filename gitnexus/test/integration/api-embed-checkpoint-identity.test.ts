@@ -219,6 +219,26 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     expect(JSON.stringify(state.currentMeta.embeddingCheckpoint)).toBe(before);
   });
 
+  it('clears a legacy zero-node checkpoint only when the table is empty', async () => {
+    state.currentMeta = makeMeta(LIVE_DIGEST);
+    state.currentMeta.embeddingCheckpoint = {
+      ...state.currentMeta.embeddingCheckpoint!,
+      nodesProcessed: 0,
+      totalNodes: 0,
+      provider: undefined,
+    };
+    state.liveIntegrity = { ...state.liveIntegrity, physicalRows: 0, validRows: 0 };
+    const response = await fetch(`${baseUrl}/api/embed`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ repo: REPO.name }),
+    });
+    const { jobId } = (await response.json()) as { jobId: string };
+    expect((await waitForTerminalJob(baseUrl, jobId)).status).toBe('complete');
+    expect(state.runEmbeddingPipeline).not.toHaveBeenCalled();
+    expect(state.currentMeta.embeddingCheckpoint).toBeUndefined();
+  });
+
   it('persists completed-window identity before an interrupted finalization', async () => {
     state.currentMeta = makeMeta(LIVE_DIGEST);
     state.runEmbeddingPipeline.mockImplementationOnce(async (...args: unknown[]) => {

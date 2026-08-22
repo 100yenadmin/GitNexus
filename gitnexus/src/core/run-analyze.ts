@@ -1577,11 +1577,16 @@ const runFullAnalysisImpl = async (
   let resumeEmbeddingCheckpoint = false;
   let pendingEmbeddingNodeIds = new Set<string>();
   let embeddingIdentityForRun: EmbeddingIdentity | undefined;
+  const isEmptyLegacyCheckpoint = (checkpoint: NonNullable<RepoMeta['embeddingCheckpoint']>) =>
+    checkpoint.provider === undefined &&
+    checkpoint.nodesProcessed === 0 &&
+    checkpoint.totalNodes === 0 &&
+    !checkpoint.pendingNodeIds?.length;
   if (existingMeta?.embeddingCheckpoint) {
     if (options.dropEmbeddings) {
       log('Discarding the interrupted embedding checkpoint (--drop-embeddings).');
       options = { ...options, force: true };
-    } else {
+    } else if (!isEmptyLegacyCheckpoint(existingMeta.embeddingCheckpoint)) {
       embeddingIdentityForRun = await resolveEmbeddingIdentity();
       const checkpoint = existingMeta.embeddingCheckpoint;
       if (
@@ -1686,6 +1691,21 @@ const runFullAnalysisImpl = async (
           'could neither be moved aside nor removed:',
       });
     }
+  }
+
+  const legacyCheckpoint = existingMeta?.embeddingCheckpoint;
+  if (!options.dropEmbeddings && legacyCheckpoint && isEmptyLegacyCheckpoint(legacyCheckpoint)) {
+    const integrity = await withLbugDb(lbugPath, inspectEmbeddingIntegrity, {
+      readOnly: true,
+    }).finally(() => closeLbug());
+    if (integrity.physicalRows > 0) {
+      throw new Error(
+        'Cannot resume embedding checkpoint: it uses unknown-provider while the table contains ' +
+          'rows. Restore the matching embedding configuration or pass --drop-embeddings to rebuild without it.',
+      );
+    }
+    existingMeta = { ...existingMeta, embeddingCheckpoint: undefined };
+    await saveMeta(metaDir, existingMeta);
   }
 
   // Checkpoint windows are durable boundaries even before the final window.
