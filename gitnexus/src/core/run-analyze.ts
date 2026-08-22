@@ -140,6 +140,7 @@ import {
   writeEmbeddingTableRebuildMarker,
 } from './embeddings/rebuild-marker.js';
 import {
+  assertIncrementalEmbeddingIdentity,
   resolveDurableEmbeddingIdentity,
   type EmbeddingIdentity,
 } from './embeddings/embedding-identity.js';
@@ -1576,6 +1577,7 @@ const runFullAnalysisImpl = async (
   let pendingEmbeddingNodeIds = new Set<string>();
   let embeddingIdentityForRun: EmbeddingIdentity | undefined;
   let generatedEmbeddingIdentity: EmbeddingIdentity | undefined;
+  let verifiedCompletedCheckpointIdentity: EmbeddingIdentity | undefined;
   if (existingMeta?.embeddingCheckpoint) {
     if (options.dropEmbeddings) {
       log('Discarding the interrupted embedding checkpoint (--drop-embeddings).');
@@ -1714,6 +1716,13 @@ const runFullAnalysisImpl = async (
         completedIntegrity,
         'Completed embedding checkpoint',
       );
+      if (checkpointToVerify.provider !== undefined) {
+        verifiedCompletedCheckpointIdentity = {
+          provider: checkpointToVerify.provider,
+          model: checkpointToVerify.model,
+          dimensions: checkpointToVerify.dimensions,
+        };
+      }
     } finally {
       await closeLbug();
     }
@@ -3033,6 +3042,12 @@ const runFullAnalysisImpl = async (
       const { fetchExistingEmbeddingHashesForNodeIds } = await import('./lbug/lbug-adapter.js');
       embeddingIdentityForRun ??= await resolveEmbeddingIdentity();
       const embeddingIdentity = embeddingIdentityForRun;
+      const survivingIntegrity = await inspectEmbeddingIntegrity();
+      assertIncrementalEmbeddingIdentity(
+        survivingIntegrity.physicalRows,
+        verifiedCompletedCheckpointIdentity ?? existingMeta?.embeddingIdentity,
+        embeddingIdentity,
+      );
       const saveEmbeddingCheckpoint = async (
         checkpoint: {
           nodesProcessed: number;
@@ -3249,7 +3264,7 @@ const runFullAnalysisImpl = async (
       embeddingIdentity: resolveDurableEmbeddingIdentity(
         embeddingCount,
         generatedEmbeddingIdentity,
-        existingMeta?.embeddingIdentity,
+        verifiedCompletedCheckpointIdentity ?? existingMeta?.embeddingIdentity,
       ),
       // The effective pdg config this run's DB rows were built under
       // (#2099 F1). `undefined` on pdg-off runs — this meta is a fresh

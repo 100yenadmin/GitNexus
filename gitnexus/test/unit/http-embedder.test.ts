@@ -76,8 +76,7 @@ describe('HTTP embedding backend', () => {
 
   describe('core embedder HTTP path', () => {
     it('derives a deterministic redacted transport identity', async () => {
-      process.env.GITNEXUS_EMBEDDING_URL =
-        'https://user:secret@example.com/v1/?token=query#fragment';
+      process.env.GITNEXUS_EMBEDDING_URL = 'https://user:secret@example.com/v1/#fragment';
       process.env.GITNEXUS_EMBEDDING_MODEL = 'test-model';
 
       const { getActiveEmbeddingIdentity } = await import('../../src/core/embeddings/embedder.js');
@@ -87,7 +86,6 @@ describe('HTTP embedding backend', () => {
       const equivalent = getActiveEmbeddingIdentity();
       expect(equivalent.provider).toBe(first.provider);
       expect(first.provider).not.toContain('secret');
-      expect(first.provider).not.toContain('query');
       expect(first.provider).not.toContain('fragment');
 
       process.env.GITNEXUS_EMBEDDING_URL = 'https://example.com/v2';
@@ -103,6 +101,13 @@ describe('HTTP embedding backend', () => {
         model: 'Snowflake/snowflake-arctic-embed-xs',
         dimensions: 384,
       });
+    });
+
+    it('refuses query-routed HTTP identity before any provider call', async () => {
+      process.env.GITNEXUS_EMBEDDING_URL = 'https://example.com/v1?deployment=one';
+      process.env.GITNEXUS_EMBEDDING_MODEL = 'test-model';
+      const { getActiveEmbeddingIdentity } = await import('../../src/core/embeddings/embedder.js');
+      expect(() => getActiveEmbeddingIdentity()).toThrow(/query routing is unverifiable/i);
     });
 
     it('sends correct request payload', async () => {

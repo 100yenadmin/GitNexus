@@ -308,15 +308,27 @@ describe('run-analyze module', () => {
         model: 'test-model',
         dimensions: 384,
       });
+      const { lbugPath } = getStoragePaths(tmpRepo.dbPath);
+      const { inspectEmbeddingIntegrity, withLbugDb, closeLbug } =
+        await import('../../src/core/lbug/lbug-adapter.js');
+      const completedIntegrity = await withLbugDb(lbugPath, inspectEmbeddingIntegrity, {
+        readOnly: true,
+      });
+      await closeLbug();
       await saveMeta(storagePath, {
         ...completed,
+        embeddingIdentity: undefined,
         embeddingCheckpoint: {
           at: new Date().toISOString(),
           nodesProcessed: 1,
           totalNodes: 1,
           chunksProcessed: 1,
+          provider: httpEmbeddingProvider('http://test:8080/v1'),
           model: 'test-model',
           dimensions: 384,
+          physicalRows: completedIntegrity.physicalRows,
+          validRows: completedIntegrity.validRows,
+          recoverableIdentitySha256: completedIntegrity.recoverableIdentitySha256,
         },
       } as RepoMeta);
       fetchMock.mockClear();
@@ -335,6 +347,7 @@ describe('run-analyze module', () => {
 
       const finalized = await loadMeta(storagePath);
       if (!finalized) throw new Error('expected finalized metadata');
+      expect(finalized.embeddingIdentity).toEqual(completed.embeddingIdentity);
       const [pendingNodeId] = await readEmbeddingNodeIds(tmpRepo.dbPath);
       if (!pendingNodeId) throw new Error('expected a persisted embedding node');
       await saveMeta(storagePath, {

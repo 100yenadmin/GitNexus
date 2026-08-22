@@ -57,7 +57,11 @@ import { UPLOAD_ROOT } from './upload-paths.js';
 import { sweepStaleUploads } from './upload-sweep.js';
 import { isRfc1918PrivateIpv4 } from './private-ip.js';
 import { logger, flushLoggerSync } from '../core/logger.js';
-import { resolveDurableEmbeddingIdentity } from '../core/embeddings/embedding-identity.js';
+import {
+  assertIncrementalEmbeddingIdentity,
+  resolveDurableEmbeddingIdentity,
+  type EmbeddingIdentity,
+} from '../core/embeddings/embedding-identity.js';
 
 const _require = createRequire(import.meta.url);
 const pkg = _require('../../package.json');
@@ -1802,6 +1806,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                 await import('../core/lbug/lbug-adapter.js');
               const embeddingIdentity = getActiveEmbeddingIdentity();
               let generatedEmbeddingIdentity: typeof embeddingIdentity | undefined;
+              let verifiedCompletedCheckpointIdentity: EmbeddingIdentity | undefined;
               let embeddingMeta = await loadMeta(entry.storagePath);
               if (!embeddingMeta) {
                 throw new Error('Repository metadata is missing; run gitnexus analyze first');
@@ -1848,8 +1853,21 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                       'Cannot resume embedding checkpoint: its durable identity no longer matches the live table.',
                     );
                   }
+                  if (priorCheckpoint.provider !== undefined) {
+                    verifiedCompletedCheckpointIdentity = {
+                      provider: priorCheckpoint.provider,
+                      model: priorCheckpoint.model,
+                      dimensions: priorCheckpoint.dimensions,
+                    };
+                  }
                 }
               }
+              const survivingIntegrity = await inspectEmbeddingIntegrity();
+              assertIncrementalEmbeddingIdentity(
+                survivingIntegrity.physicalRows,
+                verifiedCompletedCheckpointIdentity ?? embeddingMeta.embeddingIdentity,
+                embeddingIdentity,
+              );
               const forceReembedNodeIds = new Set(priorCheckpoint?.pendingNodeIds ?? []);
               const saveEmbeddingCheckpoint = async (
                 checkpoint: {
@@ -1950,7 +1968,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                 embeddingIdentity: resolveDurableEmbeddingIdentity(
                   terminalIntegrity.validRows,
                   generatedEmbeddingIdentity,
-                  embeddingMeta.embeddingIdentity,
+                  verifiedCompletedCheckpointIdentity ?? embeddingMeta.embeddingIdentity,
                 ),
               };
               await saveMeta(entry.storagePath, embeddingMeta);

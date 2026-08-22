@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  assertIncrementalEmbeddingIdentity,
   httpEmbeddingProvider,
   resolveDurableEmbeddingIdentity,
   type EmbeddingIdentity,
@@ -33,12 +34,29 @@ describe('durable embedding identity', () => {
     expect(resolveDurableEmbeddingIdentity(3, undefined, undefined)).toBeUndefined();
   });
 
-  it('fingerprints equivalent safe endpoint identities without secrets', () => {
-    const withSecrets = httpEmbeddingProvider(
-      'https://user:secret@example.com/v1/?token=query#fragment',
+  it('permits matching retained identity and refuses unknown or mismatched space', () => {
+    expect(() => assertIncrementalEmbeddingIdentity(3, local, local)).not.toThrow();
+    expect(() => assertIncrementalEmbeddingIdentity(3, undefined, local)).toThrow(
+      /durable identity/i,
     );
+    expect(() => assertIncrementalEmbeddingIdentity(3, local, remote)).toThrow(
+      /identity mismatch/i,
+    );
+  });
+
+  it('fingerprints equivalent safe endpoint identities without secrets', () => {
+    const withSecrets = httpEmbeddingProvider('https://user:secret@example.com/v1/#fragment');
     expect(withSecrets).toBe(httpEmbeddingProvider('https://example.com/v1'));
-    expect(withSecrets).not.toMatch(/secret|query|fragment/u);
+    expect(withSecrets).not.toMatch(/secret|fragment/u);
     expect(withSecrets).not.toBe(httpEmbeddingProvider('https://example.com/v2'));
+  });
+
+  it('rejects query-routed endpoints as unverifiable', () => {
+    expect(() => httpEmbeddingProvider('https://example.com/v1?deployment=one')).toThrow(
+      /query routing is unverifiable/i,
+    );
+    expect(() => httpEmbeddingProvider('https://example.com/v1?deployment=two')).toThrow(
+      /query routing is unverifiable/i,
+    );
   });
 });
