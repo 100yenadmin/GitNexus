@@ -58,6 +58,7 @@ const completedCheckpoint = {
   nodesProcessed: 5,
   totalNodes: 5,
   chunksProcessed: 6,
+  provider: 'local',
   model: 'Snowflake/snowflake-arctic-embed-xs',
   dimensions: 384,
 } as const;
