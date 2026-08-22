@@ -268,7 +268,7 @@ describe('doctor --registry read-only report (#133)', () => {
     expect(drifted.entries[0]?.health).toMatchObject({
       state: 'degraded',
       freshness: 'drifted',
-      reasons: ['freshness-drift'],
+      reasons: ['freshness-drifted'],
     });
 
     const unknown = await buildRegistryDoctorReport({
