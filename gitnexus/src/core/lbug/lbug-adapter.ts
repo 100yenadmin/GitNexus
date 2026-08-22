@@ -1834,8 +1834,7 @@ interface EmbeddingPreservationObservation {
   finite: boolean;
 }
 
-export type EmbeddingPreservationRow = CachedEmbedding &
-  Pick<EmbeddingPreservationObservation, 'id' | 'dimensions' | 'finite'>;
+export type EmbeddingPreservationRow = CachedEmbedding & { id: string };
 
 export interface EmbeddingPreservationScanOptions {
   onBatch?: (batch: readonly EmbeddingPreservationRow[]) => void | Promise<void>;
@@ -1851,7 +1850,6 @@ export interface EmbeddingPreservationScan {
   missingOwnerLabels: string[];
 }
 
-/** Locked two-pass scan: classify metadata first, then emit bounded vector batches. */
 export const scanEmbeddingPreservationRows = async (
   options: EmbeddingPreservationScanOptions = {},
 ): Promise<EmbeddingPreservationScan> => {
@@ -1927,14 +1925,14 @@ export const scanEmbeddingPreservationRows = async (
           const vector = row.embedding ?? row[5];
           const values =
             Array.isArray(vector) || ArrayBuffer.isView(vector)
-              ? Array.from(vector as ArrayLike<unknown>, Number)
+              ? Array.from(vector as ArrayLike<unknown>)
               : [];
           const observation: EmbeddingPreservationObservation = {
             id,
             nodeId,
             chunkIndex,
             dimensions: values.length,
-            finite: values.every(Number.isFinite),
+            finite: values.every((value) => typeof value === 'number' && Number.isFinite(value)),
           };
           observations.push(observation);
           physicalRows++;
@@ -1978,14 +1976,21 @@ export const scanEmbeddingPreservationRows = async (
 
     const liveOwners = new Map<string, Set<string>>();
     const missingOwnerLabels = new Set<string>();
-    for (const label of ownerIdsByLabel.keys()) {
+    for (const [label, candidates] of ownerIdsByLabel) {
       const ids = new Set<string>();
       liveOwners.set(label, ids);
       try {
-        await readRows(`MATCH (n:${escapeTableName(label)}) RETURN n.id AS id`, (row) => {
-          const id = String(row.id ?? row[0] ?? '');
-          if (id) ids.add(id);
-        });
+        const sorted = [...candidates].sort();
+        for (let offset = 0; offset < sorted.length; offset += 256) {
+          const literal = sorted
+            .slice(offset, offset + 256)
+            .map((id) => `'${escapeCypherString(id)}'`)
+            .join(', ');
+          await readRows(
+            `MATCH (n:${escapeTableName(label)}) WHERE n.id IN [${literal}] RETURN n.id AS id`,
+            (row) => void ids.add(String(row.id ?? row[0] ?? '')),
+          );
+        }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         if (!isMissingColumnOrTableError(message)) throw error;
@@ -2040,7 +2045,7 @@ export const scanEmbeddingPreservationRows = async (
         acceptedIds.add(row.id);
     }
 
-    const pending: EmbeddingPreservationRow[] = [];
+    let pending: EmbeddingPreservationRow[] = [];
     let acceptedRows = 0;
     const hashProjection = hasContentHash ? ', e.contentHash AS contentHash' : '';
     await readRows(
@@ -2053,7 +2058,7 @@ export const scanEmbeddingPreservationRows = async (
         const vector = row.embedding ?? row[5];
         const embedding =
           Array.isArray(vector) || ArrayBuffer.isView(vector)
-            ? Array.from(vector as ArrayLike<unknown>, Number)
+            ? Array.from(vector as ArrayLike<number>)
             : [];
         const hash = hasContentHash ? (row.contentHash ?? row[6]) : undefined;
         pending.push({
@@ -2062,15 +2067,13 @@ export const scanEmbeddingPreservationRows = async (
           chunkIndex: Number(row.chunkIndex ?? row[2]),
           startLine: Number(row.startLine ?? row[3] ?? 0),
           endLine: Number(row.endLine ?? row[4] ?? 0),
-          dimensions: embedding.length,
-          finite: embedding.every(Number.isFinite),
           embedding,
           ...(hash === null || hash === undefined ? {} : { contentHash: String(hash) }),
         });
         acceptedRows++;
         if (pending.length === batchSize) {
           await options.onBatch?.(pending);
-          pending.length = 0;
+          pending = [];
         }
       },
     );

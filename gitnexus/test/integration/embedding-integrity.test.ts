@@ -185,15 +185,13 @@ withTestLbugDB(
       const snapshot = () =>
         adapter.executeQuery('MATCH (e:CodeEmbedding) RETURN e ORDER BY e.rowKey');
       const before = await snapshot();
-      const scans: string[][][] = [];
+      const retained: Array<readonly { id: string }[]> = [];
       let firstReport: Awaited<ReturnType<typeof adapter.scanEmbeddingPreservationRows>>;
       markWalDriverActive(true);
       try {
-        const batches: string[][] = [];
         firstReport = await adapter.scanEmbeddingPreservationRows({
-          onBatch: (batch) => batches.push(batch.map((row) => row.id)),
+          onBatch: (batch) => retained.push(batch),
         });
-        scans.push(batches);
       } finally {
         markWalDriverActive(false);
       }
@@ -204,15 +202,13 @@ withTestLbugDB(
           secondBatches.push(batch.map((row) => row.id));
         },
       });
-      scans.push(secondBatches);
+      const scans = [retained.map((batch) => batch.map((row) => row.id)), secondBatches];
       const after = await snapshot();
 
-      expect([firstReport, secondReport]).toEqual([
-        expect.objectContaining({ physicalRows: 264, acceptedRows: 257, rejectedRows: 7 }),
-        expect.objectContaining({ physicalRows: 264, acceptedRows: 257, rejectedRows: 7 }),
-      ]);
+      expect(firstReport).toMatchObject({ physicalRows: 265, acceptedRows: 257, rejectedRows: 8 });
+      expect(secondReport).toEqual(firstReport);
       expect(firstReport.implicatedOwnerIds.join(',')).toBe(
-        'Function:bad,Function:cross,Function:dup-a,Function:dup-b,Function:semantic,Trait:legacy',
+        'Function:bad,Function:cross,Function:dup-a,Function:dup-b,Function:null,Function:semantic,Trait:legacy',
       );
       expect(firstReport.missingOwnerLabels).toEqual(['Trait']);
       expect(scans[0]?.map((batch) => batch.length)).toEqual([256, 1]);
@@ -223,7 +219,7 @@ withTestLbugDB(
   },
   {
     seed: [
-      "CREATE (:Function {id: 'Function:bulk'}), (:Function {id: 'Function:bad'}), (:Function {id: 'Function:dup-a'}), (:Function {id: 'Function:dup-b'}), (:Function {id: 'Function:semantic'}), (:Class {id: 'Function:cross'}), (:Trait {id: 'Trait:legacy'})",
+      "CREATE (:Function {id: 'Function:bad'}), (:Function {id: 'Function:dup-a'}), (:Function {id: 'Function:dup-b'}), (:Function {id: 'Function:null'}), (:Function {id: 'Function:semantic'}), (:Class {id: 'Function:cross'}), (:Trait {id: 'Trait:legacy'})",
     ],
     beforeFTS: async () => {
       const adapter = await import('../../src/core/lbug/lbug-adapter.js');
@@ -234,26 +230,31 @@ withTestLbugDB(
         'CREATE NODE TABLE CodeEmbedding (rowKey STRING PRIMARY KEY, id STRING, nodeId STRING, chunkIndex INT64, startLine INT64, endLine INT64, embedding FLOAT[])',
       );
       const vector = new Array(EMBEDDING_DIMS).fill(0.25);
+      await adapter.executeWithReusedStatement(
+        'CREATE (:Function {id: $id})',
+        Array.from({ length: 1_281 }, (_, index) => ({
+          id: `Function:${index < 257 ? 'bulk' : 'unused'}-${index}`,
+        })),
+      );
       const row = (id: string, nodeId: string, chunkIndex: number, embedding = vector) => ({
         rowKey: `${id}-${nodeId}`,
         id,
         nodeId,
         chunkIndex,
-        startLine: chunkIndex + 1,
-        endLine: chunkIndex + 2,
         embedding,
       });
       await adapter.executeWithReusedStatement(
-        'CREATE (e:CodeEmbedding {rowKey: $rowKey, id: $id, nodeId: $nodeId, chunkIndex: $chunkIndex, startLine: $startLine, endLine: $endLine, embedding: $embedding})',
+        'CREATE (e:CodeEmbedding {rowKey: $rowKey, id: $id, nodeId: $nodeId, chunkIndex: $chunkIndex, startLine: 1, endLine: 2, embedding: $embedding})',
         [
           ...Array.from({ length: 257 }, (_, index) =>
-            row(`Function:bulk:${index}`, 'Function:bulk', index),
+            row(`Function:bulk-${index}:0`, `Function:bulk-${index}`, 0),
           ),
           row('Function:bad:0', 'Function:bad', 0, [Infinity, ...vector.slice(1)]),
           row('shared', 'Function:dup-a', 0),
           row('shared', 'Function:dup-b', 0),
           row('Function:semantic:0', 'Function:semantic', 0),
           row('other', 'Function:semantic', 0),
+          row('Function:null:0', 'Function:null', 0, [null, ...vector.slice(1)] as number[]),
           row('Function:cross:0', 'Function:cross', 0),
           row('Trait:legacy:0', 'Trait:legacy', 0),
         ],
