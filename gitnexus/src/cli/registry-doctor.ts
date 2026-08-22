@@ -323,6 +323,7 @@ export const probeRegistryDatabaseCounts: RegistryDatabaseProbe = async (lbugPat
       if (lbugConfig.classifyDeleteAllError(error) !== 'benign-missing-table') throw error;
     }
     let embeddings = 0;
+    let embeddingTablePresent = true;
     try {
       embeddings = await queryCount(
         connection,
@@ -330,9 +331,11 @@ export const probeRegistryDatabaseCounts: RegistryDatabaseProbe = async (lbugPat
       );
     } catch (error) {
       if (lbugConfig.classifyDeleteAllError(error) !== 'benign-missing-table') throw error;
+      embeddingTablePresent = false;
     }
-    const expectedDimensions = await adapter.getStoredEmbeddingDimensions();
-    const report = await adapter.inspectEmbeddingIntegrity(expectedDimensions);
+    const report = embeddingTablePresent
+      ? await adapter.inspectEmbeddingIntegrity(await adapter.getStoredEmbeddingDimensions())
+      : await adapter.inspectEmbeddingIntegrity();
     const malformed =
       adapter.embeddingIntegrityFailures(report) > 0 || report.physicalRows !== report.validRows;
     return {

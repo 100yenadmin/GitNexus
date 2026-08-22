@@ -566,6 +566,19 @@ describe('doctor --registry read-only report (#133)', () => {
     });
     expect(await snapshotFiles(fixture.dbPath)).toEqual(before);
 
+    await adapter.initLbug(lbugPath);
+    try {
+      await adapter.executeQuery('DROP TABLE CodeEmbedding');
+    } finally {
+      await adapter.closeLbug();
+    }
+    const withoutEmbeddings = await snapshotFiles(fixture.dbPath);
+    await expect(probeRegistryDatabaseCounts(lbugPath)).resolves.toMatchObject({
+      embeddings: 0,
+      integrity: { status: 'clean', tablePresent: false, physicalRows: 0, validRows: 0 },
+    });
+    expect(await snapshotFiles(fixture.dbPath)).toEqual(withoutEmbeddings);
+
     await fs.writeFile(`${lbugPath}.wal`, 'unmatched wal');
     const withWal = await snapshotFiles(fixture.dbPath);
     await expect(probeRegistryDatabaseCounts(lbugPath)).rejects.toThrow(/sidecar state/i);
