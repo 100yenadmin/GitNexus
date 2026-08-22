@@ -1826,13 +1826,34 @@ export interface EmbeddingIntegrityReport {
   recoverableIdentitySha256: string;
 }
 
+const MAX_STORED_EMBEDDING_DIMENSIONS = 65_536;
+
+/** Read the vector width declared by this database's embedding table. */
+export const getStoredEmbeddingDimensions = async (): Promise<number> => {
+  const c = conn;
+  if (!c) throw new Error('LadybugDB not initialized. Call initLbug first.');
+  const rows = await withConnLock(async () =>
+    readQueryRows(await c.query(`CALL TABLE_INFO('${EMBEDDING_TABLE_NAME}') RETURN *`)),
+  );
+  const embedding = rows.find((row) => row.name === 'embedding');
+  const match =
+    typeof embedding?.type === 'string' && /^FLOAT\[([1-9][0-9]*)\]$/.exec(embedding.type);
+  const dimensions = match ? Number(match[1]) : NaN;
+  if (!Number.isSafeInteger(dimensions) || dimensions > MAX_STORED_EMBEDDING_DIMENSIONS) {
+    throw new Error('Stored embedding dimension is unavailable or invalid.');
+  }
+  return dimensions;
+};
+
 /**
  * Scan embedding identity without materializing vectors. This deliberately uses
  * streamed projections instead of primary-key equality: corrupted LadybugDB
  * artifacts can expose blank keys during a scan while `WHERE e.id = ''`
  * incorrectly reports zero matches.
  */
-export const inspectEmbeddingIntegrity = async (): Promise<EmbeddingIntegrityReport> => {
+export const inspectEmbeddingIntegrity = async (
+  expectedDimensions: number = EMBEDDING_DIMS,
+): Promise<EmbeddingIntegrityReport> => {
   const c = conn;
   if (!c) throw new Error('LadybugDB not initialized. Call initLbug first.');
 
@@ -1903,7 +1924,7 @@ export const inspectEmbeddingIntegrity = async (): Promise<EmbeddingIntegrityRep
             else seenSemantic.add(semanticKey);
             ownerCandidates.add(nodeId);
           }
-          if (dimensions !== EMBEDDING_DIMS) wrongDimensionRows++;
+          if (dimensions !== expectedDimensions) wrongDimensionRows++;
           rows.push({ id, nodeId, chunkIndex, dimensions, semanticKey });
         },
       );
@@ -1948,14 +1969,14 @@ export const inspectEmbeddingIntegrity = async (): Promise<EmbeddingIntegrityRep
       const chunkInvalid = !Number.isSafeInteger(row.chunkIndex) || row.chunkIndex < 0;
       const ownerMissing = !nodeIdEmpty && ownerCandidates.has(row.nodeId);
       if (ownerMissing) orphanRows++;
-      if (!nodeIdEmpty && !chunkInvalid && row.dimensions === EMBEDDING_DIMS && !ownerMissing) {
+      if (!nodeIdEmpty && !chunkInvalid && row.dimensions === expectedDimensions && !ownerMissing) {
         recoverable.add(row.semanticKey);
       }
       if (
         !idEmpty &&
         !nodeIdEmpty &&
         !chunkInvalid &&
-        row.dimensions === EMBEDDING_DIMS &&
+        row.dimensions === expectedDimensions &&
         !ownerMissing &&
         row.id === `${row.nodeId}:${row.chunkIndex}` &&
         !validIds.has(row.id) &&

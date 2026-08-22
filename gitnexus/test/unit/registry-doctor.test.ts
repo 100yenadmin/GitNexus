@@ -248,9 +248,11 @@ describe('doctor --registry read-only report (#133)', () => {
       metaPath,
       JSON.stringify({
         ...meta,
+        lastCommit: '',
         embeddingCheckpoint: { physicalRows: 3 },
       }),
     );
+    indexed.entry.lastCommit = '';
 
     const report = await buildRegistryDoctorReport({
       entries: [indexed.entry],
@@ -263,7 +265,11 @@ describe('doctor --registry read-only report (#133)', () => {
     });
 
     expect(report.entries[0]?.database.integrity?.status).toBe('clean');
-    expect(report.entries[0]?.health.state).toBe('healthy');
+    expect(report.entries[0]?.health).toMatchObject({
+      state: 'degraded',
+      freshness: 'current',
+      reasons: ['embedding-checkpoint-present'],
+    });
   });
 
   it('does not open a database when WAL recovery state is present', async () => {
@@ -422,6 +428,7 @@ describe('doctor --registry read-only report (#133)', () => {
       vectorSearch: 'vector-index',
       vectorSearchReason: null,
     });
+    expect(report.entries[0]?.health.reasons).toContain('fts-unavailable');
   });
 
   it('does not claim vector-index when the live named-index probe fails', async () => {
@@ -455,6 +462,7 @@ describe('doctor --registry read-only report (#133)', () => {
       vectorSearch: 'unavailable',
       vectorSearchReason: 'vector-index-missing-or-unqueryable',
     });
+    expect(report.entries[0]?.health.reasons).toContain('vector-index-unavailable');
   });
 
   it('reports a readable zero-embedding database as not-indexed', async () => {
@@ -522,6 +530,9 @@ describe('doctor --registry read-only report (#133)', () => {
       vectorSearch: null,
       vectorSearchReason: 'pool-probe-unavailable',
     });
+    expect(report.entries[0]?.health.reasons).toEqual(
+      expect.arrayContaining(['capabilities-unavailable', 'graph-unavailable', 'fts-unavailable']),
+    );
     expect(JSON.stringify(report)).not.toContain(indexed.lbugPath);
   });
 
@@ -571,5 +582,10 @@ describe('doctor --registry read-only report (#133)', () => {
       integrity: { status: 'clean', physicalRows: 0, validRows: 0 },
     });
     expect(await snapshotFiles(fixture.dbPath)).toEqual(before);
+
+    await fs.writeFile(`${lbugPath}.wal`, 'unmatched wal');
+    const withWal = await snapshotFiles(fixture.dbPath);
+    await expect(probeRegistryDatabaseCounts(lbugPath)).rejects.toThrow(/sidecar state/i);
+    expect(await snapshotFiles(fixture.dbPath)).toEqual(withWal);
   });
 });

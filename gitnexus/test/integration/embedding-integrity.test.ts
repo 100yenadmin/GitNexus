@@ -61,6 +61,11 @@ withTestLbugDB(
         orphanRows: 1,
         wrongDimensionRows: 0,
       });
+      await expect(adapter.inspectEmbeddingIntegrity(EMBEDDING_DIMS + 1)).resolves.toMatchObject({
+        validRows: 0,
+        recoverableRows: 0,
+        wrongDimensionRows: 5,
+      });
     });
 
     it('refuses HNSW creation for the malformed table', async () => {

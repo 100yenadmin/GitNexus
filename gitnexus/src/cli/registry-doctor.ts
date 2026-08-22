@@ -294,18 +294,19 @@ const queryCount = async (connection: QueryConnectionLike, cypher: string): Prom
 
 /** Open a clean index in LadybugDB's read-only mode and issue count queries. */
 export const probeRegistryDatabaseCounts: RegistryDatabaseProbe = async (lbugPath) => {
-  const [{ default: lbug }, lbugConfig, schema] = await Promise.all([
-    import('@ladybugdb/core'),
+  const [adapter, lbugConfig, schema] = await Promise.all([
+    import('../core/lbug/lbug-adapter.js'),
     import('../core/lbug/lbug-config.js'),
     import('../core/lbug/schema.js'),
   ]);
-  const handle = await lbugConfig.openLbugConnection(lbug, lbugPath, {
-    readOnly: true,
-    throwOnWalReplayFailure: true,
-  });
-  const connection = handle.conn as unknown as QueryConnectionLike;
+  await adapter.initLbugReadOnlyNonRecovering(lbugPath);
+  const connection: QueryConnectionLike = {
+    query: async (cypher) => ({
+      getAll: async () => adapter.executeQuery(cypher),
+      close: () => {},
+    }),
+  };
   const tableName = (name: string): string => `\`${name.replace(/`/g, '``')}\``;
-  let counts: Omit<RegistryDatabaseCounts, 'integrity'>;
   try {
     let nodes = 0;
     for (const table of schema.NODE_TABLES) {
@@ -336,19 +337,16 @@ export const probeRegistryDatabaseCounts: RegistryDatabaseProbe = async (lbugPat
     } catch (error) {
       if (lbugConfig.classifyDeleteAllError(error) !== 'benign-missing-table') throw error;
     }
-    counts = { nodes, edges, embeddings };
-  } finally {
-    await lbugConfig.closeLbugConnection(handle);
-  }
-
-  const adapter = await import('../core/lbug/lbug-adapter.js');
-  try {
-    const report = await adapter.withLbugDb(lbugPath, adapter.inspectEmbeddingIntegrity, {
-      readOnly: true,
-    });
+    const expectedDimensions = await adapter.getStoredEmbeddingDimensions();
+    const report = await adapter.inspectEmbeddingIntegrity(expectedDimensions);
     const malformed =
       adapter.embeddingIntegrityFailures(report) > 0 || report.physicalRows !== report.validRows;
-    return { ...counts, integrity: { status: malformed ? 'malformed' : 'clean', ...report } };
+    return {
+      nodes,
+      edges,
+      embeddings,
+      integrity: { status: malformed ? 'malformed' : 'clean', ...report },
+    };
   } finally {
     await adapter.closeLbug();
   }
@@ -445,12 +443,14 @@ const withHealth = (
   report: Omit<RegistryEntryDoctorReport, 'health'>,
   registryCommit: string,
   metadataCommit?: string,
+  checkpointPresent: boolean = false,
 ): RegistryEntryDoctorReport => {
-  const freshness = !metadataCommit
-    ? 'unknown'
-    : metadataCommit === registryCommit
-      ? 'current'
-      : 'drifted';
+  const freshness =
+    metadataCommit === undefined
+      ? 'unknown'
+      : metadataCommit === registryCommit
+        ? 'current'
+        : 'drifted';
   const count_alignment =
     report.countComparison.status === 'match'
       ? 'aligned'
@@ -462,17 +462,24 @@ const withHealth = (
   const reasons: string[] = [];
   if (report.storage.status === 'unsafe') reasons.push('unsafe-storage');
   if (integrity !== 'clean') reasons.push(`embedding-identity-${integrity}`);
+  if (checkpointPresent) reasons.push('embedding-checkpoint-present');
   if (freshness !== 'current') reasons.push(`freshness-${freshness}`);
   if (count_alignment !== 'aligned') reasons.push(`count-alignment-${count_alignment}`);
   const embeddings = report.database.status === 'available' ? report.database.counts.embeddings : 0;
+  if (report.capabilities.source !== 'active-probe') reasons.push('capabilities-unavailable');
+  if (report.capabilities.graph !== 'available') reasons.push('graph-unavailable');
+  if (report.capabilities.fts !== 'available') reasons.push('fts-unavailable');
   if (embeddings > 0 && report.capabilities.vectorSearch !== 'vector-index') {
-    reasons.push('semantic-index-unavailable');
+    reasons.push('vector-index-unavailable');
   }
   const semantic_ready =
     embeddings > 0 &&
     integrity === 'clean' &&
     freshness === 'current' &&
     count_alignment === 'aligned' &&
+    report.capabilities.source === 'active-probe' &&
+    report.capabilities.graph === 'available' &&
+    report.capabilities.fts === 'available' &&
     report.capabilities.vectorSearch === 'vector-index';
   const quarantined = report.storage.status === 'unsafe' || integrity === 'malformed';
   return {
@@ -628,6 +635,7 @@ const inspectEntry = async (
     },
     entry.lastCommit,
     meta?.lastCommit,
+    meta?.embeddingCheckpoint !== undefined,
   );
 };
 
