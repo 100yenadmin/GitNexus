@@ -307,6 +307,9 @@ export const doctorCommand = async (
       console.log(JSON.stringify(report, null, 2));
     } else {
       console.log('GitNexus registry doctor (read-only)');
+      if (report.registryRead.status === 'failed') {
+        console.log(`  registry read:           failed (${report.registryRead.reason})`);
+      }
       console.log(`  entries:                 ${report.summary.entries}`);
       console.log(`  remote identities:       ${report.summary.remoteIdentities}`);
       console.log(`  local-only entries:      ${report.summary.localOnlyEntries}`);
@@ -337,7 +340,12 @@ export const doctorCommand = async (
         console.log('  paths:                   hidden (use --show-paths to reveal)');
       }
     }
-    if (report.entries.some((entry) => entry.health.state !== 'healthy')) process.exitCode = 1;
+    if (
+      report.registryRead.status === 'failed' ||
+      report.entries.some((entry) => entry.health.state !== 'healthy')
+    ) {
+      process.exitCode = 1;
+    }
     return;
   }
 

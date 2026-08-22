@@ -958,6 +958,38 @@ export const getGlobalRegistryPath = (): string => {
   return path.join(getGlobalDir(), 'registry.json');
 };
 
+export type RegistryReadFailure = 'unreadable' | 'malformed' | 'not-array';
+
+export type RegistryReadResult =
+  | { status: 'available'; entries: RegistryEntry[] }
+  | { status: 'failed'; reason: RegistryReadFailure };
+
+/**
+ * Read the global registry while preserving failures for read-only diagnostics.
+ * The long-standing readRegistry() helper intentionally remains fail-open for
+ * callers that use an absent registry as an empty one; Doctor needs this strict
+ * result so corruption or permission loss cannot look like a healthy empty
+ * registry.
+ */
+export const readRegistryStrict = async (): Promise<RegistryReadResult> => {
+  let raw: string;
+  try {
+    raw = await fs.readFile(getGlobalRegistryPath(), 'utf-8');
+  } catch {
+    return { status: 'failed', reason: 'unreadable' };
+  }
+
+  let data: unknown;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    return { status: 'failed', reason: 'malformed' };
+  }
+  return Array.isArray(data)
+    ? { status: 'available', entries: data as RegistryEntry[] }
+    : { status: 'failed', reason: 'not-array' };
+};
+
 /**
  * Read the global registry. Returns empty array if not found.
  */

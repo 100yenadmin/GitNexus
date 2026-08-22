@@ -150,4 +150,54 @@ describe('read-only doctor CLI modes (#127, #133)', () => {
     });
     expect(shown.stdout).toContain(secretPath);
   });
+
+  it.each([
+    ['malformed', '{', 'malformed'],
+    ['non-array', '{}', 'not-array'],
+  ] as const)('fails closed for a %s registry', async (_label, contents, reason) => {
+    await fs.writeFile(path.join(home.dbPath, 'registry.json'), contents);
+
+    const result = runDoctor(['--registry', '--json']);
+
+    expect(result.status).toBe(1);
+    expect(JSON.parse(result.stdout)).toMatchObject({
+      mode: 'registry',
+      readOnly: true,
+      registryRead: { status: 'failed', reason },
+      summary: { entries: 0 },
+    });
+    expect(`${result.stdout}${result.stderr}`).not.toContain(home.dbPath);
+    expect(`${result.stdout}${result.stderr}`).not.toContain(contents);
+  });
+
+  it('fails closed for an unreadable registry and distinguishes a valid empty one', async () => {
+    await fs.mkdir(path.join(home.dbPath, 'registry.json'));
+    const unreadable = runDoctor(['--registry', '--json']);
+    expect(unreadable.status).toBe(1);
+    expect(JSON.parse(unreadable.stdout)).toMatchObject({
+      registryRead: { status: 'failed', reason: 'unreadable' },
+      summary: { entries: 0 },
+    });
+    expect(`${unreadable.stdout}${unreadable.stderr}`).not.toContain(home.dbPath);
+
+    const emptyHome = await createTempDir();
+    try {
+      await fs.writeFile(path.join(emptyHome.dbPath, 'registry.json'), '[]');
+      const empty = spawnSync(
+        process.execPath,
+        [...CLI_SPAWN_PREFIX, 'doctor', '--registry', '--json'],
+        {
+          encoding: 'utf8',
+          env: { ...process.env, GITNEXUS_HOME: emptyHome.dbPath },
+        },
+      );
+      expect(empty.status).toBe(0);
+      expect(JSON.parse(empty.stdout)).toMatchObject({
+        registryRead: { status: 'available' },
+        summary: { entries: 0 },
+      });
+    } finally {
+      await emptyHome.cleanup();
+    }
+  });
 });

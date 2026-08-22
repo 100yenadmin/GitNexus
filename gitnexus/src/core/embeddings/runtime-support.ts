@@ -17,7 +17,78 @@
  * (The runtime-install import below only resolves paths — it never loads the
  * embedding stack.)
  */
-import { resolveEmbeddingRuntime } from './runtime-install.js';
+import { isPrefixRuntimeLoadable, resolveEmbeddingRuntime } from './runtime-install.js';
+
+export type QueryEmbeddingRuntimeStatus = {
+  available: boolean;
+  mode: 'http' | 'local';
+  reason:
+    | 'http-config-incomplete'
+    | 'http-config-invalid'
+    | 'local-runtime-unavailable'
+    | 'local-runtime-unloadable'
+    | null;
+};
+
+const validHttpInteger = (name: string, max: number, allowZero: boolean): boolean => {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return true;
+  if (!/^\d+$/.test(raw)) return false;
+  const parsed = Number(raw);
+  return Number.isSafeInteger(parsed) && parsed <= max && (allowZero ? parsed >= 0 : parsed > 0);
+};
+
+/**
+ * Provider-free readiness for the query embedding path. This only validates
+ * local module resolution/platform gates or the shape of an installed HTTP
+ * wrapper configuration; it never imports a model, opens a socket, or stores
+ * an endpoint, model, or secret in the returned status.
+ */
+export const getQueryEmbeddingRuntimeStatus = (): QueryEmbeddingRuntimeStatus => {
+  const configuredUrl = process.env.GITNEXUS_EMBEDDING_URL?.trim();
+  const configuredModel = process.env.GITNEXUS_EMBEDDING_MODEL?.trim();
+  if (configuredUrl || configuredModel) {
+    if (!configuredUrl || !configuredModel) {
+      return { available: false, mode: 'http', reason: 'http-config-incomplete' };
+    }
+    try {
+      const endpoint = new URL(configuredUrl);
+      if (
+        (endpoint.protocol !== 'http:' && endpoint.protocol !== 'https:') ||
+        endpoint.username !== '' ||
+        endpoint.password !== ''
+      ) {
+        return { available: false, mode: 'http', reason: 'http-config-invalid' };
+      }
+    } catch {
+      return { available: false, mode: 'http', reason: 'http-config-invalid' };
+    }
+    if (!validHttpInteger('GITNEXUS_EMBEDDING_DIMS', Number.MAX_SAFE_INTEGER, false)) {
+      return { available: false, mode: 'http', reason: 'http-config-invalid' };
+    }
+    if (!validHttpInteger('GITNEXUS_EMBEDDING_MAX_ATTEMPTS', 20, false)) {
+      return { available: false, mode: 'http', reason: 'http-config-invalid' };
+    }
+    if (!validHttpInteger('GITNEXUS_EMBEDDING_RETRY_CAP_MS', 300_000, false)) {
+      return { available: false, mode: 'http', reason: 'http-config-invalid' };
+    }
+    if (!validHttpInteger('GITNEXUS_EMBEDDING_MIN_INTERVAL_MS', 300_000, true)) {
+      return { available: false, mode: 'http', reason: 'http-config-invalid' };
+    }
+    return { available: true, mode: 'http', reason: null };
+  }
+
+  const blocker = getLocalEmbeddingRuntimeBlocker();
+  if (blocker) return { available: false, mode: 'local', reason: 'local-runtime-unavailable' };
+  const resolution = resolveEmbeddingRuntime();
+  if (resolution === null) {
+    return { available: false, mode: 'local', reason: 'local-runtime-unavailable' };
+  }
+  if (resolution.source === 'runtime-prefix' && !isPrefixRuntimeLoadable()) {
+    return { available: false, mode: 'local', reason: 'local-runtime-unloadable' };
+  }
+  return { available: true, mode: 'local', reason: null };
+};
 
 /**
  * Stable lead line of the macOS-Intel blocker message. Also used to recognise
