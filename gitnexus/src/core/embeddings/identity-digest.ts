@@ -55,10 +55,10 @@ export const embeddingPhysicalVectorInfo = (vector: unknown): EmbeddingPhysicalV
     finite = 'finite';
   } else if (ArrayBuffer.isView(vector)) {
     kind = vector.constructor?.name ?? 'typed-array';
-    const length = (vector as ArrayLike<unknown>).length;
+    const length = (vector as unknown as ArrayLike<unknown>).length;
     const validLength = Number.isSafeInteger(length) && length >= 0;
     dimensions = validLength ? length : 0;
-    values = validLength ? (vector as ArrayLike<unknown>) : undefined;
+    values = validLength ? (vector as unknown as ArrayLike<unknown>) : undefined;
     finite = validLength ? 'finite' : 'malformed';
   } else if (vector !== null && vector !== undefined) {
     kind = typeof vector;
