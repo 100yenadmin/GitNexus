@@ -316,10 +316,28 @@ export const doctorCommand = async (
       console.log(`  recovery states:         ${report.summary.recoveryStateEntries}`);
       console.log(`  database locks:          ${report.summary.lockedEntries}`);
       console.log(`  unsafe storage entries:  ${report.summary.unsafeStorageEntries}`);
+      for (const state of ['healthy', 'degraded', 'quarantined'] as const) {
+        console.log(
+          `  health ${state}:`.padEnd(29) +
+            report.entries.filter((entry) => entry.health.state === state).length,
+        );
+      }
+      const reasonCounts = new Map<string, number>();
+      for (const entry of report.entries) {
+        for (const reason of entry.health.reasons) {
+          reasonCounts.set(reason, (reasonCounts.get(reason) ?? 0) + 1);
+        }
+      }
+      for (const [reason, count] of [...reasonCounts].sort(([left], [right]) =>
+        left.localeCompare(right),
+      )) {
+        console.log(`  health reason ${reason}: ${count}`);
+      }
       if (!options.showPaths) {
         console.log('  paths:                   hidden (use --show-paths to reveal)');
       }
     }
+    if (report.entries.some((entry) => entry.health.state !== 'healthy')) process.exitCode = 1;
     return;
   }
 

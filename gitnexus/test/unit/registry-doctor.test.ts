@@ -197,6 +197,11 @@ describe('doctor --registry read-only report (#133)', () => {
       registryVsDatabase: ['nodes'],
     });
     expect(report.entries[0]?.countComparison.status).toBe('match');
+    expect(report.entries[0]?.health.state).toBe('quarantined');
+    expect(report.entries[1]?.health.state).toBe('quarantined');
+    expect(report.entries[0]?.health.reasons).toEqual(
+      expect.arrayContaining(['remote-collision', 'alias-collision']),
+    );
     expect(report.entries[2]?.identity).toEqual({ kind: 'local-path' });
     expect(report.entries[2]?.name).toBe('<path-like-alias>');
     expect(report.entries[0]?.capabilities.source).toBe('active-probe');
@@ -224,6 +229,82 @@ describe('doctor --registry read-only report (#133)', () => {
     expect(withPaths.entries[0]?.path).toBe(alpha.entry.path);
     expect(JSON.stringify(withPaths)).toContain(fixture.dbPath);
     expect(await snapshotFiles(fixture.dbPath)).toEqual(before);
+  });
+
+  it('reports exact commit identities and deterministic freshness states', async () => {
+    const indexed = await createEntry(
+      fixture.dbPath,
+      'head-states',
+      'HeadStates',
+      'https://github.com/owner/head-states.git',
+      { nodes: 1, edges: 0, embeddings: 1 },
+    );
+    const databaseProbe = async () => ({
+      nodes: 1,
+      edges: 0,
+      embeddings: 1,
+      integrity: cleanIntegrity(1),
+    });
+    const current = await buildRegistryDoctorReport({
+      entries: [indexed.entry],
+      databaseProbe,
+      headProbe: () => 'a'.repeat(40),
+    });
+    expect(current.entries[0]).toMatchObject({
+      indexed_sha: 'a'.repeat(40),
+      registry_sha: 'a'.repeat(40),
+      head_sha: 'a'.repeat(40),
+      health: { state: 'healthy', freshness: 'current', count_alignment: 'aligned' },
+    });
+
+    indexed.entry.lastCommit = 'b'.repeat(40);
+    const drifted = await buildRegistryDoctorReport({
+      entries: [indexed.entry],
+      databaseProbe,
+      headProbe: () => 'b'.repeat(40),
+    });
+    expect(drifted.entries[0]?.health).toMatchObject({
+      state: 'degraded',
+      freshness: 'drifted',
+      reasons: ['freshness-drift'],
+    });
+
+    const unknown = await buildRegistryDoctorReport({
+      entries: [indexed.entry],
+      databaseProbe,
+      headProbe: () => '',
+    });
+    expect(unknown.entries[0]?.health).toMatchObject({
+      state: 'degraded',
+      freshness: 'unknown',
+      reasons: ['freshness-unknown'],
+    });
+  });
+
+  it('keeps a graph-only index healthy when the embedding table is absent', async () => {
+    const indexed = await createEntry(
+      fixture.dbPath,
+      'graph-only',
+      'GraphOnly',
+      'https://github.com/owner/graph-only.git',
+      { nodes: 1, edges: 0, embeddings: 0 },
+    );
+    const report = await buildRegistryDoctorReport({
+      entries: [indexed.entry],
+      databaseProbe: async () => ({
+        nodes: 1,
+        edges: 0,
+        embeddings: 0,
+        integrity: { ...cleanIntegrity(0), tablePresent: false },
+      }),
+      headProbe: () => 'a'.repeat(40),
+    });
+    expect(report.entries[0]?.health).toMatchObject({
+      state: 'healthy',
+      semantic_ready: false,
+      freshness: 'current',
+      count_alignment: 'aligned',
+    });
   });
 
   it('does not open a database when WAL recovery state is present', async () => {
