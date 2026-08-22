@@ -255,6 +255,22 @@ describe('runFullAnalysis metadata reconciliation (mocked pipeline)', () => {
       queryImporters: vi.fn(async () => []),
       queryImportersBatch: vi.fn(async () => []),
       loadFTSExtension: vi.fn(async () => false),
+      inspectEmbeddingIntegrity: vi.fn(async () => ({
+        tablePresent: false,
+        physicalRows: 0,
+        validRows: 0,
+        recoverableRows: 0,
+        emptyIdRows: 0,
+        emptyNodeIdRows: 0,
+        invalidChunkRows: 0,
+        noncanonicalIdRows: 0,
+        duplicateIdRows: 0,
+        duplicateSemanticRows: 0,
+        orphanRows: 0,
+        wrongDimensionRows: 0,
+        recoverableIdentitySha256: '0'.repeat(64),
+      })),
+      embeddingIntegrityFailures: vi.fn(() => 0),
     }));
     vi.doMock('../../src/core/search/fts-indexes.js', () => ({
       initialiseSearchFTSStemmer: vi.fn(() => 'porter'),

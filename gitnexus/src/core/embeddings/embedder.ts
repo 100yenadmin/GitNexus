@@ -281,6 +281,12 @@ export const getEmbeddingDimensions = (): number => {
   return DEFAULT_EMBEDDING_CONFIG.dimensions;
 };
 
+/** Identity of the transport that embedText/embedBatch will actually use. */
+export const getActiveEmbeddingIdentity = (): { model: string; dimensions: number } => ({
+  model: isHttpMode() ? process.env.GITNEXUS_EMBEDDING_MODEL! : resolveEmbeddingConfig().modelId,
+  dimensions: getEmbeddingDimensions(),
+});
+
 /**
  * Get the embedder instance (throws if not initialized)
  */

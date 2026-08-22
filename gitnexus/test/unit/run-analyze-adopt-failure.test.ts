@@ -45,6 +45,7 @@ import {
 } from '../../src/storage/repo-manager.js';
 import { runFullAnalysis } from '../../src/core/run-analyze.js';
 import { createTempDir } from '../helpers/test-db.js';
+import { seedEmbeddingsForFiles } from '../helpers/embedding-seed.js';
 
 describe('fast-path restamp failure modes (#2364 F3)', () => {
   let tmpHome: Awaited<ReturnType<typeof createTempDir>>;
@@ -98,6 +99,9 @@ describe('fast-path restamp failure modes (#2364 F3)', () => {
     });
     const flat = getStoragePaths(tmpRepo.dbPath);
     await rmCtx.realSaveMeta!(flat.storagePath, metaFor('main'));
+    const { initLbug, closeLbug } = await import('../../src/core/lbug/lbug-adapter.js');
+    await initLbug(flat.lbugPath);
+    await closeLbug();
     const branch = getStoragePaths(tmpRepo.dbPath, 'feature/x');
     await rmCtx.realSaveMeta!(path.dirname(branch.metaPath), metaFor('feature/x'));
     await registerRepo(tmpRepo.dbPath, metaFor('main'));
@@ -158,6 +162,39 @@ describe('fast-path restamp failure modes (#2364 F3)', () => {
       // The stamp never landed, so the guard stays true for the next run.
       const meta = await loadMeta(flatStorage);
       expect(meta?.branch).toBe('main');
+    },
+  );
+
+  it.each(['EROFS', 'EACCES', 'EPERM'] as const)(
+    'verified count remains usable when its metadata restamp hits %s',
+    async (code) => {
+      await fs.writeFile(path.join(tmpRepo.dbPath, 'index.ts'), 'export function value() {}\n');
+      execSync('git init && git add index.ts', { cwd: tmpRepo.dbPath, stdio: 'pipe' });
+      execSync('git -c user.name=t -c user.email=t@t commit -m init', {
+        cwd: tmpRepo.dbPath,
+        stdio: 'pipe',
+      });
+      await runFullAnalysis(
+        tmpRepo.dbPath,
+        { skipAgentsMd: true, skipSkills: true },
+        { onProgress: () => {} },
+      );
+      await seedEmbeddingsForFiles(tmpRepo.dbPath, ['index.ts'], 1);
+      const { storagePath } = getStoragePaths(tmpRepo.dbPath);
+      const meta = await loadMeta(storagePath);
+      if (!meta) throw new Error('expected metadata');
+      await rmCtx.realSaveMeta!(storagePath, {
+        ...meta,
+        stats: { ...meta.stats, embeddings: 0 },
+      });
+      rmCtx.saveMetaMock.mockRejectedValueOnce(Object.assign(new Error('mock ro'), { code }));
+      const logs: string[] = [];
+
+      const result = await runFullAnalysis(tmpRepo.dbPath, {}, { onLog: (m) => logs.push(m) });
+
+      expect(result).toMatchObject({ alreadyUpToDate: true, stats: { embeddings: 1 } });
+      expect(logs.some((m) => m.includes('embedding count') && m.includes('read-only'))).toBe(true);
+      expect((await loadMeta(storagePath))?.stats?.embeddings).toBe(0);
     },
   );
 });

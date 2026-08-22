@@ -1538,8 +1538,10 @@ const analyzeCommandImpl = async (
           `  Updated base_ref to "${resolvedDefaultBranch}" in ${baseRefRefreshed.join(', ')}\n`,
         );
       }
-      // Safe to return without process.exit(0) — the early-return path in
-      // runFullAnalysis never opens LadybugDB, so no native handles prevent exit.
+      // The fast path now performs a read-only embedding-integrity scan and can
+      // initialize LadybugDB native handles. Give the outer lifecycle guard an
+      // explicit success code; otherwise it must conservatively default to 1.
+      if (isLbugReady()) process.exitCode ??= 0;
       return;
     }
 

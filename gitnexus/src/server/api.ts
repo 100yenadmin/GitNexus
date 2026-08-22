@@ -1796,14 +1796,10 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
             await withLbugDb(lbugPath, async () => {
               const { runEmbeddingPipeline } =
                 await import('../core/embeddings/embedding-pipeline.js');
-              const [{ getEmbeddingDimensions }, { resolveEmbeddingConfig }] = await Promise.all([
-                import('../core/embeddings/embedder.js'),
-                import('../core/embeddings/config.js'),
-              ]);
-              const embeddingIdentity = {
-                model: process.env.GITNEXUS_EMBEDDING_MODEL ?? resolveEmbeddingConfig().modelId,
-                dimensions: getEmbeddingDimensions(),
-              };
+              const { getActiveEmbeddingIdentity } = await import('../core/embeddings/embedder.js');
+              const { inspectEmbeddingIntegrity, embeddingIntegrityFailures } =
+                await import('../core/lbug/lbug-adapter.js');
+              const embeddingIdentity = getActiveEmbeddingIdentity();
               let embeddingMeta = await loadMeta(entry.storagePath);
               if (!embeddingMeta) {
                 throw new Error('Repository metadata is missing; run gitnexus analyze first');
@@ -1820,6 +1816,31 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                     `${embeddingIdentity.model} at ${embeddingIdentity.dimensions}.`,
                 );
               }
+              if (priorCheckpoint && !priorCheckpoint.pendingNodeIds?.length) {
+                const proof = [
+                  priorCheckpoint.physicalRows,
+                  priorCheckpoint.validRows,
+                  priorCheckpoint.recoverableIdentitySha256,
+                ];
+                if (!proof.every((value) => value === undefined)) {
+                  const integrity = await inspectEmbeddingIntegrity();
+                  if (
+                    !Number.isSafeInteger(priorCheckpoint.physicalRows) ||
+                    !Number.isSafeInteger(priorCheckpoint.validRows) ||
+                    typeof priorCheckpoint.recoverableIdentitySha256 !== 'string' ||
+                    !/^[a-f0-9]{64}$/.test(priorCheckpoint.recoverableIdentitySha256) ||
+                    embeddingIntegrityFailures(integrity) > 0 ||
+                    integrity.physicalRows !== priorCheckpoint.physicalRows ||
+                    integrity.validRows !== priorCheckpoint.validRows ||
+                    integrity.recoverableIdentitySha256 !==
+                      priorCheckpoint.recoverableIdentitySha256
+                  ) {
+                    throw new Error(
+                      'Cannot resume embedding checkpoint: its durable identity no longer matches the live table.',
+                    );
+                  }
+                }
+              }
               const forceReembedNodeIds = new Set(priorCheckpoint?.pendingNodeIds ?? []);
               const saveEmbeddingCheckpoint = async (
                 checkpoint: {
@@ -1828,6 +1849,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                   chunksProcessed: number;
                 },
                 pendingNodeIds: string[],
+                integrity?: Awaited<ReturnType<typeof inspectEmbeddingIntegrity>>,
               ): Promise<void> => {
                 embeddingMeta = {
                   ...embeddingMeta,
@@ -1836,6 +1858,9 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                     ...checkpoint,
                     ...embeddingIdentity,
                     pendingNodeIds,
+                    physicalRows: integrity?.physicalRows,
+                    validRows: integrity?.validRows,
+                    recoverableIdentitySha256: integrity?.recoverableIdentitySha256,
                   },
                 };
                 await saveMeta(entry.storagePath, embeddingMeta);
@@ -1882,7 +1907,14 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                   },
                   onCheckpoint: async (checkpoint) => {
                     await flushWAL();
-                    await saveEmbeddingCheckpoint(checkpoint, []);
+                    const integrity = await inspectEmbeddingIntegrity();
+                    if (
+                      embeddingIntegrityFailures(integrity) > 0 ||
+                      integrity.physicalRows !== integrity.validRows
+                    ) {
+                      throw new Error('Completed embedding checkpoint failed identity validation');
+                    }
+                    await saveEmbeddingCheckpoint(checkpoint, [], integrity);
                   },
                 },
               );
@@ -1892,7 +1924,18 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
               // handles this during process exit, but the server keeps the
               // connection open for other routes — a CHECKPOINT is enough.
               await flushWAL();
-              embeddingMeta = { ...embeddingMeta, embeddingCheckpoint: undefined };
+              const terminalIntegrity = await inspectEmbeddingIntegrity();
+              if (
+                embeddingIntegrityFailures(terminalIntegrity) > 0 ||
+                terminalIntegrity.physicalRows !== terminalIntegrity.validRows
+              ) {
+                throw new Error('Embedding finalization failed identity validation');
+              }
+              embeddingMeta = {
+                ...embeddingMeta,
+                stats: { ...embeddingMeta.stats, embeddings: terminalIntegrity.validRows },
+                embeddingCheckpoint: undefined,
+              };
               await saveMeta(entry.storagePath, embeddingMeta);
             });
 

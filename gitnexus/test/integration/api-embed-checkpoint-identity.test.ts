@@ -1,0 +1,235 @@
+import http from 'node:http';
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { EmbeddingIntegrityReport } from '../../src/core/lbug/lbug-adapter.js';
+import type { RegistryEntry, RepoMeta } from '../../src/storage/repo-manager.js';
+
+const MODEL = 'api-checkpoint-test-model';
+const LIVE_DIGEST = 'a'.repeat(64);
+const MISMATCHED_DIGEST = 'b'.repeat(64);
+const REPO: RegistryEntry = {
+  name: 'checkpoint-fixture',
+  path: '/virtual/checkpoint-fixture',
+  storagePath: '/virtual/checkpoint-fixture/.gitnexus',
+  indexedAt: '2026-08-22T00:00:00.000Z',
+  lastCommit: 'test-head',
+};
+
+const identity = { model: MODEL, dimensions: 384 };
+const makeIntegrity = (digest: string): EmbeddingIntegrityReport =>
+  ({
+    physicalRows: 3,
+    validRows: 3,
+    recoverableIdentitySha256: digest,
+  }) as EmbeddingIntegrityReport;
+
+const makeMeta = (digest: string): RepoMeta => ({
+  repoPath: REPO.path,
+  lastCommit: REPO.lastCommit,
+  indexedAt: REPO.indexedAt,
+  stats: { embeddings: 3 },
+  embeddingCheckpoint: {
+    at: REPO.indexedAt,
+    nodesProcessed: 1,
+    totalNodes: 2,
+    chunksProcessed: 3,
+    ...identity,
+    physicalRows: 3,
+    validRows: 3,
+    recoverableIdentitySha256: digest,
+    pendingNodeIds: [],
+  },
+});
+
+const state = {
+  currentMeta: makeMeta(MISMATCHED_DIGEST),
+  liveIntegrity: makeIntegrity(LIVE_DIGEST),
+  runEmbeddingPipeline: vi.fn(async (..._args: unknown[]) => undefined),
+  inspectEmbeddingIntegrity: vi.fn(async () => state.liveIntegrity),
+  saveMeta: vi.fn(async (_storagePath: string, next: RepoMeta) => {
+    state.currentMeta = next;
+  }),
+  loadMeta: vi.fn(async () => state.currentMeta),
+  listRegisteredRepos: vi.fn(async () => [REPO]),
+};
+
+vi.doMock('../../src/storage/repo-manager.js', async () => ({
+  ...(await vi.importActual<typeof import('../../src/storage/repo-manager.js')>(
+    '../../src/storage/repo-manager.js',
+  )),
+  listRegisteredRepos: state.listRegisteredRepos,
+  loadMeta: state.loadMeta,
+  saveMeta: state.saveMeta,
+}));
+
+vi.doMock('../../src/core/lbug/lbug-adapter.js', async () => ({
+  ...(await vi.importActual<typeof import('../../src/core/lbug/lbug-adapter.js')>(
+    '../../src/core/lbug/lbug-adapter.js',
+  )),
+  executeQuery: vi.fn(async () => []),
+  executePrepared: vi.fn(async () => []),
+  executeWithReusedStatement: vi.fn(async () => undefined),
+  streamQuery: vi.fn(async () => undefined),
+  flushWAL: vi.fn(async () => undefined),
+  closeLbug: vi.fn(async () => undefined),
+  withLbugDb: vi.fn(async (_dbPath: string, operation: () => Promise<unknown>) => operation()),
+  isReadOnlyDbError: vi.fn(() => false),
+  inspectEmbeddingIntegrity: state.inspectEmbeddingIntegrity,
+  embeddingIntegrityFailures: vi.fn(() => 0),
+  fetchExistingEmbeddingHashes: vi.fn(async () => undefined),
+}));
+
+vi.doMock('../../src/core/embeddings/embedder.js', () => ({
+  getActiveEmbeddingIdentity: vi.fn(() => identity),
+}));
+vi.doMock('../../src/core/embeddings/embedding-pipeline.js', () => ({
+  runEmbeddingPipeline: state.runEmbeddingPipeline,
+}));
+vi.doMock('../../src/mcp/local/local-backend.js', () => ({
+  LocalBackend: class {
+    async init(): Promise<void> {}
+    async disconnect(): Promise<void> {}
+  },
+}));
+vi.doMock('../../src/server/mcp-http.js', () => ({
+  mountMCPEndpoints: () => async (): Promise<void> => {},
+}));
+vi.doMock('../../src/server/analyze-launch.js', () => ({
+  createLaunchAnalysisWorker: () => (): void => {},
+}));
+vi.doMock('../../src/server/analyze-upload.js', () => ({
+  createAnalyzeUploadHandler: () => (_req: unknown, _res: unknown, next: () => void) => next(),
+}));
+vi.doMock('../../src/server/upload-sweep.js', () => ({
+  sweepStaleUploads: async (): Promise<void> => {},
+}));
+
+const allocatePort = (): Promise<number> =>
+  new Promise((resolve, reject) => {
+    const probe = http.createServer();
+    probe.once('error', reject);
+    probe.listen(0, '127.0.0.1', () => {
+      const address = probe.address();
+      if (!address || typeof address === 'string') {
+        reject(new Error('could not allocate a test port'));
+        return;
+      }
+      probe.close((error) => (error ? reject(error) : resolve(address.port)));
+    });
+  });
+
+const waitForTerminalJob = async (baseUrl: string, jobId: string) => {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const response = await fetch(`${baseUrl}/api/embed/${jobId}`);
+    const body = (await response.json()) as { status: string; error?: string };
+    if (body.status === 'complete' || body.status === 'failed') return body;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`embedding job ${jobId} did not reach a terminal state`);
+};
+
+describe('POST /api/embed completed-checkpoint identity', () => {
+  let baseUrl = '';
+  let shutdown: (() => Promise<void>) | undefined;
+  let exitSpy: ReturnType<typeof vi.spyOn>;
+  let onceSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeAll(async () => {
+    exitSpy = vi.spyOn(process, 'exit').mockImplementation(() => undefined as never);
+    const originalOnce = process.once.bind(process);
+    onceSpy = vi.spyOn(process, 'once').mockImplementation(((event: string, listener: Function) => {
+      if (event === 'SIGTERM') {
+        shutdown = listener as () => Promise<void>;
+        return process;
+      }
+      return originalOnce(event, listener);
+    }) as typeof process.once);
+
+    const { createServer } = await import('../../src/server/api.js');
+    const port = await allocatePort();
+    await createServer(port, '127.0.0.1');
+    baseUrl = `http://127.0.0.1:${port}`;
+  });
+
+  beforeEach(() => {
+    state.currentMeta = makeMeta(MISMATCHED_DIGEST);
+    state.liveIntegrity = makeIntegrity(LIVE_DIGEST);
+    state.runEmbeddingPipeline.mockReset();
+    state.runEmbeddingPipeline.mockResolvedValue(undefined);
+    state.saveMeta.mockClear();
+  });
+
+  afterAll(async () => {
+    onceSpy.mockRestore();
+    await shutdown?.();
+    exitSpy.mockRestore();
+  });
+
+  it('rejects an equal-count different-digest completed window before the pipeline', async () => {
+    const checkpointBefore = JSON.stringify(state.currentMeta.embeddingCheckpoint);
+    const response = await fetch(`${baseUrl}/api/embed`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ repo: REPO.name }),
+    });
+    expect(response.status).toBe(202);
+    const { jobId } = (await response.json()) as { jobId: string };
+    const job = await waitForTerminalJob(baseUrl, jobId);
+
+    expect(job.status).toBe('failed');
+    expect(job.error).toMatch(/durable identity no longer matches/i);
+    expect(state.runEmbeddingPipeline).not.toHaveBeenCalled();
+    expect(state.saveMeta).not.toHaveBeenCalled();
+    expect(JSON.stringify(state.currentMeta.embeddingCheckpoint)).toBe(checkpointBefore);
+  });
+
+  it('accepts a matching digest and finalizes clean metadata', async () => {
+    state.currentMeta = makeMeta(LIVE_DIGEST);
+    const response = await fetch(`${baseUrl}/api/embed`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ repo: REPO.name }),
+    });
+    expect(response.status).toBe(202);
+    const { jobId } = (await response.json()) as { jobId: string };
+    const job = await waitForTerminalJob(baseUrl, jobId);
+
+    expect(job.status).toBe('complete');
+    expect(state.runEmbeddingPipeline).toHaveBeenCalledOnce();
+    expect(state.currentMeta.stats?.embeddings).toBe(3);
+    expect(state.currentMeta.embeddingCheckpoint).toBeUndefined();
+  });
+
+  it('persists completed-window identity before an interrupted finalization', async () => {
+    state.currentMeta = makeMeta(LIVE_DIGEST);
+    state.runEmbeddingPipeline.mockImplementationOnce(async (...args: unknown[]) => {
+      const options = args[6] as {
+        onCheckpoint: (checkpoint: {
+          nodesProcessed: number;
+          totalNodes: number;
+          chunksProcessed: number;
+        }) => Promise<void>;
+      };
+      await options.onCheckpoint({ nodesProcessed: 2, totalNodes: 4, chunksProcessed: 5 });
+      throw new Error('simulated interruption after durable checkpoint');
+    });
+
+    const response = await fetch(`${baseUrl}/api/embed`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ repo: REPO.name }),
+    });
+    const { jobId } = (await response.json()) as { jobId: string };
+    expect((await waitForTerminalJob(baseUrl, jobId)).status).toBe('failed');
+
+    const persisted = (await state.loadMeta()).embeddingCheckpoint;
+    expect(persisted).toMatchObject({
+      nodesProcessed: 2,
+      totalNodes: 4,
+      chunksProcessed: 5,
+      physicalRows: 3,
+      validRows: 3,
+      recoverableIdentitySha256: LIVE_DIGEST,
+      pendingNodeIds: [],
+    });
+  });
+});

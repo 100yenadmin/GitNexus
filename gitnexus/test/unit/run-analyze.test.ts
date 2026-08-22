@@ -18,7 +18,14 @@ import {
 } from '../../src/storage/repo-manager.js';
 import { taintModelVersion } from '../../src/core/ingestion/taint/typescript-model.js';
 import { createTempDir } from '../helpers/test-db.js';
-import { readEmbeddingNodeIds } from '../helpers/embedding-seed.js';
+import { readEmbeddingNodeIds, seedEmbeddingsForFiles } from '../helpers/embedding-seed.js';
+
+async function createReadableEmptyIndex(repoPath: string, branch?: string): Promise<void> {
+  const { lbugPath } = getStoragePaths(repoPath, branch);
+  const { initLbug, closeLbug } = await import('../../src/core/lbug/lbug-adapter.js');
+  await initLbug(lbugPath);
+  await closeLbug();
+}
 
 describe('run-analyze module', () => {
   it('exports runFullAnalysis as a function', async () => {
@@ -41,6 +48,16 @@ describe('run-analyze module', () => {
         identitySha256: '0'.repeat(64),
       }),
     ).toBe(true);
+  });
+
+  it('inspects a completed staged checkpoint through the selected database path', async () => {
+    const source = await fs.readFile(
+      path.join(__dirname, '..', '..', 'src', 'core', 'run-analyze.ts'),
+      'utf-8',
+    );
+    expect(source).toMatch(
+      /const completedIntegrity = await withLbugDb\(\s*lbugPath,\s*inspectEmbeddingIntegrity/,
+    );
   });
 
   it('creates .gitnexus/.gitignore on the already-up-to-date fast path (#1233)', async () => {
@@ -66,6 +83,7 @@ describe('run-analyze module', () => {
         schemaVersion: INCREMENTAL_SCHEMA_VERSION,
       };
       await saveMeta(storagePath, meta);
+      await createReadableEmptyIndex(tmpRepo.dbPath);
 
       const { runFullAnalysis } = await import('../../src/core/run-analyze.js');
       const result = await runFullAnalysis(
@@ -79,9 +97,86 @@ describe('run-analyze module', () => {
       expect(result.alreadyUpToDate).toBe(true);
       // A flat/primary index reports isPrimaryBranch true (#2106 R2).
       expect(result.isPrimaryBranch).toBe(true);
+      const { isLbugReady } = await import('../../src/core/lbug/lbug-adapter.js');
+      expect(isLbugReady()).toBe(false);
       await expect(
         fs.readFile(path.join(tmpRepo.dbPath, '.gitnexus', '.gitignore'), 'utf-8'),
       ).resolves.toBe('*\n');
+    } finally {
+      await tmpRepo.cleanup();
+    }
+  });
+
+  it('restamps a verified clean embedding count on the already-up-to-date fast path', async () => {
+    const tmpRepo = await createTempDir('gitnexus-run-analyze-fast-path-count-');
+    try {
+      await fs.writeFile(
+        path.join(tmpRepo.dbPath, 'index.ts'),
+        'export function fastPathCount() { return "verified"; }\n',
+      );
+      execSync('git init', { cwd: tmpRepo.dbPath, stdio: 'pipe' });
+      execSync('git add index.ts', { cwd: tmpRepo.dbPath, stdio: 'pipe' });
+      execSync('git -c user.name=test -c user.email=test@test commit -m init', {
+        cwd: tmpRepo.dbPath,
+        stdio: 'pipe',
+      });
+
+      const { runFullAnalysis } = await import('../../src/core/run-analyze.js');
+      await runFullAnalysis(
+        tmpRepo.dbPath,
+        { skipAgentsMd: true, skipSkills: true },
+        { onProgress: () => {} },
+      );
+      const seeded = await seedEmbeddingsForFiles(tmpRepo.dbPath, ['index.ts'], 1);
+      expect(seeded.get('index.ts')).toHaveLength(1);
+
+      const { storagePath } = getStoragePaths(tmpRepo.dbPath);
+      const completed = await loadMeta(storagePath);
+      if (!completed) throw new Error('expected completed metadata');
+      await saveMeta(storagePath, {
+        ...completed,
+        stats: { ...completed.stats, embeddings: 0 },
+      });
+
+      await expect(
+        runFullAnalysis(tmpRepo.dbPath, { incrementalOnly: true }, { onProgress: () => {} }),
+      ).rejects.toThrow(/verified embedding count requires a metadata restamp/i);
+      expect((await loadMeta(storagePath))?.stats?.embeddings).toBe(0);
+      const { isLbugReady } = await import('../../src/core/lbug/lbug-adapter.js');
+      expect(isLbugReady()).toBe(false);
+
+      const result = await runFullAnalysis(tmpRepo.dbPath, {}, { onProgress: () => {} });
+
+      expect(result.alreadyUpToDate).toBe(true);
+      expect(result.stats.embeddings).toBe(1);
+      expect((await loadMeta(storagePath))?.stats?.embeddings).toBe(1);
+
+      const restamped = await loadMeta(storagePath);
+      if (!restamped) throw new Error('expected restamped metadata');
+      await saveMeta(storagePath, {
+        ...restamped,
+        stats: { ...restamped.stats, embeddings: 2 },
+      });
+      await expect(
+        runFullAnalysis(tmpRepo.dbPath, { incrementalOnly: true }, { onProgress: () => {} }),
+      ).rejects.toThrow(/verified embedding count requires a metadata restamp/i);
+      expect((await loadMeta(storagePath))?.stats?.embeddings).toBe(2);
+
+      const stalePositive = await runFullAnalysis(tmpRepo.dbPath, {}, { onProgress: () => {} });
+      expect(stalePositive.alreadyUpToDate).toBe(true);
+      expect(stalePositive.stats.embeddings).toBe(1);
+      expect((await loadMeta(storagePath))?.stats?.embeddings).toBe(1);
+
+      const { lbugPath } = getStoragePaths(tmpRepo.dbPath);
+      const { initLbug, executeQuery, closeLbug } =
+        await import('../../src/core/lbug/lbug-adapter.js');
+      await initLbug(lbugPath);
+      await executeQuery('MATCH (e:CodeEmbedding) DELETE e');
+      await closeLbug();
+      await expect(runFullAnalysis(tmpRepo.dbPath, {}, { onProgress: () => {} })).rejects.toThrow(
+        /lost all recorded embeddings/i,
+      );
+      expect((await loadMeta(storagePath))?.stats?.embeddings).toBe(1);
     } finally {
       await tmpRepo.cleanup();
     }
@@ -290,6 +385,32 @@ describe('run-analyze module', () => {
         ),
       ).rejects.toThrow('Cannot resume embedding checkpoint');
       expect(fetchMock).not.toHaveBeenCalled();
+
+      await saveMeta(storagePath, {
+        ...resumedPending,
+        embeddingCheckpoint: {
+          at: new Date().toISOString(),
+          nodesProcessed: 1,
+          totalNodes: 2,
+          chunksProcessed: 1,
+          model: 'test-model',
+          dimensions: 384,
+          pendingNodeIds: [],
+          physicalRows: 1,
+          validRows: 1,
+          recoverableIdentitySha256: '0'.repeat(64),
+        },
+      });
+      await expect(
+        runFullAnalysis(
+          tmpRepo.dbPath,
+          { skipAgentsMd: true, skipSkills: true },
+          { onProgress: () => {} },
+        ),
+      ).rejects.toThrow(/no longer matches the live embedding identities/i);
+      expect(fetchMock).not.toHaveBeenCalled();
+      const { isLbugReady } = await import('../../src/core/lbug/lbug-adapter.js');
+      expect(isLbugReady()).toBe(false);
     } finally {
       vi.unstubAllGlobals();
       const restore = (key: string, value: string | undefined) => {
@@ -337,6 +458,7 @@ describe('run-analyze module', () => {
         schemaVersion: INCREMENTAL_SCHEMA_VERSION,
       };
       await saveMeta(flat.storagePath, flatMetaSeed);
+      await createReadableEmptyIndex(tmpRepo.dbPath);
       const branch = getStoragePaths(tmpRepo.dbPath, 'feature/x');
       await saveMeta(path.dirname(branch.metaPath), {
         repoPath: tmpRepo.dbPath,
@@ -399,6 +521,7 @@ describe('run-analyze module', () => {
         branch: 'main',
         schemaVersion: INCREMENTAL_SCHEMA_VERSION,
       });
+      await createReadableEmptyIndex(tmpRepo.dbPath);
       const branch = getStoragePaths(tmpRepo.dbPath, 'feature/x');
       await saveMeta(path.dirname(branch.metaPath), {
         repoPath: tmpRepo.dbPath,
@@ -453,6 +576,7 @@ describe('run-analyze module', () => {
         branch: 'main',
         schemaVersion: INCREMENTAL_SCHEMA_VERSION,
       });
+      await createReadableEmptyIndex(tmpRepo.dbPath);
 
       // Detached HEAD → branchLabel is null → the restamp block must not
       // fire: the existing stamp survives, mirroring the end-of-run write.
@@ -502,6 +626,7 @@ describe('run-analyze module', () => {
         branch: 'feature/x',
         schemaVersion: INCREMENTAL_SCHEMA_VERSION,
       });
+      await createReadableEmptyIndex(tmpRepo.dbPath, 'feature/x');
 
       const { runFullAnalysis } = await import('../../src/core/run-analyze.js');
       const result = await runFullAnalysis(
