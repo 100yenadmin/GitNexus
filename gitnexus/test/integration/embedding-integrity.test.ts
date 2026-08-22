@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { withTestLbugDB } from '../helpers/test-indexed-db.js';
 import { EMBEDDING_DIMS } from '../../src/core/lbug/schema.js';
+import { probeRegistryDatabaseCounts } from '../../src/cli/registry-doctor.js';
 
 describe('embedding writer identity preflight', () => {
   it('validates the whole batch before executing and prepares once per row', async () => {
@@ -29,7 +30,7 @@ describe('embedding writer identity preflight', () => {
 
 withTestLbugDB(
   'embedding-integrity-scan',
-  () => {
+  (handle) => {
     it('finds noncanonical, duplicate-semantic, blank-owner, and orphan rows by scan', async () => {
       const adapter = await import('../../src/core/lbug/lbug-adapter.js');
       const vector = new Array(EMBEDDING_DIMS).fill(0);
@@ -61,11 +62,39 @@ withTestLbugDB(
         orphanRows: 1,
         wrongDimensionRows: 0,
       });
+      await adapter.executeQuery('DROP TABLE CodeRelation');
+      await adapter.executeQuery('DROP TABLE Class');
+      await expect(adapter.getStoredEmbeddingDimensions()).resolves.toBe(EMBEDDING_DIMS);
+      await expect(adapter.inspectEmbeddingIntegrity(EMBEDDING_DIMS + 1)).resolves.toMatchObject({
+        validRows: 0,
+        recoverableRows: 0,
+        wrongDimensionRows: 5,
+      });
     });
 
     it('refuses HNSW creation for the malformed table', async () => {
       const { buildVectorIndex } = await import('../../src/core/embeddings/embedding-pipeline.js');
       await expect(buildVectorIndex()).rejects.toThrow(/refused malformed embedding rows/i);
+    });
+
+    it('preserves counts when a present legacy table lacks chunkIndex', async () => {
+      const adapter = await import('../../src/core/lbug/lbug-adapter.js');
+      const vector = new Array(EMBEDDING_DIMS).fill(0);
+      await adapter.executeQuery('DROP TABLE CodeEmbedding');
+      await adapter.executeQuery(
+        `CREATE NODE TABLE CodeEmbedding (id STRING, nodeId STRING, embedding FLOAT[${EMBEDDING_DIMS}], PRIMARY KEY (id))`,
+      );
+      await adapter.executeWithReusedStatement(
+        'CREATE (e:CodeEmbedding {id: $id, nodeId: $nodeId, embedding: $embedding})',
+        [{ id: 'Function:live', nodeId: 'Function:live', embedding: vector }],
+      );
+      await adapter.flushWAL();
+      await expect(probeRegistryDatabaseCounts(handle.dbPath)).resolves.toMatchObject({
+        nodes: 1,
+        edges: 0,
+        embeddings: 1,
+        integrity: { status: 'unavailable', reason: 'identity-scan-unavailable' },
+      });
     });
   },
   {
