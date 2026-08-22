@@ -1,7 +1,13 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { execSync } from 'node:child_process';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { getStoragePaths, saveMeta, type RepoMeta } from '../../src/storage/repo-manager.js';
+import {
+  getStoragePaths,
+  saveMeta,
+  INCREMENTAL_SCHEMA_VERSION,
+  type RepoMeta,
+} from '../../src/storage/repo-manager.js';
 import { createTempDir } from '../helpers/test-db.js';
 
 const healthyProbe = {
@@ -124,6 +130,9 @@ async function importRepairSubject(options: {
     wrongDimensionRows: 0,
     recoverableIdentitySha256: options.identityDigest ?? 'a'.repeat(64),
   }));
+  const withLbugDb = vi.fn(async (_dbPath: string, operation: () => Promise<unknown>) =>
+    operation(),
+  );
   const registerRepo = vi.fn(async () => 'fixture-repo');
   const probeDoctorPool = vi.fn(async () => probes.shift() ?? healthyProbe);
   vi.doMock('../../src/core/lbug/lbug-adapter.js', async (importActual) => ({
@@ -137,6 +146,7 @@ async function importRepairSubject(options: {
     getLbugStats: vi.fn(async () => ({ nodes: 5, edges: 4 })),
     executeQuery,
     inspectEmbeddingIntegrity,
+    withLbugDb,
   }));
   vi.doMock('../../src/cli/doctor-pool-probe.js', () => ({
     EXPECTED_POOL_CONNECTIONS: 8,
@@ -175,6 +185,7 @@ async function importRepairSubject(options: {
       closeLbug,
       executeQuery,
       inspectEmbeddingIntegrity,
+      withLbugDb,
       registerRepo,
       probeDoctorPool,
     },
@@ -189,6 +200,39 @@ describe('runFullAnalysis VECTOR-only repair (#170)', () => {
     vi.doUnmock('../../src/storage/repo-manager.js');
     vi.resetModules();
     vi.clearAllMocks();
+  });
+
+  it('inspects live rows on the same-commit path when legacy metadata reports zero', async () => {
+    const indexed = await createIndexedFixture(0, {
+      schemaVersion: INCREMENTAL_SCHEMA_VERSION,
+    });
+    try {
+      execSync('git init', { cwd: indexed.fixture.dbPath, stdio: 'pipe' });
+      execSync('git -c user.name=test -c user.email=test@test commit --allow-empty -m init', {
+        cwd: indexed.fixture.dbPath,
+        stdio: 'pipe',
+      });
+      const currentCommit = execSync('git rev-parse HEAD', {
+        cwd: indexed.fixture.dbPath,
+        encoding: 'utf8',
+      }).trim();
+      await saveMeta(indexed.paths.storagePath, { ...indexed.meta, lastCommit: currentCommit });
+
+      const { runFullAnalysis, mocks } = await importRepairSubject({
+        counts: [1],
+        malformedEmbeddingTable: true,
+      });
+      await expect(
+        runFullAnalysis(indexed.fixture.dbPath, {}, { onProgress: () => {} }),
+      ).rejects.toThrow(/Already-up-to-date index failed embedding integrity validation/i);
+      expect(mocks.withLbugDb).toHaveBeenCalledWith(
+        indexed.paths.lbugPath,
+        mocks.inspectEmbeddingIntegrity,
+        { readOnly: true },
+      );
+    } finally {
+      await indexed.fixture.cleanup();
+    }
   });
 
   it('rebuilds only HNSW, preserves the embedding count, then reconciles metadata', async () => {

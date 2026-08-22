@@ -1590,11 +1590,9 @@ const runFullAnalysisImpl = async (
         checkpoint.nodesProcessed === checkpoint.totalNodes &&
         !checkpoint.pendingNodeIds?.length
       ) {
-        const completedIntegrity = await withLbugDb(
-          canonicalPaths.lbugPath,
-          inspectEmbeddingIntegrity,
-          { readOnly: true },
-        );
+        const completedIntegrity = await withLbugDb(lbugPath, inspectEmbeddingIntegrity, {
+          readOnly: true,
+        });
         assertCompletedCheckpointIdentity(
           checkpoint,
           completedIntegrity,
@@ -1824,18 +1822,19 @@ const runFullAnalysisImpl = async (
       const healUnregistered =
         options.allowDuplicateName === true && !(await isRepoRegistered(repoPath));
       if (!dirty && !healUnregistered) {
-        if (Number(existingMeta.stats?.embeddings ?? 0) > 0) {
-          const fastPathIntegrity = await withLbugDb(
-            canonicalPaths.lbugPath,
-            inspectEmbeddingIntegrity,
-            { readOnly: true },
-          );
-          assertEmbeddingIntegrity(
-            fastPathIntegrity,
-            'Already-up-to-date index',
-            Number(existingMeta.stats!.embeddings),
-          );
-        }
+        const recordedEmbeddingCount = existingMeta.stats?.embeddings;
+        const fastPathIntegrity = await withLbugDb(
+          canonicalPaths.lbugPath,
+          inspectEmbeddingIntegrity,
+          { readOnly: true },
+        );
+        assertEmbeddingIntegrity(
+          fastPathIntegrity,
+          'Already-up-to-date index',
+          recordedEmbeddingCount !== undefined && recordedEmbeddingCount > 0
+            ? recordedEmbeddingCount
+            : undefined,
+        );
         // ── #2354: restamp the workspace label on a same-commit branch flip ──
         // The flat slot follows the checked-out working tree; a branch switch
         // at the SAME commit with a clean tree changes nothing the pipeline

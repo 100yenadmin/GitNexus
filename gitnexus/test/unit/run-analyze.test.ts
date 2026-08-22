@@ -20,6 +20,13 @@ import { taintModelVersion } from '../../src/core/ingestion/taint/typescript-mod
 import { createTempDir } from '../helpers/test-db.js';
 import { readEmbeddingNodeIds } from '../helpers/embedding-seed.js';
 
+async function createReadableEmptyIndex(repoPath: string, branch?: string): Promise<void> {
+  const { lbugPath } = getStoragePaths(repoPath, branch);
+  const { initLbug, closeLbug } = await import('../../src/core/lbug/lbug-adapter.js');
+  await initLbug(lbugPath);
+  await closeLbug();
+}
+
 describe('run-analyze module', () => {
   it('exports runFullAnalysis as a function', async () => {
     const mod = await import('../../src/core/run-analyze.js');
@@ -41,6 +48,16 @@ describe('run-analyze module', () => {
         identitySha256: '0'.repeat(64),
       }),
     ).toBe(true);
+  });
+
+  it('inspects a completed staged checkpoint through the selected database path', async () => {
+    const source = await fs.readFile(
+      path.join(__dirname, '..', '..', 'src', 'core', 'run-analyze.ts'),
+      'utf-8',
+    );
+    expect(source).toMatch(
+      /const completedIntegrity = await withLbugDb\(\s*lbugPath,\s*inspectEmbeddingIntegrity/,
+    );
   });
 
   it('creates .gitnexus/.gitignore on the already-up-to-date fast path (#1233)', async () => {
@@ -66,6 +83,7 @@ describe('run-analyze module', () => {
         schemaVersion: INCREMENTAL_SCHEMA_VERSION,
       };
       await saveMeta(storagePath, meta);
+      await createReadableEmptyIndex(tmpRepo.dbPath);
 
       const { runFullAnalysis } = await import('../../src/core/run-analyze.js');
       const result = await runFullAnalysis(
@@ -337,6 +355,7 @@ describe('run-analyze module', () => {
         schemaVersion: INCREMENTAL_SCHEMA_VERSION,
       };
       await saveMeta(flat.storagePath, flatMetaSeed);
+      await createReadableEmptyIndex(tmpRepo.dbPath);
       const branch = getStoragePaths(tmpRepo.dbPath, 'feature/x');
       await saveMeta(path.dirname(branch.metaPath), {
         repoPath: tmpRepo.dbPath,
@@ -399,6 +418,7 @@ describe('run-analyze module', () => {
         branch: 'main',
         schemaVersion: INCREMENTAL_SCHEMA_VERSION,
       });
+      await createReadableEmptyIndex(tmpRepo.dbPath);
       const branch = getStoragePaths(tmpRepo.dbPath, 'feature/x');
       await saveMeta(path.dirname(branch.metaPath), {
         repoPath: tmpRepo.dbPath,
@@ -453,6 +473,7 @@ describe('run-analyze module', () => {
         branch: 'main',
         schemaVersion: INCREMENTAL_SCHEMA_VERSION,
       });
+      await createReadableEmptyIndex(tmpRepo.dbPath);
 
       // Detached HEAD → branchLabel is null → the restamp block must not
       // fire: the existing stamp survives, mirroring the end-of-run write.
@@ -502,6 +523,7 @@ describe('run-analyze module', () => {
         branch: 'feature/x',
         schemaVersion: INCREMENTAL_SCHEMA_VERSION,
       });
+      await createReadableEmptyIndex(tmpRepo.dbPath, 'feature/x');
 
       const { runFullAnalysis } = await import('../../src/core/run-analyze.js');
       const result = await runFullAnalysis(

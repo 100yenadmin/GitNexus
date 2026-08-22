@@ -1817,7 +1817,8 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                 );
               }
               if (
-                priorCheckpoint?.nodesProcessed === priorCheckpoint?.totalNodes &&
+                priorCheckpoint &&
+                priorCheckpoint.nodesProcessed === priorCheckpoint.totalNodes &&
                 !priorCheckpoint.pendingNodeIds?.length
               ) {
                 const proof = [
