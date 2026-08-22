@@ -31,6 +31,23 @@ const CAPABILITIES: NonNullable<RepoMeta['capabilities']> = {
   },
 };
 
+const cleanIntegrity = (rows: number) => ({
+  status: 'clean' as const,
+  tablePresent: true,
+  physicalRows: rows,
+  validRows: rows,
+  recoverableRows: rows,
+  emptyIdRows: 0,
+  emptyNodeIdRows: 0,
+  invalidChunkRows: 0,
+  noncanonicalIdRows: 0,
+  duplicateIdRows: 0,
+  duplicateSemanticRows: 0,
+  orphanRows: 0,
+  wrongDimensionRows: 0,
+  recoverableIdentitySha256: 'a'.repeat(64),
+});
+
 interface FixtureEntry {
   entry: RegistryEntry;
   lbugPath: string;
@@ -226,6 +243,68 @@ describe('doctor --registry read-only report (#133)', () => {
     expect(report.entries[0]?.countComparison.status).toBe('partial');
     expect(report.summary.recoveryStateEntries).toBe(1);
     expect(await snapshotFiles(fixture.dbPath)).toEqual(before);
+  });
+
+  it('marks partial and total-loss durable checkpoints malformed', async () => {
+    const indexed = await createEntry(
+      fixture.dbPath,
+      'checkpoint-integrity',
+      'CheckpointIntegrity',
+      'https://github.com/owner/checkpoint-integrity.git',
+      { nodes: 1, edges: 0, embeddings: 3 },
+    );
+    const metaPath = path.join(indexed.entry.storagePath, INDEX_METADATA_FILE);
+    const meta = JSON.parse(await fs.readFile(metaPath, 'utf8'));
+    const databaseProbe = async () => ({
+      nodes: 1,
+      edges: 0,
+      embeddings: 3,
+      embeddingDimensions: 384,
+      integrity: cleanIntegrity(3),
+    });
+
+    await fs.writeFile(
+      metaPath,
+      JSON.stringify({
+        ...meta,
+        embeddingCheckpoint: { dimensions: 384, physicalRows: 3 },
+      }),
+    );
+    const partial = await buildRegistryDoctorReport({ entries: [indexed.entry], databaseProbe });
+    expect(partial.entries[0]?.database).toMatchObject({
+      status: 'available',
+      counts: { nodes: 1, edges: 0, embeddings: 3 },
+      integrity: { status: 'malformed' },
+    });
+
+    await fs.writeFile(
+      metaPath,
+      JSON.stringify({
+        ...meta,
+        embeddingCheckpoint: {
+          nodesProcessed: 1,
+          totalNodes: 1,
+          dimensions: 384,
+          physicalRows: 0,
+          validRows: 0,
+          recoverableIdentitySha256: 'a'.repeat(64),
+        },
+      }),
+    );
+    const totalLoss = await buildRegistryDoctorReport({
+      entries: [indexed.entry],
+      databaseProbe: async () => ({
+        nodes: 1,
+        edges: 0,
+        embeddings: 0,
+        embeddingDimensions: 384,
+        integrity: cleanIntegrity(0),
+      }),
+    });
+    expect(totalLoss.entries[0]?.database).toMatchObject({
+      status: 'available',
+      integrity: { status: 'malformed' },
+    });
   });
 
   it('does not open a database while a lock sidecar is present', async () => {
@@ -498,11 +577,26 @@ describe('doctor --registry read-only report (#133)', () => {
     }
 
     const before = await snapshotFiles(fixture.dbPath);
-    await expect(probeRegistryDatabaseCounts(lbugPath)).resolves.toEqual({
+    await expect(probeRegistryDatabaseCounts(lbugPath)).resolves.toMatchObject({
       nodes: 1,
       edges: 0,
       embeddings: 0,
+      integrity: { status: 'clean', physicalRows: 0, validRows: 0 },
     });
     expect(await snapshotFiles(fixture.dbPath)).toEqual(before);
+
+    await adapter.initLbug(lbugPath);
+    try {
+      await adapter.executeQuery('DROP TABLE CodeEmbedding');
+    } finally {
+      await adapter.closeLbug();
+    }
+    await expect(probeRegistryDatabaseCounts(lbugPath)).resolves.toMatchObject({
+      embeddings: 0,
+      integrity: { status: 'clean', tablePresent: false, physicalRows: 0, validRows: 0 },
+    });
+
+    await fs.writeFile(`${lbugPath}.wal`, 'unmatched wal');
+    await expect(probeRegistryDatabaseCounts(lbugPath)).rejects.toThrow(/sidecar state/i);
   });
 });

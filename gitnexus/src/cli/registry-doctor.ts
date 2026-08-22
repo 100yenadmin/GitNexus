@@ -14,6 +14,7 @@ import {
   probeDoctorPool,
   type DoctorPoolProbe,
 } from './doctor-pool-probe.js';
+import type { EmbeddingIntegrityReport } from '../core/lbug/lbug-adapter.js';
 
 export interface RegistryCounts {
   nodes: number | null;
@@ -27,7 +28,17 @@ export interface RegistryDatabaseCounts {
   embeddings: number;
 }
 
-export type RegistryDatabaseProbe = (lbugPath: string) => Promise<RegistryDatabaseCounts>;
+export type RegistryDatabaseIntegrity =
+  | ({ status: 'clean' | 'malformed' } & EmbeddingIntegrityReport)
+  | { status: 'malformed'; reason: 'identity-checkpoint-invalid' }
+  | { status: 'unavailable'; reason: 'identity-scan-unavailable' };
+
+export type RegistryDatabaseProbe = (lbugPath: string) => Promise<
+  RegistryDatabaseCounts & {
+    integrity?: RegistryDatabaseIntegrity;
+    embeddingDimensions?: number;
+  }
+>;
 
 export interface RegistryCapabilityReport {
   source: 'active-probe' | 'unavailable';
@@ -86,7 +97,11 @@ export interface RegistryEntryDoctorReport {
   registry: { counts: RegistryCounts };
   metadata: { status: 'available' | 'missing' | 'not-read'; counts: RegistryCounts };
   database:
-    | { status: 'available'; counts: RegistryDatabaseCounts }
+    | {
+        status: 'available';
+        counts: RegistryDatabaseCounts;
+        integrity: RegistryDatabaseIntegrity;
+      }
     | {
         status: 'skipped' | 'unavailable';
         reason:
@@ -275,18 +290,27 @@ const queryCount = async (connection: QueryConnectionLike, cypher: string): Prom
   }
 };
 
+const isLegacyMissingChunkIndexError = (error: unknown): boolean => {
+  const message = error instanceof Error ? error.message : String(error);
+  return /binder exception:\s*(?:column\s+chunkIndex\s+does not exist|cannot find property\s+chunkIndex\s+for\s+e\.?)$/i.test(
+    message.trim(),
+  );
+};
+
 /** Open a clean index in LadybugDB's read-only mode and issue count queries. */
 export const probeRegistryDatabaseCounts: RegistryDatabaseProbe = async (lbugPath) => {
-  const [{ default: lbug }, lbugConfig, schema] = await Promise.all([
-    import('@ladybugdb/core'),
+  const [adapter, lbugConfig, schema] = await Promise.all([
+    import('../core/lbug/lbug-adapter.js'),
     import('../core/lbug/lbug-config.js'),
     import('../core/lbug/schema.js'),
   ]);
-  const handle = await lbugConfig.openLbugConnection(lbug, lbugPath, {
-    readOnly: true,
-    throwOnWalReplayFailure: true,
-  });
-  const connection = handle.conn as unknown as QueryConnectionLike;
+  await adapter.initLbugReadOnlyNonRecovering(lbugPath);
+  const connection: QueryConnectionLike = {
+    query: async (cypher) => ({
+      getAll: async () => adapter.executeQuery(cypher),
+      close: () => {},
+    }),
+  };
   const tableName = (name: string): string => `\`${name.replace(/`/g, '``')}\``;
   try {
     let nodes = 0;
@@ -310,6 +334,7 @@ export const probeRegistryDatabaseCounts: RegistryDatabaseProbe = async (lbugPat
       if (lbugConfig.classifyDeleteAllError(error) !== 'benign-missing-table') throw error;
     }
     let embeddings = 0;
+    let embeddingTablePresent = true;
     try {
       embeddings = await queryCount(
         connection,
@@ -317,10 +342,34 @@ export const probeRegistryDatabaseCounts: RegistryDatabaseProbe = async (lbugPat
       );
     } catch (error) {
       if (lbugConfig.classifyDeleteAllError(error) !== 'benign-missing-table') throw error;
+      embeddingTablePresent = false;
     }
-    return { nodes, edges, embeddings };
+    let embeddingDimensions: number | undefined;
+    let report: EmbeddingIntegrityReport | undefined;
+    if (embeddingTablePresent) {
+      try {
+        embeddingDimensions = await adapter.getStoredEmbeddingDimensions();
+        report = await adapter.inspectEmbeddingIntegrity(embeddingDimensions);
+      } catch (error) {
+        if (!isLegacyMissingChunkIndexError(error)) throw error;
+      }
+    } else {
+      report = await adapter.inspectEmbeddingIntegrity();
+    }
+    const malformed =
+      report &&
+      (adapter.embeddingIntegrityFailures(report) > 0 || report.physicalRows !== report.validRows);
+    return {
+      nodes,
+      edges,
+      embeddings,
+      embeddingDimensions,
+      integrity: report
+        ? { status: malformed ? 'malformed' : 'clean', ...report }
+        : { status: 'unavailable', reason: 'identity-scan-unavailable' },
+    };
   } finally {
-    await lbugConfig.closeLbugConnection(handle);
+    await adapter.closeLbug();
   }
 };
 
@@ -411,6 +460,11 @@ const compareCounts = (
   };
 };
 
+const markIntegrityMalformed = (integrity: RegistryDatabaseIntegrity): RegistryDatabaseIntegrity =>
+  'physicalRows' in integrity
+    ? { ...integrity, status: 'malformed' }
+    : { status: 'malformed', reason: 'identity-checkpoint-invalid' };
+
 const inspectEntry = async (
   entry: RegistryEntry,
   entryPosition: number,
@@ -492,8 +546,52 @@ const inspectEntry = async (
     database = { status: 'skipped', reason: 'recovery-state-present' };
   } else {
     try {
-      availableCounts = await (options.databaseProbe ?? probeRegistryDatabaseCounts)(lbugPath);
-      database = { status: 'available', counts: availableCounts };
+      const {
+        integrity: scannedIntegrity,
+        embeddingDimensions,
+        ...scannedCounts
+      } = await (options.databaseProbe ?? probeRegistryDatabaseCounts)(lbugPath);
+      availableCounts = scannedCounts;
+      let integrity =
+        scannedIntegrity ??
+        ({ status: 'unavailable', reason: 'identity-scan-unavailable' } as const);
+      const checkpoint = meta?.embeddingCheckpoint;
+      if (checkpoint) {
+        const checkpointIdentity = [
+          checkpoint.physicalRows,
+          checkpoint.validRows,
+          checkpoint.recoverableIdentitySha256,
+        ];
+        const hasCheckpointIdentity = checkpointIdentity.some((value) => value !== undefined);
+        const completeCheckpointIdentity =
+          Number.isSafeInteger(checkpoint.physicalRows) &&
+          checkpoint.physicalRows >= 0 &&
+          Number.isSafeInteger(checkpoint.validRows) &&
+          checkpoint.validRows >= 0 &&
+          typeof checkpoint.recoverableIdentitySha256 === 'string' &&
+          /^[a-f0-9]{64}$/.test(checkpoint.recoverableIdentitySha256);
+        const scannedIdentity =
+          integrity.status !== 'unavailable' && 'physicalRows' in integrity ? integrity : null;
+        const checkpointMismatch =
+          hasCheckpointIdentity &&
+          (!completeCheckpointIdentity ||
+            checkpoint.physicalRows !==
+              (scannedIdentity?.physicalRows ?? scannedCounts.embeddings) ||
+            (scannedIdentity !== null &&
+              (checkpoint.validRows !== scannedIdentity.validRows ||
+                checkpoint.recoverableIdentitySha256 !==
+                  scannedIdentity.recoverableIdentitySha256)));
+        const dimensionMismatch =
+          embeddingDimensions !== undefined && checkpoint.dimensions !== embeddingDimensions;
+        const completedCheckpoint =
+          checkpoint.nodesProcessed === checkpoint.totalNodes && !checkpoint.pendingNodeIds?.length;
+        const totalEmbeddingLoss =
+          completedCheckpoint && checkpoint.totalNodes > 0 && scannedCounts.embeddings === 0;
+        if (checkpointMismatch || dimensionMismatch || totalEmbeddingLoss) {
+          integrity = markIntegrityMalformed(integrity);
+        }
+      }
+      database = { status: 'available', counts: availableCounts, integrity };
     } catch (error) {
       const message = error instanceof Error ? error.message.toLowerCase() : String(error);
       database = {
