@@ -76,11 +76,16 @@ describe('HTTP embedding backend', () => {
   });
 
   describe('core embedder HTTP path', () => {
-    it('derives a stable provider from a credential- and fragment-free endpoint', () => {
-      const provider = httpEmbeddingProvider('HTTPS://user:secret@example.com/v1///#fragment');
+    it('derives a stable provider after stripping credentials and trailing slashes', () => {
+      const provider = httpEmbeddingProvider('HTTPS://user:secret@example.com/v1///');
       expect(provider).toBe(httpEmbeddingProvider('https://example.com/v1'));
       expect(provider).not.toContain('secret');
-      expect(provider).not.toContain('fragment');
+    });
+
+    it('refuses fragments instead of colliding with the fragment-free route', () => {
+      for (const endpoint of ['https://example.com/v1#fragment', 'https://example.com/v1#']) {
+        expect(() => httpEmbeddingProvider(endpoint)).toThrow(/fragments are unverifiable/i);
+      }
     });
 
     it('refuses query-bearing and malformed endpoints before provider use', () => {

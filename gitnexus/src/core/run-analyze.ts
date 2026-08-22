@@ -487,12 +487,16 @@ export const assertVectorRepairPreflight = async (
     // mismatched identity would build HNSW over incompatible rows AND erase
     // the evidence. Mirror the resume-path guard before allowing either.
     const identity = await resolveEmbeddingIdentity();
-    if (checkpoint.model !== identity.model || checkpoint.dimensions !== identity.dimensions) {
+    if (
+      (checkpoint.provider !== undefined && checkpoint.provider !== identity.provider) ||
+      checkpoint.model !== identity.model ||
+      checkpoint.dimensions !== identity.dimensions
+    ) {
       throw new Error(
-        `Cannot repair VECTOR: the completed embedding checkpoint records ${checkpoint.model} at ` +
-          `${checkpoint.dimensions} dimensions, but this run resolves ${identity.model} at ` +
-          `${identity.dimensions}. Restore the matching embedding configuration, or rebuild with ` +
-          'analyze --drop-embeddings --embeddings.',
+        `Cannot repair VECTOR: the completed embedding checkpoint records ${checkpoint.provider ?? 'legacy'} / ` +
+          `${checkpoint.model} at ${checkpoint.dimensions} dimensions, but this run resolves ` +
+          `${identity.provider} / ${identity.model} at ${identity.dimensions}. Restore the matching ` +
+          'embedding configuration, or rebuild with analyze --drop-embeddings --embeddings.',
       );
     }
   }

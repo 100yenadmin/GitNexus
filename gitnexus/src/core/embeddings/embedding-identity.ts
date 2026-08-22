@@ -21,12 +21,14 @@ const normalizeHttpEndpoint = (endpoint: string): string => {
   if (url.search || endpoint.includes('?')) {
     throw new Error('HTTP embedding endpoint query routing is unverifiable.');
   }
+  if (url.hash || endpoint.includes('#')) {
+    throw new Error('HTTP embedding endpoint fragments are unverifiable.');
+  }
 
-  // URL serialization canonicalizes scheme/host/port. Remove all credential,
-  // fragment, and query material before deriving the durable provider label.
+  // URL serialization canonicalizes scheme/host/port. Remove all credential
+  // material before deriving the durable provider label.
   url.username = '';
   url.password = '';
-  url.hash = '';
   url.pathname = url.pathname.replace(/\/+$/u, '') || '/';
   return url.toString();
 };

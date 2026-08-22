@@ -70,6 +70,62 @@ describe('run-analyze module', () => {
     expect(source).toMatch(/provider: embeddingIdentity\.provider/);
   });
 
+  it('refuses a completed VECTOR repair checkpoint with a provider mismatch but accepts legacy metadata', async () => {
+    const tmpRepo = await createTempDir('gitnexus-run-analyze-vector-repair-identity-');
+    const saved = {
+      url: process.env.GITNEXUS_EMBEDDING_URL,
+      model: process.env.GITNEXUS_EMBEDDING_MODEL,
+      dims: process.env.GITNEXUS_EMBEDDING_DIMS,
+    };
+    try {
+      process.env.GITNEXUS_EMBEDDING_URL = 'http://test:8080/v1';
+      process.env.GITNEXUS_EMBEDDING_MODEL = 'test-model';
+      process.env.GITNEXUS_EMBEDDING_DIMS = '384';
+      const { storagePath, lbugPath } = getStoragePaths(tmpRepo.dbPath);
+      await fs.mkdir(storagePath, { recursive: true });
+      await fs.writeFile(lbugPath, '');
+      const checkpoint = {
+        at: new Date().toISOString(),
+        nodesProcessed: 1,
+        totalNodes: 1,
+        chunksProcessed: 1,
+        provider: httpEmbeddingProvider('http://other:8080/v1'),
+        model: 'test-model',
+        dimensions: 384,
+      };
+      await saveMeta(storagePath, {
+        repoPath: tmpRepo.dbPath,
+        lastCommit: 'test-commit',
+        indexedAt: new Date().toISOString(),
+        embeddingCheckpoint: checkpoint,
+      });
+
+      const { assertVectorRepairPreflight } = await import('../../src/core/run-analyze.js');
+      await expect(assertVectorRepairPreflight(tmpRepo.dbPath)).rejects.toThrow(
+        /completed embedding checkpoint records .*other.* but this run resolves/i,
+      );
+
+      await saveMeta(storagePath, {
+        repoPath: tmpRepo.dbPath,
+        lastCommit: 'test-commit',
+        indexedAt: new Date().toISOString(),
+        embeddingCheckpoint: { ...checkpoint, provider: undefined },
+      });
+      await expect(assertVectorRepairPreflight(tmpRepo.dbPath)).resolves.toMatchObject({
+        embeddingCheckpoint: { provider: undefined },
+      });
+    } finally {
+      const restore = (key: string, value: string | undefined) => {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      };
+      restore('GITNEXUS_EMBEDDING_URL', saved.url);
+      restore('GITNEXUS_EMBEDDING_MODEL', saved.model);
+      restore('GITNEXUS_EMBEDDING_DIMS', saved.dims);
+      await tmpRepo.cleanup();
+    }
+  });
+
   it('creates .gitnexus/.gitignore on the already-up-to-date fast path (#1233)', async () => {
     const tmpRepo = await createTempDir('gitnexus-run-analyze-fast-path-');
     try {
