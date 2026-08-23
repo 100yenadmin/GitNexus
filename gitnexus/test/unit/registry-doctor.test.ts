@@ -441,7 +441,9 @@ describe('doctor --registry read-only report (#133)', () => {
       headProbe: () => 'a'.repeat(40),
     });
 
-    expect(report.entries[0]?.health.reasons).toContain('embedding-query-local-runtime-unavailable');
+    expect(report.entries[0]?.health.reasons).toContain(
+      'embedding-query-local-runtime-unavailable',
+    );
   });
 
   it('compares explicit and default HTTP query dimensions with stored index width', async () => {
@@ -474,10 +476,14 @@ describe('doctor --registry read-only report (#133)', () => {
       );
 
     const explicitMismatch = await reportFor('512', 384);
-    expect(explicitMismatch.entries[0]?.health.reasons).toEqual(['embedding-query-dimensions-mismatch']);
+    expect(explicitMismatch.entries[0]?.health.reasons).toEqual([
+      'embedding-query-dimensions-mismatch',
+    ]);
     expect(explicitMismatch.entries[0]?.health.semantic_ready).toBe(false);
     const unsetMismatch = await reportFor(undefined, 512);
-    expect(unsetMismatch.entries[0]?.health.reasons).toContain('embedding-query-dimensions-mismatch');
+    expect(unsetMismatch.entries[0]?.health.reasons).toContain(
+      'embedding-query-dimensions-mismatch',
+    );
   });
 
   it('rejects malformed registry stats values while accepting missing and zero stats', async () => {
