@@ -1,22 +1,33 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { hookCalls, prefixLoadable, runtimeSource, transformersLoadable } = vi.hoisted(() => ({
-  hookCalls: [] as string[],
-  prefixLoadable: { value: true },
-  runtimeSource: { value: 'package' as 'package' | 'runtime-prefix' },
-  transformersLoadable: { value: true },
-}));
+const { hookCalls, failingHook, prefixLoadable, recordHook, runtimeSource, transformersLoadable } =
+  vi.hoisted(() => {
+    const hookCalls: string[] = [];
+    const failingHook = { value: null as 'stack' | 'common' | 'node' | null };
+    const recordHook = (name: 'stack' | 'common' | 'node') => {
+      hookCalls.push(name);
+      if (failingHook.value === name) throw new Error(`${name} resolver unavailable`);
+    };
+    return {
+      hookCalls,
+      failingHook,
+      prefixLoadable: { value: true },
+      recordHook,
+      runtimeSource: { value: 'package' as 'package' | 'runtime-prefix' },
+      transformersLoadable: { value: true },
+    };
+  });
 
 vi.mock('../../src/core/embeddings/runtime-install.js', () => ({
-  ensureEmbeddingStackResolvable: vi.fn(() => hookCalls.push('stack')),
+  ensureEmbeddingStackResolvable: vi.fn(() => recordHook('stack')),
   isPrefixRuntimeLoadable: vi.fn(() => prefixLoadable.value),
   resolveEmbeddingRuntime: vi.fn(() => ({ source: runtimeSource.value })),
 }));
 vi.mock('../../src/core/embeddings/onnxruntime-common-resolver.js', () => ({
-  ensureOnnxRuntimeCommonResolvable: vi.fn(() => hookCalls.push('common')),
+  ensureOnnxRuntimeCommonResolvable: vi.fn(() => recordHook('common')),
 }));
 vi.mock('../../src/core/embeddings/onnxruntime-node-resolver.js', () => ({
-  ensureOnnxRuntimeNodeMatchesSystem: vi.fn(() => hookCalls.push('node')),
+  ensureOnnxRuntimeNodeMatchesSystem: vi.fn(() => recordHook('node')),
 }));
 
 vi.mock('@huggingface/transformers', () => {
@@ -34,6 +45,7 @@ describe('provider-free query embedding runtime status', () => {
     vi.resetModules();
     prefixLoadable.value = true;
     runtimeSource.value = 'package';
+    failingHook.value = null;
     hookCalls.length = 0;
     transformersLoadable.value = true;
     for (const key of [
@@ -42,7 +54,8 @@ describe('provider-free query embedding runtime status', () => {
       'GITNEXUS_EMBEDDING_DIMS',
       'GITNEXUS_EMBEDDING_THREADS',
       'GITNEXUS_EMBEDDING_DEVICE',
-    ]) delete process.env[key];
+    ])
+      delete process.env[key];
   });
 
   it('rejects a resolvable but unloadable package runtime', async () => {
@@ -63,6 +76,21 @@ describe('provider-free query embedding runtime status', () => {
       reason: null,
     });
     expect(hookCalls).toEqual(['stack', 'common', 'node', 'transformers']);
+  });
+
+  it.each([
+    ['stack', ['stack']],
+    ['common', ['stack', 'common']],
+    ['node', ['stack', 'common', 'node']],
+  ] as const)('classifies a throwing %s resolver hook without rejecting', async (hook, calls) => {
+    failingHook.value = hook;
+
+    await expectStatus({
+      available: false,
+      mode: 'local',
+      reason: 'local-runtime-unloadable',
+    });
+    expect(hookCalls).toEqual(calls);
   });
 
   it('keeps HTTP mode available without importing the local runtime', async () => {

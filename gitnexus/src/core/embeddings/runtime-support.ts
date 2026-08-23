@@ -118,10 +118,10 @@ export const getQueryEmbeddingRuntimeStatus = async (): Promise<QueryEmbeddingRu
   // resolution fallbacks; importing transformers.js loads the native runtime
   // without creating a pipeline, loading a model, or making a provider/network
   // request.
-  ensureEmbeddingStackResolvable();
-  ensureOnnxRuntimeCommonResolvable();
-  ensureOnnxRuntimeNodeMatchesSystem();
   try {
+    ensureEmbeddingStackResolvable();
+    ensureOnnxRuntimeCommonResolvable();
+    ensureOnnxRuntimeNodeMatchesSystem();
     await import('@huggingface/transformers');
   } catch {
     return { available: false, mode: 'local', reason: 'local-runtime-unloadable' };
