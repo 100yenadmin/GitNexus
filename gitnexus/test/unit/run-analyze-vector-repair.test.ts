@@ -88,6 +88,7 @@ async function importRepairSubject(options: {
   missingEmbeddingTable?: boolean;
   malformedEmbeddingTable?: boolean;
   identityDigest?: string;
+  registered?: boolean;
   afterInitialPreflight?: () => Promise<void> | void;
 }) {
   const counts = [...(options.counts ?? [3, 3, 3, 3])];
@@ -135,6 +136,7 @@ async function importRepairSubject(options: {
     operation(),
   );
   const registerRepo = vi.fn(async () => 'fixture-repo');
+  const isRepoRegistered = vi.fn(async () => options.registered ?? true);
   const probeDoctorPool = vi.fn(async () => probes.shift() ?? healthyProbe);
   vi.doMock('../../src/core/lbug/lbug-adapter.js', async (importActual) => ({
     ...(await importActual<typeof import('../../src/core/lbug/lbug-adapter.js')>()),
@@ -172,6 +174,7 @@ async function importRepairSubject(options: {
   vi.doMock('../../src/storage/repo-manager.js', async (importActual) => ({
     ...(await importActual<typeof import('../../src/storage/repo-manager.js')>()),
     registerRepo,
+    isRepoRegistered,
   }));
 
   const subject = await import('../../src/core/run-analyze.js');
@@ -188,6 +191,7 @@ async function importRepairSubject(options: {
       inspectEmbeddingIntegrity,
       withLbugDb,
       registerRepo,
+      isRepoRegistered,
       probeDoctorPool,
     },
   };
@@ -655,6 +659,42 @@ describe('runFullAnalysis VECTOR-only repair (#170)', () => {
       );
       expect(cleared.embeddingCheckpoint).toBeUndefined();
       expect(cleared.incrementalInProgress).toBeUndefined();
+      expect(cleared.stats.embeddings).toBe(0);
+    } finally {
+      restoreEnv();
+      await indexed.fixture.cleanup();
+    }
+  });
+
+  it('clears an unregistered zero-node checkpoint without first registering the index', async () => {
+    const restoreEnv = pinDefaultEmbeddingIdentity();
+    const indexed = await createIndexedFixture(5, {
+      embeddingCheckpoint: {
+        ...completedCheckpoint,
+        nodesProcessed: 0,
+        totalNodes: 0,
+        chunksProcessed: 0,
+        provider: undefined,
+      },
+    });
+    try {
+      const { runFullAnalysis, mocks } = await importRepairSubject({
+        counts: [0, 0, 0, 0],
+        registered: false,
+      });
+      const result = await runFullAnalysis(
+        indexed.fixture.dbPath,
+        { repairVector: true },
+        { onProgress: () => {} },
+      );
+
+      expect(result.vectorRepairStatus).toBe('not-indexed');
+      expect(mocks.registerRepo).not.toHaveBeenCalled();
+
+      const cleared = JSON.parse(
+        await fs.readFile(path.join(indexed.paths.storagePath, 'gitnexus.json'), 'utf8'),
+      );
+      expect(cleared.embeddingCheckpoint).toBeUndefined();
       expect(cleared.stats.embeddings).toBe(0);
     } finally {
       restoreEnv();

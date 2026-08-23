@@ -959,7 +959,11 @@ const runFullAnalysisImpl = async (
           embeddingCheckpoint: undefined,
           incrementalInProgress: undefined,
         };
-        projectName = await commitStagedMetadataAndRegistry(clearedMeta);
+        if (await isRepoRegistered(repoPath)) {
+          projectName = await commitStagedMetadataAndRegistry(clearedMeta);
+        } else {
+          await saveMeta(canonicalMetaDir, clearedMeta);
+        }
         resultStats = {
           ...clearedMeta.stats,
           nodes: stats.nodes,
@@ -1679,7 +1683,7 @@ const runFullAnalysisImpl = async (
       stats: { ...existingMeta.stats, embeddings: 0 },
       embeddingCheckpoint: undefined,
     };
-    if (stagedPaths) {
+    if (stagedPaths || !(await isRepoRegistered(repoPath))) {
       await saveMeta(metaDir, existingMeta);
     } else {
       await commitStagedMetadataAndRegistry(existingMeta);
