@@ -1780,7 +1780,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
     try {
       const rows = await execQuery(
         `MATCH (n:${quoteNodeTable('File')}) WHERE n.id IS NOT NULL AND n.filePath IS NOT NULL ` +
-          `AND n.filePath <> '' AND n.content IS NOT NULL AND n.content <> '' ` +
+          `AND n.filePath <> '' AND n.content IS NOT NULL AND trim(n.content) <> '' ` +
           `AND n.content <> '[Binary file - content not stored]' RETURN n.id AS id LIMIT 1`,
       );
       return rows?.some(rowHasId) ?? false;
