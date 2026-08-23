@@ -981,9 +981,10 @@ const isRawSafeIntegerToken = (token: string): boolean => {
 const hasValidRawRegistryStatsNumbers = (raw: string): boolean => {
   let valid = true;
   const seenStatsObjects = new Set<string>();
+  const seenStatKeys = new Set<string>();
   visit(raw, {
-    onObjectProperty(_name, _offset, _length, _line, _character, pathSupplier) {
-      if (!valid || _name !== 'stats') return;
+    onObjectProperty(name, _offset, _length, _line, _character, pathSupplier) {
+      if (!valid) return;
       const jsonPath = pathSupplier();
       const isEntryStatsObject = jsonPath.length === 1 && typeof jsonPath[0] === 'number';
       const isBranchStatsObject =
@@ -991,10 +992,26 @@ const hasValidRawRegistryStatsNumbers = (raw: string): boolean => {
         typeof jsonPath[0] === 'number' &&
         jsonPath[1] === 'branches' &&
         typeof jsonPath[2] === 'number';
-      if (!isEntryStatsObject && !isBranchStatsObject) return;
-      const pathKey = JSON.stringify(jsonPath);
-      if (seenStatsObjects.has(pathKey)) valid = false;
-      else seenStatsObjects.add(pathKey);
+      if (name === 'stats' && (isEntryStatsObject || isBranchStatsObject)) {
+        const pathKey = JSON.stringify(jsonPath);
+        if (seenStatsObjects.has(pathKey)) valid = false;
+        else seenStatsObjects.add(pathKey);
+        return;
+      }
+      const isEntryStatProperty =
+        jsonPath.length === 2 &&
+        typeof jsonPath[0] === 'number' &&
+        jsonPath[1] === 'stats';
+      const isBranchStatProperty =
+        jsonPath.length === 4 &&
+        typeof jsonPath[0] === 'number' &&
+        jsonPath[1] === 'branches' &&
+        typeof jsonPath[2] === 'number' &&
+        jsonPath[3] === 'stats';
+      if (!isEntryStatProperty && !isBranchStatProperty) return;
+      const statKey = `${JSON.stringify(jsonPath)}:${JSON.stringify(name)}`;
+      if (seenStatKeys.has(statKey)) valid = false;
+      else seenStatKeys.add(statKey);
     },
     onLiteralValue(value, offset, length, _line, _character, pathSupplier) {
       if (!valid || typeof value !== 'number') return;
