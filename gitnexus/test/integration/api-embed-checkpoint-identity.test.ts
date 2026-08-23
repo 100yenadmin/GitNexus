@@ -711,6 +711,79 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     });
   });
 
+  it.each([
+    { label: 'successful checkpoint commit', saveError: undefined },
+    { label: 'failed checkpoint commit', saveError: 'checkpoint persistence failed' },
+  ])('keeps checkpoint cancellation pending through a $label', async ({ saveError }) => {
+    state.currentMeta = makeMeta(LIVE_DIGEST);
+    const checkpointBefore = JSON.stringify(state.currentMeta.embeddingCheckpoint);
+    let checkpointSaveStarted!: () => void;
+    const checkpointSave = new Promise<void>((resolve) => (checkpointSaveStarted = resolve));
+    let releaseSave!: () => void;
+    const saveRelease = new Promise<void>((resolve) => (releaseSave = resolve));
+    state.saveMeta.mockImplementation(async (_storagePath, next) => {
+      if (next.embeddingCheckpoint?.nodesProcessed === 2) {
+        checkpointSaveStarted();
+        await saveRelease;
+        if (saveError) throw new Error(saveError);
+      }
+      state.currentMeta = next;
+    });
+    let pipelineResumed = false;
+    state.runEmbeddingPipeline.mockImplementationOnce(async (...args: unknown[]) => {
+      const options = args[6] as {
+        onCheckpoint: (checkpoint: {
+          nodesProcessed: number;
+          totalNodes: number;
+          chunksProcessed: number;
+        }) => Promise<void>;
+      };
+      await options.onCheckpoint({ nodesProcessed: 2, totalNodes: 4, chunksProcessed: 5 });
+      pipelineResumed = true;
+    });
+
+    const response = await fetch(`${baseUrl}/api/embed`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ repo: REPO.name }),
+    });
+    const { jobId } = (await response.json()) as { jobId: string };
+    await checkpointSave;
+
+    const deleteHandlerStarted = armDeleteHandlerSignal();
+    let deleteSettled = false;
+    const deleteResponse = fetch(`${baseUrl}/api/embed/${jobId}`, { method: 'DELETE' }).then(
+      (result) => {
+        deleteSettled = true;
+        return result;
+      },
+    );
+    await deleteHandlerStarted;
+    expect(deleteSettled).toBe(false);
+    const activeJob = (await (await fetch(`${baseUrl}/api/embed/${jobId}`)).json()) as {
+      status: string;
+    };
+    expect(activeJob.status).not.toMatch(/complete|failed/);
+
+    releaseSave();
+    const deleted = await deleteResponse;
+    expect(deleted.status).toBe(400);
+    await expect(deleted.json()).resolves.toEqual({ error: 'Job already failed' });
+    const job = await waitForTerminalJob(baseUrl, jobId);
+    expect(job.status).toBe('failed');
+    expect(job.error).toBe(saveError ?? 'Cancelled by user');
+    expect(pipelineResumed).toBe(false);
+    if (saveError) {
+      expect(JSON.stringify(state.currentMeta.embeddingCheckpoint)).toBe(checkpointBefore);
+    } else {
+      expect(state.currentMeta.embeddingCheckpoint).toMatchObject({
+        nodesProcessed: 2,
+        totalNodes: 4,
+        chunksProcessed: 5,
+      });
+    }
+  });
+
   it('keeps terminal cancellation pending until completion is published', async () => {
     state.currentMeta = makeMeta(LIVE_DIGEST);
     let terminalSaveStarted!: () => void;
