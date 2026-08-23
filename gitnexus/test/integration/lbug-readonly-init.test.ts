@@ -85,7 +85,7 @@ withTestLbugDB(
       const zeroVector = new Array(EMBEDDING_DIMS).fill(0).join(',');
       const loadMeta = vi.fn(async () => {
         loadCount++;
-        if (injectWritableDrift && loadCount === 2) {
+        if (injectWritableDrift && loadCount === 3) {
           await adapter.executeQuery(
             `CREATE (e:CodeEmbedding {id:'native-row', nodeId:'Function:native.ts:run', chunkIndex:0, startLine:1, endLine:1, embedding:[${zeroVector}], contentHash:'native-hash'})`,
           );
@@ -93,7 +93,7 @@ withTestLbugDB(
         return meta;
       });
       const pipeline = vi.fn(async () => {
-        expect(loadCount).toBe(2);
+        expect(loadCount).toBe(3);
         const rows = (await adapter.executeQuery(
           "MATCH (n:Function {id:'Function:native.ts:run'}) RETURN n.id AS id",
         )) as Array<{ id: string }>;
