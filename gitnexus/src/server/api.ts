@@ -31,6 +31,7 @@ import {
   streamQuery,
   flushWAL,
   closeLbug,
+  initLbugReadOnlyNonRecovering,
   withLbugDb,
   isReadOnlyDbError,
 } from '../core/lbug/lbug-adapter.js';
@@ -1861,22 +1862,23 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
               }
             }
             if (isEmptyLegacyCheckpoint(priorCheckpoint)) {
-              const preflight = await withLbugDb(
-                lbugPath,
-                async () => {
+              await initLbugReadOnlyNonRecovering(lbugPath);
+              const preflight = await (async () => {
+                try {
                   const integrity = await inspectEmbeddingIntegrity();
                   return {
                     integrity,
                     graphHasNodes:
                       integrity.physicalRows === 0 && (await hasEmbeddableNodes(executeQuery)),
                   };
-                },
-                { readOnly: true },
-              );
+                } finally {
+                  await closeLbug();
+                }
+              })();
               if (preflight.integrity.physicalRows > 0) {
                 throw new Error(
                   'Cannot resume embedding checkpoint: it uses unknown-provider while the table contains ' +
-                    'rows. Restore the matching embedding configuration or pass --drop-embeddings to rebuild without it.',
+                    `rows. ${API_CHECKPOINT_CONTEXT}`,
                 );
               }
               assertCompletedCheckpointIdentity(

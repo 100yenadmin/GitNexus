@@ -55,6 +55,8 @@ const state = {
   liveIntegrity: makeIntegrity(LIVE_DIGEST),
   executeQuery: vi.fn(async () => [] as unknown[]),
   openModes: [] as Array<boolean | undefined>,
+  closeLbug: vi.fn(async () => undefined),
+  initLbugReadOnlyNonRecovering: vi.fn(async () => state.openModes.push(true)),
   withLbugDb: vi.fn(
     async (
       _dbPath: string,
@@ -92,7 +94,8 @@ vi.doMock('../../src/core/lbug/lbug-adapter.js', async () => ({
   executeWithReusedStatement: vi.fn(async () => undefined),
   streamQuery: vi.fn(async () => undefined),
   flushWAL: vi.fn(async () => undefined),
-  closeLbug: vi.fn(async () => undefined),
+  closeLbug: state.closeLbug,
+  initLbugReadOnlyNonRecovering: state.initLbugReadOnlyNonRecovering,
   withLbugDb: state.withLbugDb,
   isReadOnlyDbError: vi.fn(() => false),
   inspectEmbeddingIntegrity: state.inspectEmbeddingIntegrity,
@@ -178,6 +181,8 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     state.executeQuery.mockReset();
     state.executeQuery.mockResolvedValue([]);
     state.openModes.length = 0;
+    state.closeLbug.mockClear();
+    state.initLbugReadOnlyNonRecovering.mockClear();
     state.withLbugDb.mockClear();
     state.runEmbeddingPipeline.mockReset();
     state.runEmbeddingPipeline.mockResolvedValue(undefined);
@@ -272,6 +277,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     const { jobId } = (await response.json()) as { jobId: string };
     expect((await waitForTerminalJob(baseUrl, jobId)).status).toBe('complete');
     expect(state.openModes).toEqual([true]);
+    expect(state.closeLbug).toHaveBeenCalledOnce();
     expect(state.runEmbeddingPipeline).not.toHaveBeenCalled();
     expect(state.currentMeta.embeddingCheckpoint).toBeUndefined();
   });
@@ -371,6 +377,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     expect(job.status).toBe('failed');
     expect(job.error).toMatch(/preflight query failed/);
     expect(state.openModes).toEqual([true]);
+    expect(state.closeLbug).toHaveBeenCalledOnce();
     expect(JSON.stringify(state.currentMeta.embeddingCheckpoint)).toBe(before);
   });
   it('persists completed-window identity before an interrupted finalization', async () => {
