@@ -582,7 +582,7 @@ describe('runFullAnalysis VECTOR-only repair (#170)', () => {
       const { runFullAnalysis, mocks } = await importRepairSubject({});
       await expect(
         runFullAnalysis(indexed.fixture.dbPath, { repairVector: true }, { onProgress: () => {} }),
-      ).rejects.toThrow(/records voyage-code-3 at 384 dimensions/i);
+      ).rejects.toThrow(/records local \/ voyage-code-3 at 384 dimensions/i);
       expect(mocks.initLbugForMaintenance).not.toHaveBeenCalled();
 
       const untouched = JSON.parse(
