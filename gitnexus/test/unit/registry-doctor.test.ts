@@ -575,6 +575,15 @@ describe('doctor --registry read-only report (#133)', () => {
           expect(await readRegistryStrict()).toEqual({ status: 'failed', reason: 'malformed' });
         }
       }
+      for (const stats of [
+        '{"unexpected":1},"stats":{"nodes":1}',
+        '{"nodes":1},"stats":{"nodes":1}',
+      ]) {
+        for (const branchSummary of [false, true]) {
+          await writeRawStats(stats, branchSummary);
+          expect(await readRegistryStrict()).toEqual({ status: 'failed', reason: 'malformed' });
+        }
+      }
     } finally {
       if (previousHome === undefined) delete process.env.GITNEXUS_HOME;
       else process.env.GITNEXUS_HOME = previousHome;

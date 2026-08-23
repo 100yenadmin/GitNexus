@@ -980,7 +980,22 @@ const isRawSafeIntegerToken = (token: string): boolean => {
 
 const hasValidRawRegistryStatsNumbers = (raw: string): boolean => {
   let valid = true;
+  const seenStatsObjects = new Set<string>();
   visit(raw, {
+    onObjectProperty(_name, _offset, _length, _line, _character, pathSupplier) {
+      if (!valid || _name !== 'stats') return;
+      const jsonPath = pathSupplier();
+      const isEntryStatsObject = jsonPath.length === 1 && typeof jsonPath[0] === 'number';
+      const isBranchStatsObject =
+        jsonPath.length === 3 &&
+        typeof jsonPath[0] === 'number' &&
+        jsonPath[1] === 'branches' &&
+        typeof jsonPath[2] === 'number';
+      if (!isEntryStatsObject && !isBranchStatsObject) return;
+      const pathKey = JSON.stringify(jsonPath);
+      if (seenStatsObjects.has(pathKey)) valid = false;
+      else seenStatsObjects.add(pathKey);
+    },
     onLiteralValue(value, offset, length, _line, _character, pathSupplier) {
       if (!valid || typeof value !== 'number') return;
       const jsonPath = pathSupplier();
@@ -993,7 +1008,10 @@ const hasValidRawRegistryStatsNumbers = (raw: string): boolean => {
         typeof jsonPath[2] === 'number' &&
         jsonPath[3] === 'stats';
       if (!isEntryStat && !isBranchStat) return;
+      const statKey = jsonPath[jsonPath.length - 1];
       valid =
+        typeof statKey === 'string' &&
+        REGISTRY_STATS_KEYS.includes(statKey as (typeof REGISTRY_STATS_KEYS)[number]) &&
         isFiniteNonnegativeSafeInteger(value) &&
         isRawSafeIntegerToken(raw.slice(offset, offset + length));
     },
