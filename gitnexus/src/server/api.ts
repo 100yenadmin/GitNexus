@@ -1779,7 +1779,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
 
     try {
       const rows = await execQuery(
-        `MATCH (n:${quoteNodeTable('File')}) RETURN n.id AS id, n.filePath AS filePath, n.content AS content LIMIT 1`,
+        `MATCH (n:${quoteNodeTable('File')}) RETURN n.id AS id, n.filePath AS filePath, n.content AS content`,
       );
       return (
         rows?.some((row) => {
