@@ -69,6 +69,8 @@ describe('run-analyze module', () => {
     expect(source).toMatch(/checkpoint\.provider === undefined/);
     expect(source).toMatch(/provider: embeddingIdentity\.provider/);
     expect(source).toMatch(/unknown-provider/);
+    expect(source).not.toMatch(/--drop-embeddings --embeddings\./);
+    expect(source.match(/--drop-embeddings --embeddings 0/g)?.length).toBeGreaterThanOrEqual(3);
   });
 
   it('gives provider-less durable-proof mismatches actionable recovery guidance', async () => {
@@ -147,7 +149,9 @@ describe('run-analyze module', () => {
 
       const { assertVectorRepairPreflight } = await import('../../src/core/run-analyze.js');
       await expect(assertVectorRepairPreflight(tmpRepo.dbPath)).rejects.toThrow(
-        new RegExp(`completed embedding checkpoint records ${otherProvider} /`),
+        new RegExp(
+          `completed embedding checkpoint records ${otherProvider} /[\\s\\S]*--drop-embeddings --embeddings 0`,
+        ),
       );
 
       await saveMeta(storagePath, {
@@ -156,7 +160,9 @@ describe('run-analyze module', () => {
         indexedAt: new Date().toISOString(),
         embeddingCheckpoint: { ...checkpoint, provider: undefined },
       });
-      await expect(assertVectorRepairPreflight(tmpRepo.dbPath)).rejects.toThrow(/unknown-provider/);
+      await expect(assertVectorRepairPreflight(tmpRepo.dbPath)).rejects.toThrow(
+        /unknown-provider[\s\S]*--drop-embeddings --embeddings 0/,
+      );
       expect((await loadMeta(storagePath))?.embeddingCheckpoint?.provider).toBeUndefined();
 
       await saveMeta(storagePath, {

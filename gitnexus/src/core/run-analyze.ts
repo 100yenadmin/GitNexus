@@ -448,7 +448,7 @@ export const assertVectorRepairPreflight = async (
         `Cannot repair VECTOR: the completed embedding checkpoint records ${checkpoint.provider ?? 'unknown-provider'} / ` +
           `${checkpoint.model} at ${checkpoint.dimensions} dimensions, but this run resolves ` +
           `${identity.provider} / ${identity.model} at ${identity.dimensions}. Restore the matching ` +
-          'embedding configuration, or rebuild with analyze --drop-embeddings --embeddings.',
+          'embedding configuration, or rebuild with analyze --drop-embeddings --embeddings 0.',
       );
     }
   }
@@ -901,7 +901,7 @@ const runFullAnalysisImpl = async (
         throw new Error(
           'Cannot repair VECTOR: the completed embedding checkpoint has unknown-provider ' +
             'provenance while the table contains rows. Re-run analyze with ' +
-            '--force --drop-embeddings --embeddings.',
+            '--force --drop-embeddings --embeddings 0.',
         );
       }
       assertCompletedCheckpointIdentity(
