@@ -1863,17 +1863,18 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                     integrity,
                     API_CHECKPOINT_CONTEXT,
                   );
-                  embeddingMeta = { ...embeddingMeta, embeddingCheckpoint: undefined };
-                  await saveMeta(entry.storagePath, embeddingMeta);
-                  priorCheckpoint = undefined;
                   if (!(await hasEmbeddableNodes(executeQuery))) {
                     embeddingMeta = {
                       ...embeddingMeta,
                       stats: { ...embeddingMeta.stats, embeddings: integrity.validRows },
+                      embeddingCheckpoint: undefined,
                     };
                     await saveMeta(entry.storagePath, embeddingMeta);
                     return;
                   }
+                  // Keep the old checkpoint persisted until the fresh pipeline
+                  // either records a new window or finalizes successfully.
+                  priorCheckpoint = undefined;
                 }
               }
               const { getActiveEmbeddingIdentity } = await import('../core/embeddings/embedder.js');
