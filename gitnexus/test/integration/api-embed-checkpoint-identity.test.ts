@@ -408,6 +408,52 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     expect(fileQueries.every((query) => /ORDER BY n\.id LIMIT 256$/.test(query))).toBe(true);
   });
 
+  it('uses database order when a high-BMP File precedes an emoji File', async () => {
+    state.currentMeta = makeMeta(LIVE_DIGEST);
+    state.currentMeta.embeddingCheckpoint = {
+      at: REPO.indexedAt,
+      nodesProcessed: 0,
+      totalNodes: 0,
+      chunksProcessed: 0,
+      model: MODEL,
+      dimensions: identity.dimensions,
+      pendingNodeIds: [],
+    };
+    state.liveIntegrity = makeIntegrity(LIVE_DIGEST, 0);
+    state.graphNodes = [];
+    const firstId = 'File:\uE000';
+    const validId = 'File:😀';
+    const fileQueries: string[] = [];
+    state.executeQuery.mockImplementation(async (...args: unknown[]) => {
+      const query = String(args[0] ?? '');
+      if (!query.includes('`File`')) throw new Error('table LegacyNode does not exist');
+      fileQueries.push(query);
+      expect(query).toMatch(/ORDER BY n\.id LIMIT 256$/);
+      if (fileQueries.length === 1) {
+        return Array.from({ length: 256 }, (_, index) => ({
+          id: index === 255 ? firstId : `File:invalid-${index}`,
+          filePath: `invalid/${index}`,
+          content: '',
+        }));
+      }
+      expect(query).toContain(`WHERE n.id > '${escapeCypherString(firstId)}' `);
+      return [{ id: validId, filePath: 'src/emoji.ts', content: 'export const emoji = true;' }];
+    });
+
+    const response = await fetch(`${baseUrl}/api/embed`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ repo: REPO.name }),
+    });
+    const { jobId } = (await response.json()) as { jobId: string };
+    expect((await waitForTerminalJob(baseUrl, jobId)).status).toBe('complete');
+    expect(fileQueries).toHaveLength(2);
+    expect(state.runEmbeddingPipeline).toHaveBeenCalledOnce();
+    expect(state.getActiveEmbeddingIdentity).toHaveBeenCalledOnce();
+    expect(state.currentMeta.stats?.embeddings).toBe(3);
+    expect(state.currentMeta.embeddingCheckpoint).toBeUndefined();
+  });
+
   it.each([
     'table LegacyNode does not exist',
     'column LegacyNode does not exist',

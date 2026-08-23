@@ -1799,7 +1799,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
             `ORDER BY n.id LIMIT ${FILE_PREFLIGHT_PAGE_SIZE}`,
         );
         const nextFileId = String(rows?.at(-1)?.id ?? rows?.at(-1)?.[0] ?? '');
-        if (!nextFileId || (lastFileId !== undefined && nextFileId <= lastFileId)) return false;
+        if (!nextFileId || (lastFileId !== undefined && nextFileId === lastFileId)) return false;
         lastFileId = nextFileId;
         if (
           rows?.some((row) => {
