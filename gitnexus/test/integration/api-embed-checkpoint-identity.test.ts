@@ -482,6 +482,142 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     expect(fileQueries.every((query) => /ORDER BY n\.id LIMIT 256$/.test(query))).toBe(true);
   });
 
+  it('keeps a valid File when the page ends with an empty cursor', async () => {
+    state.currentMeta = makeMeta(LIVE_DIGEST);
+    state.currentMeta.embeddingCheckpoint = {
+      ...state.currentMeta.embeddingCheckpoint!,
+      nodesProcessed: 0,
+      totalNodes: 0,
+      provider: undefined,
+      physicalRows: undefined,
+      validRows: undefined,
+      recoverableIdentitySha256: undefined,
+    };
+    state.liveIntegrity = makeIntegrity(LIVE_DIGEST, 0);
+    state.graphNodes = [];
+    const fileQueries: string[] = [];
+    state.executeQuery.mockImplementation(async (...args: unknown[]) => {
+      const query = String(args[0] ?? '');
+      if (!query.includes('`File`')) throw new Error('table LegacyNode does not exist');
+      fileQueries.push(query);
+      return [
+        { id: 'valid-file', filePath: 'src/valid.ts', content: 'export const valid = true;' },
+        { id: null, filePath: 'invalid/last.ts', content: '' },
+      ];
+    });
+
+    const response = await fetch(`${baseUrl}/api/embed`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ repo: REPO.name }),
+    });
+    const { jobId } = (await response.json()) as { jobId: string };
+
+    expect((await waitForTerminalJob(baseUrl, jobId)).status).toBe('complete');
+    expect(fileQueries).toHaveLength(1);
+    expect(state.runEmbeddingPipeline).toHaveBeenCalledOnce();
+  });
+
+  it('does not enter preflight after cancellation and preserves empty-graph metadata', async () => {
+    state.currentMeta = makeMeta(LIVE_DIGEST);
+    state.currentMeta.embeddingCheckpoint = {
+      ...state.currentMeta.embeddingCheckpoint!,
+      nodesProcessed: 0,
+      totalNodes: 0,
+      provider: undefined,
+      physicalRows: 0,
+      validRows: 0,
+    };
+    state.liveIntegrity = makeIntegrity(LIVE_DIGEST, 0);
+    state.graphNodes = [];
+    let releaseInspection!: () => void;
+    let inspectionStartedResolve!: () => void;
+    const inspectionStarted = new Promise<void>((resolve) => {
+      inspectionStartedResolve = resolve;
+    });
+    const inspectionReleased = new Promise<void>((resolve) => {
+      releaseInspection = resolve;
+    });
+    state.inspectEmbeddingIntegrity.mockImplementationOnce(async () => {
+      inspectionStartedResolve();
+      await inspectionReleased;
+      return state.liveIntegrity;
+    });
+
+    const response = await fetch(`${baseUrl}/api/embed`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ repo: REPO.name }),
+    });
+    const { jobId } = (await response.json()) as { jobId: string };
+    await inspectionStarted;
+    const cancelResponse = await fetch(`${baseUrl}/api/embed/${jobId}`, { method: 'DELETE' });
+    expect(cancelResponse.status).toBe(200);
+    releaseInspection();
+
+    expect((await waitForTerminalJob(baseUrl, jobId)).status).toBe('failed');
+    expect(state.executeQuery).not.toHaveBeenCalled();
+    expect(state.runEmbeddingPipeline).not.toHaveBeenCalled();
+    expect(state.saveMeta).not.toHaveBeenCalled();
+    expect(state.currentMeta.embeddingCheckpoint).toBeDefined();
+  });
+
+  it('stops paginated preflight after cancellation before empty-graph save', async () => {
+    state.currentMeta = makeMeta(LIVE_DIGEST);
+    state.currentMeta.embeddingCheckpoint = {
+      ...state.currentMeta.embeddingCheckpoint!,
+      nodesProcessed: 0,
+      totalNodes: 0,
+      provider: undefined,
+      physicalRows: undefined,
+      validRows: undefined,
+      recoverableIdentitySha256: undefined,
+    };
+    state.liveIntegrity = makeIntegrity(LIVE_DIGEST, 0);
+    state.graphNodes = [];
+    const fileQueries: string[] = [];
+    let releaseSecondPage!: () => void;
+    let secondPageStartedResolve!: () => void;
+    const secondPageStarted = new Promise<void>((resolve) => {
+      secondPageStartedResolve = resolve;
+    });
+    const secondPageReleased = new Promise<void>((resolve) => {
+      releaseSecondPage = resolve;
+    });
+    state.executeQuery.mockImplementation(async (...args: unknown[]) => {
+      const query = String(args[0] ?? '');
+      if (!query.includes('`File`')) throw new Error('table LegacyNode does not exist');
+      fileQueries.push(query);
+      if (fileQueries.length === 1) {
+        return Array.from({ length: 256 }, (_, index) => ({
+          id: `invalid-${index}`,
+          filePath: `invalid/${index}`,
+          content: '',
+        }));
+      }
+      secondPageStartedResolve();
+      await secondPageReleased;
+      return [];
+    });
+
+    const response = await fetch(`${baseUrl}/api/embed`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ repo: REPO.name }),
+    });
+    const { jobId } = (await response.json()) as { jobId: string };
+    await secondPageStarted;
+    const cancelResponse = await fetch(`${baseUrl}/api/embed/${jobId}`, { method: 'DELETE' });
+    expect(cancelResponse.status).toBe(200);
+    releaseSecondPage();
+
+    expect((await waitForTerminalJob(baseUrl, jobId)).status).toBe('failed');
+    expect(fileQueries).toHaveLength(2);
+    expect(state.runEmbeddingPipeline).not.toHaveBeenCalled();
+    expect(state.saveMeta).not.toHaveBeenCalled();
+    expect(state.currentMeta.embeddingCheckpoint).toBeDefined();
+  });
+
   it('uses database order when a high-BMP File precedes an emoji File', async () => {
     state.currentMeta = makeMeta(LIVE_DIGEST);
     state.currentMeta.embeddingCheckpoint = {

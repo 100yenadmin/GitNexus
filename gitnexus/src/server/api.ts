@@ -1795,8 +1795,15 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
 
   const hasEmbeddableNodes = async (
     execQuery: (cypher: string) => Promise<any[]>,
+    signal: AbortSignal,
   ): Promise<boolean> => {
-    const rowHasId = (row: any): boolean => Boolean(row?.id ?? row?.[0]);
+    const getRowId = (row: any): string | undefined => {
+      const value = row?.id ?? row?.[0];
+      return value === undefined || value === null || String(value).length === 0
+        ? undefined
+        : String(value);
+    };
+    const rowHasId = (row: any): boolean => getRowId(row) !== undefined;
     const isMissingSchemaError = (err: unknown): boolean => {
       const message = err instanceof Error ? err.message : String(err);
       return (
@@ -1810,9 +1817,11 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
     };
     for (const label of EMBEDDABLE_LABELS) {
       try {
+        signal.throwIfAborted();
         const rows = await execQuery(
           `MATCH (n:${quoteNodeTable(label)}) RETURN n.id AS id LIMIT 1`,
         );
+        signal.throwIfAborted();
         if (rows?.some(rowHasId)) return true;
       } catch (err) {
         if (!isMissingSchemaError(err)) throw err;
@@ -1822,17 +1831,22 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
     let lastFileId: string | undefined;
     for (;;) {
       try {
+        signal.throwIfAborted();
         const afterId = lastFileId === undefined ? '' : `WHERE n.id > '${escapeCypherString(lastFileId)}' `;
         const rows = await execQuery(
           `MATCH (n:${quoteNodeTable('File')}) ${afterId}RETURN n.id AS id, n.filePath AS filePath, n.content AS content ` +
             `ORDER BY n.id LIMIT ${FILE_PREFLIGHT_PAGE_SIZE}`,
         );
-        const nextFileId = String(rows?.at(-1)?.id ?? rows?.at(-1)?.[0] ?? '');
+        signal.throwIfAborted();
+        const nextFileId = rows?.reduceRight<string | undefined>(
+          (cursor, row) => cursor ?? getRowId(row),
+          undefined,
+        );
         if (!nextFileId || (lastFileId !== undefined && nextFileId === lastFileId)) return false;
         lastFileId = nextFileId;
         if (
           rows?.some((row) => {
-            const id = row?.id ?? row?.[0];
+            const id = getRowId(row);
             const filePath = row?.filePath ?? row?.[1];
             const content = row?.content ?? row?.[2];
             return (
@@ -1932,7 +1946,8 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                     integrity,
                     API_CHECKPOINT_CONTEXT,
                   );
-                  if (!(await hasEmbeddableNodes(executeQuery))) {
+                  if (!(await hasEmbeddableNodes(executeQuery, embedController.signal))) {
+                    embedController.signal.throwIfAborted();
                     embeddingMeta = {
                       ...embeddingMeta,
                       stats: { ...embeddingMeta.stats, embeddings: integrity.validRows },
