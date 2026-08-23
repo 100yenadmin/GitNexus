@@ -8,6 +8,10 @@ export interface EmbeddingIdentity {
 }
 
 const normalizeHttpEndpoint = (endpoint: string): string => {
+  if (endpoint !== endpoint.trim()) {
+    throw new Error('HTTP embedding endpoint must not have surrounding whitespace.');
+  }
+
   let url: URL;
   try {
     url = new URL(endpoint);
