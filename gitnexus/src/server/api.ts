@@ -59,6 +59,7 @@ import { sweepStaleUploads } from './upload-sweep.js';
 import { isRfc1918PrivateIpv4 } from './private-ip.js';
 import { logger, flushLoggerSync } from '../core/logger.js';
 import { assertCompletedCheckpointIdentity } from '../core/embeddings/checkpoint-identity.js';
+import type { EmbeddingIdentity } from '../core/embeddings/embedding-identity.js';
 import { EMBEDDABLE_LABELS } from '../core/embeddings/types.js';
 import { escapeCypherString } from '../core/lbug/cypher-escape.js';
 
@@ -76,6 +77,34 @@ const API_CHECKPOINT_CONTEXT =
   'Run `gitnexus analyze --force --drop-embeddings --embeddings` or POST /api/analyze with force, ' +
   'dropEmbeddings, and embeddings set to true.';
 const FILE_PREFLIGHT_PAGE_SIZE = 256;
+
+const isLegacyZeroRowCheckpoint = (checkpoint?: RepoMeta['embeddingCheckpoint']): boolean =>
+  isEmptyLegacyCheckpoint(checkpoint) &&
+  (checkpoint?.physicalRows ?? 0) === 0 &&
+  (checkpoint?.validRows ?? 0) === 0;
+
+const assertEmbeddingCheckpointIdentity = (
+  checkpoint: RepoMeta['embeddingCheckpoint'],
+  identity: EmbeddingIdentity,
+): void => {
+  if (
+    !checkpoint ||
+    (checkpoint.provider !== undefined &&
+      checkpoint.provider === identity.provider &&
+      checkpoint.model === identity.model &&
+      checkpoint.dimensions === identity.dimensions)
+  ) {
+    return;
+  }
+  throw new Error(
+    `Cannot resume embedding checkpoint: it uses ${checkpoint?.provider ?? 'unknown-provider'} / ` +
+      `${checkpoint?.model} at ${checkpoint?.dimensions} dimensions, but this run resolves ` +
+      `${identity.provider} / ${identity.model} at ${identity.dimensions}. ` +
+      'Manual recovery required: do not retry POST /api/embed. Run ' +
+      '`gitnexus analyze --force --drop-embeddings --embeddings` or POST /api/analyze ' +
+      'with force, dropEmbeddings, and embeddings set to true.',
+  );
+};
 
 /**
  * Determine whether an HTTP Origin header value is allowed by CORS policy.
@@ -1868,17 +1897,33 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         // Run embedding pipeline asynchronously
         (async () => {
           try {
+            let embeddingMeta = await loadMeta(entry.storagePath);
+            if (!embeddingMeta) {
+              throw new Error('Repository metadata is missing; run gitnexus analyze first');
+            }
+            const initialMetadataFingerprint = JSON.stringify(embeddingMeta);
+            let priorCheckpoint = embeddingMeta.embeddingCheckpoint;
+            let preflightEmbeddingIdentity: EmbeddingIdentity | undefined;
+            if (priorCheckpoint && !isLegacyZeroRowCheckpoint(priorCheckpoint)) {
+              const { getActiveEmbeddingIdentity } = await import('../core/embeddings/embedder.js');
+              preflightEmbeddingIdentity = getActiveEmbeddingIdentity();
+              assertEmbeddingCheckpointIdentity(priorCheckpoint, preflightEmbeddingIdentity);
+            }
             const lbugPath = path.join(entry.storagePath, 'lbug');
             await withLbugDb(lbugPath, async () => {
+              const currentMeta = await loadMeta(entry.storagePath);
+              if (!currentMeta || JSON.stringify(currentMeta) !== initialMetadataFingerprint) {
+                throw new Error(
+                  'Embedding metadata changed while acquiring writable LadybugDB; ' +
+                    'refusing to overwrite newer metadata',
+                );
+              }
+              embeddingMeta = currentMeta;
+              priorCheckpoint = embeddingMeta.embeddingCheckpoint;
               const { runEmbeddingPipeline } =
                 await import('../core/embeddings/embedding-pipeline.js');
               const { inspectEmbeddingIntegrity, embeddingIntegrityFailures } =
                 await import('../core/lbug/lbug-adapter.js');
-              let embeddingMeta = await loadMeta(entry.storagePath);
-              if (!embeddingMeta) {
-                throw new Error('Repository metadata is missing; run gitnexus analyze first');
-              }
-              let priorCheckpoint = embeddingMeta.embeddingCheckpoint;
               if (isEmptyLegacyCheckpoint(priorCheckpoint)) {
                 const integrity = await inspectEmbeddingIntegrity();
                 if (integrity.physicalRows === 0) {
@@ -1901,24 +1946,10 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                   priorCheckpoint = undefined;
                 }
               }
-              const { getActiveEmbeddingIdentity } = await import('../core/embeddings/embedder.js');
-              const embeddingIdentity = getActiveEmbeddingIdentity();
-              if (
-                priorCheckpoint &&
-                (priorCheckpoint.provider === undefined ||
-                  priorCheckpoint.provider !== embeddingIdentity.provider ||
-                  priorCheckpoint.model !== embeddingIdentity.model ||
-                  priorCheckpoint.dimensions !== embeddingIdentity.dimensions)
-              ) {
-                throw new Error(
-                  `Cannot resume embedding checkpoint: it uses ${priorCheckpoint.provider ?? 'unknown-provider'} / ` +
-                    `${priorCheckpoint.model} at ${priorCheckpoint.dimensions} dimensions, but this run resolves ` +
-                    `${embeddingIdentity.provider} / ${embeddingIdentity.model} at ${embeddingIdentity.dimensions}. ` +
-                    'Manual recovery required: do not retry POST /api/embed. Run ' +
-                    '`gitnexus analyze --force --drop-embeddings --embeddings` or POST /api/analyze ' +
-                    'with force, dropEmbeddings, and embeddings set to true.',
-                );
-              }
+              const embeddingIdentity =
+                preflightEmbeddingIdentity ??
+                (await import('../core/embeddings/embedder.js')).getActiveEmbeddingIdentity();
+              assertEmbeddingCheckpointIdentity(priorCheckpoint, embeddingIdentity);
               if (priorCheckpoint && !priorCheckpoint.pendingNodeIds?.length) {
                 if (
                   priorCheckpoint.physicalRows !== undefined ||

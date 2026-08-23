@@ -1,5 +1,6 @@
 import http from 'node:http';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { RepoMeta } from '../../storage/repo-manager.js';
 
 const repo = {
   name: 'checkpoint-fixture',
@@ -8,7 +9,7 @@ const repo = {
   indexedAt: '2026-08-22T00:00:00.000Z',
   lastCommit: 'test-head',
 };
-const checkpoint = {
+const checkpoint: NonNullable<RepoMeta['embeddingCheckpoint']> = {
   at: repo.indexedAt,
   nodesProcessed: 0,
   totalNodes: 0,
@@ -48,6 +49,7 @@ const state = {
   })),
   pipeline: vi.fn(),
   identity: vi.fn(),
+  withLbugDb: vi.fn(async (_path: string, run: () => Promise<unknown>) => run()),
 };
 
 vi.doMock('../../storage/repo-manager.js', async () => ({
@@ -65,7 +67,7 @@ vi.doMock('../../core/lbug/lbug-adapter.js', () => ({
   streamQuery: vi.fn(async () => undefined),
   flushWAL: vi.fn(async () => undefined),
   closeLbug: vi.fn(async () => undefined),
-  withLbugDb: vi.fn(async (_path: string, run: () => Promise<unknown>) => run()),
+  withLbugDb: state.withLbugDb,
   isReadOnlyDbError: vi.fn(() => false),
   inspectEmbeddingIntegrity: state.inspect,
   embeddingIntegrityFailures: vi.fn(() => 0),
@@ -149,6 +151,7 @@ describe('POST /api/embed checkpoint recovery', () => {
     state.pipeline.mockReset();
     state.identity.mockReset();
     state.saveMeta.mockClear();
+    state.withLbugDb.mockClear();
   });
 
   afterAll(async () => {
@@ -182,6 +185,34 @@ describe('POST /api/embed checkpoint recovery', () => {
     expect(job.error).toMatch(new RegExp(message));
     expect(state.pipeline).not.toHaveBeenCalled();
     expect(state.identity).not.toHaveBeenCalled();
+    expect(state.saveMeta).not.toHaveBeenCalled();
+    expect(JSON.stringify(state.meta.embeddingCheckpoint)).toBe(before);
+  });
+
+  it('rejects an embedding identity mismatch before opening writable LadybugDB', async () => {
+    state.meta.embeddingCheckpoint = {
+      ...checkpoint,
+      provider: 'persisted-provider',
+    };
+    state.identity.mockReturnValue({
+      provider: 'active-provider',
+      model: checkpoint.model,
+      dimensions: checkpoint.dimensions,
+    });
+    const before = JSON.stringify(state.meta.embeddingCheckpoint);
+
+    const response = await fetch(`${url}/api/embed`, {
+      method: 'POST',
+      body: JSON.stringify({ repo: repo.name }),
+    });
+    const { jobId } = (await response.json()) as { jobId: string };
+    const job = await terminal(url, jobId);
+
+    expect(job.status).toBe('failed');
+    expect(job.error).toMatch(/Cannot resume embedding checkpoint/);
+    expect(state.identity).toHaveBeenCalledOnce();
+    expect(state.withLbugDb).not.toHaveBeenCalled();
+    expect(state.pipeline).not.toHaveBeenCalled();
     expect(state.saveMeta).not.toHaveBeenCalled();
     expect(JSON.stringify(state.meta.embeddingCheckpoint)).toBe(before);
   });
