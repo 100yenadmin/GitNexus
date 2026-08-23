@@ -612,4 +612,49 @@ describe('POST /api/embed completed-checkpoint identity', () => {
       pendingNodeIds: [],
     });
   });
+
+  it('waits for terminal metadata before rejecting a concurrent cancellation', async () => {
+    state.currentMeta = makeMeta(LIVE_DIGEST);
+    let releaseSave!: () => void;
+    let terminalSaveStarted!: () => void;
+    const terminalSave = new Promise<void>((resolve) => {
+      terminalSaveStarted = resolve;
+    });
+    const saveRelease = new Promise<void>((resolve) => {
+      releaseSave = resolve;
+    });
+    state.saveMeta.mockImplementation(async (_storagePath, next) => {
+      if (next.embeddingCheckpoint === undefined) {
+        terminalSaveStarted();
+        await saveRelease;
+      }
+      state.currentMeta = next;
+    });
+
+    const response = await fetch(`${baseUrl}/api/embed`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ repo: REPO.name }),
+    });
+    const { jobId } = (await response.json()) as { jobId: string };
+    await terminalSave;
+
+    let deleteSettled = false;
+    const deleteResponse = fetch(`${baseUrl}/api/embed/${jobId}`, {
+      method: 'DELETE',
+    }).then((result) => {
+      deleteSettled = true;
+      return result;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(deleteSettled).toBe(false);
+
+    releaseSave();
+    const deleted = await deleteResponse;
+    expect(deleted.status).toBe(400);
+    await expect(deleted.json()).resolves.toEqual({ error: 'Job already complete' });
+
+    expect((await waitForTerminalJob(baseUrl, jobId)).status).toBe('complete');
+    expect(state.currentMeta.embeddingCheckpoint).toBeUndefined();
+  });
 });

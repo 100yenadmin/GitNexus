@@ -117,6 +117,7 @@ export interface EmbedCommitBarrier {
   phase: EmbedCommitPhase;
   cancelRequested: boolean;
   cancelReason?: string;
+  terminalCommit?: Promise<void>;
 }
 
 export const createEmbedCommitBarrier = (): EmbedCommitBarrier => ({
@@ -156,11 +157,18 @@ export const commitEmbedMetadata = async (
   if (barrier.phase !== 'RUNNING') {
     throw new Error(barrier.cancelReason || 'Embedding job was cancelled');
   }
+  let settleTerminalCommit: (() => void) | undefined;
+  if (phase === 'COMMITTING_TERMINAL') {
+    barrier.terminalCommit = new Promise<void>((resolve) => {
+      settleTerminalCommit = resolve;
+    });
+  }
   barrier.phase = phase;
   try {
     await write();
   } catch (error) {
     barrier.phase = 'FAILED';
+    settleTerminalCommit?.();
     throw error;
   }
   if (phase === 'COMMITTING_CHECKPOINT' && barrier.cancelRequested) {
@@ -168,6 +176,7 @@ export const commitEmbedMetadata = async (
     throw new Error(barrier.cancelReason || 'Embedding job was cancelled');
   }
   barrier.phase = phase === 'COMMITTING_TERMINAL' ? 'COMPLETE' : 'RUNNING';
+  settleTerminalCommit?.();
 };
 
 /**
@@ -2208,7 +2217,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
   mountSSEProgress(app, '/api/embed/:jobId/progress', embedJobManager);
 
   // DELETE /api/embed/:jobId — cancel embedding job
-  app.delete('/api/embed/:jobId', requireLocalhostOrigin, (req, res) => {
+  app.delete('/api/embed/:jobId', requireLocalhostOrigin, async (req, res) => {
     const jobId = req.params.jobId as string;
     const job = embedJobManager.getJob(jobId);
     if (!job) {
@@ -2220,12 +2229,26 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
       return;
     }
     const barrier = embedBarriers.get(jobId);
+    const currentJob = embedJobManager.getJob(jobId);
+    if (currentJob?.status === 'complete' || currentJob?.status === 'failed') {
+      res.status(400).json({ error: `Job already ${currentJob.status}` });
+      return;
+    }
     if (barrier) {
       const outcome = requestEmbedCancellation(
         barrier,
         'Cancelled by user',
         () => embedAborters.get(jobId)?.(),
       );
+      if (outcome === 'deferred' && barrier.phase === 'COMMITTING_TERMINAL') {
+        await barrier.terminalCommit;
+        await Promise.resolve();
+      }
+      const settledJob = embedJobManager.getJob(jobId);
+      if (settledJob?.status === 'complete' || settledJob?.status === 'failed') {
+        res.status(400).json({ error: `Job already ${settledJob.status}` });
+        return;
+      }
       if (outcome === 'cancelled') embedJobManager.cancelJob(jobId, 'Cancelled by user');
     } else {
       embedJobManager.cancelJob(jobId, 'Cancelled by user');
