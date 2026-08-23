@@ -58,7 +58,7 @@ import { UPLOAD_ROOT } from './upload-paths.js';
 import { sweepStaleUploads } from './upload-sweep.js';
 import { isRfc1918PrivateIpv4 } from './private-ip.js';
 import { logger, flushLoggerSync } from '../core/logger.js';
-import { assertCompletedCheckpointIdentity } from '../core/run-analyze.js';
+import { assertCompletedCheckpointIdentity } from '../core/embeddings/checkpoint-identity.js';
 
 const _require = createRequire(import.meta.url);
 const pkg = _require('../../package.json');
@@ -68,6 +68,11 @@ const isEmptyLegacyCheckpoint = (checkpoint?: RepoMeta['embeddingCheckpoint']): 
   checkpoint.nodesProcessed === 0 &&
   checkpoint.totalNodes === 0 &&
   !checkpoint.pendingNodeIds?.length;
+
+const API_CHECKPOINT_CONTEXT =
+  'Cannot resume embedding checkpoint. Manual recovery required: do not retry POST /api/embed. ' +
+  'Run `gitnexus analyze --force --drop-embeddings --embeddings` or POST /api/analyze with force, ' +
+  'dropEmbeddings, and embeddings set to true.';
 
 /**
  * Determine whether an HTTP Origin header value is allowed by CORS policy.
@@ -1817,7 +1822,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                   assertCompletedCheckpointIdentity(
                     priorCheckpoint,
                     integrity,
-                    'Cannot resume embedding checkpoint',
+                    API_CHECKPOINT_CONTEXT,
                   );
                   embeddingMeta = { ...embeddingMeta, embeddingCheckpoint: undefined };
                   await saveMeta(entry.storagePath, embeddingMeta);
@@ -1843,28 +1848,17 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                 );
               }
               if (priorCheckpoint && !priorCheckpoint.pendingNodeIds?.length) {
-                const proof = [
-                  priorCheckpoint.physicalRows,
-                  priorCheckpoint.validRows,
-                  priorCheckpoint.recoverableIdentitySha256,
-                ];
-                if (!proof.every((value) => value === undefined)) {
+                if (
+                  priorCheckpoint.physicalRows !== undefined ||
+                  priorCheckpoint.validRows !== undefined ||
+                  priorCheckpoint.recoverableIdentitySha256 !== undefined
+                ) {
                   const integrity = await inspectEmbeddingIntegrity();
-                  if (
-                    !Number.isSafeInteger(priorCheckpoint.physicalRows) ||
-                    !Number.isSafeInteger(priorCheckpoint.validRows) ||
-                    typeof priorCheckpoint.recoverableIdentitySha256 !== 'string' ||
-                    !/^[a-f0-9]{64}$/.test(priorCheckpoint.recoverableIdentitySha256) ||
-                    embeddingIntegrityFailures(integrity) > 0 ||
-                    integrity.physicalRows !== priorCheckpoint.physicalRows ||
-                    integrity.validRows !== priorCheckpoint.validRows ||
-                    integrity.recoverableIdentitySha256 !==
-                      priorCheckpoint.recoverableIdentitySha256
-                  ) {
-                    throw new Error(
-                      'Cannot resume embedding checkpoint: its durable identity no longer matches the live table.',
-                    );
-                  }
+                  assertCompletedCheckpointIdentity(
+                    priorCheckpoint,
+                    integrity,
+                    API_CHECKPOINT_CONTEXT,
+                  );
                 }
               }
               const forceReembedNodeIds = new Set(priorCheckpoint?.pendingNodeIds ?? []);

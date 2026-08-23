@@ -226,6 +226,9 @@ describe('POST /api/embed completed-checkpoint identity', () => {
       nodesProcessed: 0,
       totalNodes: 0,
       provider: undefined,
+      physicalRows: undefined,
+      validRows: undefined,
+      recoverableIdentitySha256: undefined,
     };
     state.liveIntegrity = { ...state.liveIntegrity, physicalRows: 0, validRows: 0 };
     const response = await fetch(`${baseUrl}/api/embed`, {
@@ -257,6 +260,8 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     const job = await waitForTerminalJob(baseUrl, jobId);
 
     expect(job.error).toMatch(/failed embedding integrity validation|durable identity/i);
+    expect(job.error).toMatch(/do not retry POST \/api\/embed/i);
+    expect(job.error).toMatch(/gitnexus analyze --force --drop-embeddings --embeddings/);
     expect(state.runEmbeddingPipeline).not.toHaveBeenCalled();
     expect(state.saveMeta).not.toHaveBeenCalled();
   });

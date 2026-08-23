@@ -41,7 +41,6 @@ import {
   LbugWipeError,
   DELETE_FILES_CHUNK_SIZE,
   inspectEmbeddingIntegrity,
-  embeddingIntegrityFailures,
   type EmbeddingIntegrityReport,
 } from './lbug/lbug-adapter.js';
 import { estimateBufferPool, setBufferPoolSizeHint } from './lbug/lbug-config.js';
@@ -99,6 +98,12 @@ import {
 import { DEFAULT_PDG_MAX_INTERPROC_EDGES } from './ingestion/taint/interproc-emit.js';
 import { taintModelVersion } from './ingestion/taint/typescript-model.js';
 import { parseTruthyEnv, parsePositiveIntEnv } from './ingestion/utils/env.js';
+import {
+  assertCompletedCheckpointIdentity,
+  assertEmbeddingIntegrity,
+  embeddingIntegrityIsClean,
+  embeddingIntegritySummary,
+} from './embeddings/checkpoint-identity.js';
 import { computeFileHashes, diffFileHashes } from '../storage/file-hash.js';
 import {
   extractChangedSubgraph,
@@ -325,61 +330,6 @@ export interface AnalyzeOptions {
 const resolveEmbeddingIdentity = async (): Promise<EmbeddingIdentity> => {
   const { getActiveEmbeddingIdentity } = await import('./embeddings/embedder.js');
   return getActiveEmbeddingIdentity();
-};
-
-const embeddingIntegrityIsClean = (report: EmbeddingIntegrityReport): boolean =>
-  embeddingIntegrityFailures(report) === 0 && report.physicalRows === report.validRows;
-
-const embeddingIntegritySummary = (report: EmbeddingIntegrityReport): string =>
-  `physical=${report.physicalRows}, valid=${report.validRows}, recoverable=${report.recoverableRows}, ` +
-  `empty-id=${report.emptyIdRows}, empty-owner=${report.emptyNodeIdRows}, ` +
-  `invalid-chunk=${report.invalidChunkRows}, noncanonical-id=${report.noncanonicalIdRows}, ` +
-  `duplicate-id=${report.duplicateIdRows}, duplicate-owner-chunk=${report.duplicateSemanticRows}, ` +
-  `orphan=${report.orphanRows}, wrong-dimension=${report.wrongDimensionRows}`;
-
-const assertEmbeddingIntegrity = (
-  report: EmbeddingIntegrityReport,
-  context: string,
-  expectedCount?: number,
-): void => {
-  if (
-    !embeddingIntegrityIsClean(report) ||
-    (expectedCount !== undefined && report.physicalRows !== expectedCount)
-  ) {
-    throw new Error(
-      `${context} failed embedding integrity validation (${embeddingIntegritySummary(report)}).`,
-    );
-  }
-};
-
-export const assertCompletedCheckpointIdentity = (
-  checkpoint: NonNullable<RepoMeta['embeddingCheckpoint']>,
-  report: EmbeddingIntegrityReport,
-  context: string,
-): void => {
-  const values = [
-    checkpoint.physicalRows,
-    checkpoint.validRows,
-    checkpoint.recoverableIdentitySha256,
-  ];
-  if (values.every((value) => value === undefined)) return; // Legacy checkpoint.
-  if (
-    !Number.isSafeInteger(checkpoint.physicalRows) ||
-    !Number.isSafeInteger(checkpoint.validRows) ||
-    typeof checkpoint.recoverableIdentitySha256 !== 'string' ||
-    !/^[a-f0-9]{64}$/.test(checkpoint.recoverableIdentitySha256)
-  ) {
-    throw new Error(`${context} has an incomplete or malformed durable embedding identity.`);
-  }
-  assertEmbeddingIntegrity(report, context, checkpoint.physicalRows);
-  if (
-    report.validRows !== checkpoint.validRows ||
-    report.recoverableIdentitySha256 !== checkpoint.recoverableIdentitySha256
-  ) {
-    throw new Error(
-      `${context} no longer matches the live embedding identities (${embeddingIntegritySummary(report)}).`,
-    );
-  }
 };
 
 export const shouldRecreateStagedEmbeddingTableForResume = (
