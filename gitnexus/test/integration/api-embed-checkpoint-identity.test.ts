@@ -53,6 +53,7 @@ const makeMeta = (digest: string): RepoMeta => ({
 const state = {
   currentMeta: makeMeta(MISMATCHED_DIGEST),
   liveIntegrity: makeIntegrity(LIVE_DIGEST),
+  graphNodes: [{ id: 'node-1' }],
   runEmbeddingPipeline: vi.fn(async (..._args: unknown[]) => undefined),
   inspectEmbeddingIntegrity: vi.fn(async () => state.liveIntegrity),
   saveMeta: vi.fn(async (_storagePath: string, next: RepoMeta) => {
@@ -75,7 +76,7 @@ vi.doMock('../../src/core/lbug/lbug-adapter.js', async () => ({
   ...(await vi.importActual<typeof import('../../src/core/lbug/lbug-adapter.js')>(
     '../../src/core/lbug/lbug-adapter.js',
   )),
-  executeQuery: vi.fn(async () => []),
+  executeQuery: vi.fn(async () => state.graphNodes),
   executePrepared: vi.fn(async () => []),
   executeWithReusedStatement: vi.fn(async () => undefined),
   streamQuery: vi.fn(async () => undefined),
@@ -163,6 +164,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
   beforeEach(() => {
     state.currentMeta = makeMeta(MISMATCHED_DIGEST);
     state.liveIntegrity = makeIntegrity(LIVE_DIGEST);
+    state.graphNodes = [{ id: 'node-1' }];
     state.runEmbeddingPipeline.mockReset();
     state.runEmbeddingPipeline.mockResolvedValue(undefined);
     state.saveMeta.mockClear();
@@ -229,7 +231,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     expect(JSON.stringify(state.currentMeta.embeddingCheckpoint)).toBe(before);
   });
 
-  it('clears a legacy zero-node checkpoint only when the table is empty', async () => {
+  it('clears a legacy zero-node checkpoint and runs a fresh pipeline for current graph nodes', async () => {
     state.currentMeta = makeMeta(LIVE_DIGEST);
     state.currentMeta.embeddingCheckpoint = {
       ...state.currentMeta.embeddingCheckpoint!,
@@ -241,6 +243,10 @@ describe('POST /api/embed completed-checkpoint identity', () => {
       recoverableIdentitySha256: undefined,
     };
     state.liveIntegrity = { ...state.liveIntegrity, physicalRows: 0, validRows: 0 };
+    state.graphNodes = [{ id: 'node-1' }, { id: 'node-2' }];
+    state.runEmbeddingPipeline.mockImplementationOnce(async (executeQuery) => {
+      expect(await (executeQuery as () => Promise<unknown[]>)()).toEqual(state.graphNodes);
+    });
     const response = await fetch(`${baseUrl}/api/embed`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -248,7 +254,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     });
     const { jobId } = (await response.json()) as { jobId: string };
     expect((await waitForTerminalJob(baseUrl, jobId)).status).toBe('complete');
-    expect(state.runEmbeddingPipeline).not.toHaveBeenCalled();
+    expect(state.runEmbeddingPipeline).toHaveBeenCalledOnce();
     expect(state.currentMeta.embeddingCheckpoint).toBeUndefined();
   });
 
@@ -287,6 +293,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
       validRows: 0,
     };
     state.liveIntegrity = makeIntegrity(LIVE_DIGEST, 0);
+    state.graphNodes = [];
     const response = await fetch(`${baseUrl}/api/embed`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -295,7 +302,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     const { jobId } = (await response.json()) as { jobId: string };
 
     expect((await waitForTerminalJob(baseUrl, jobId)).status).toBe('complete');
-    expect(state.runEmbeddingPipeline).not.toHaveBeenCalled();
+    expect(state.runEmbeddingPipeline).toHaveBeenCalledOnce();
     expect(state.currentMeta.embeddingCheckpoint).toBeUndefined();
   });
 

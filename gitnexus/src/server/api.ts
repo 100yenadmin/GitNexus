@@ -1815,7 +1815,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
               if (!embeddingMeta) {
                 throw new Error('Repository metadata is missing; run gitnexus analyze first');
               }
-              const priorCheckpoint = embeddingMeta.embeddingCheckpoint;
+              let priorCheckpoint = embeddingMeta.embeddingCheckpoint;
               if (isEmptyLegacyCheckpoint(priorCheckpoint)) {
                 const integrity = await inspectEmbeddingIntegrity();
                 if (integrity.physicalRows === 0) {
@@ -1826,7 +1826,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                   );
                   embeddingMeta = { ...embeddingMeta, embeddingCheckpoint: undefined };
                   await saveMeta(entry.storagePath, embeddingMeta);
-                  return;
+                  priorCheckpoint = undefined;
                 }
               }
               const { getActiveEmbeddingIdentity } = await import('../core/embeddings/embedder.js');
