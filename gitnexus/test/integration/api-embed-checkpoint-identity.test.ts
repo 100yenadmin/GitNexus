@@ -15,22 +15,21 @@ const REPO: RegistryEntry = {
 };
 
 const identity = { provider: 'api-checkpoint-test-provider', model: MODEL, dimensions: 384 };
-const makeIntegrity = (digest: string, physicalRows = 3): EmbeddingIntegrityReport =>
-  ({
-    tablePresent: true,
-    physicalRows,
-    validRows: physicalRows,
-    recoverableRows: physicalRows,
-    emptyIdRows: 0,
-    emptyNodeIdRows: 0,
-    invalidChunkRows: 0,
-    noncanonicalIdRows: 0,
-    duplicateIdRows: 0,
-    duplicateSemanticRows: 0,
-    orphanRows: 0,
-    wrongDimensionRows: 0,
-    recoverableIdentitySha256: digest,
-  });
+const makeIntegrity = (digest: string, physicalRows = 3): EmbeddingIntegrityReport => ({
+  tablePresent: true,
+  physicalRows,
+  validRows: physicalRows,
+  recoverableRows: physicalRows,
+  emptyIdRows: 0,
+  emptyNodeIdRows: 0,
+  invalidChunkRows: 0,
+  noncanonicalIdRows: 0,
+  duplicateIdRows: 0,
+  duplicateSemanticRows: 0,
+  orphanRows: 0,
+  wrongDimensionRows: 0,
+  recoverableIdentitySha256: digest,
+});
 
 const makeMeta = (digest: string): RepoMeta => ({
   repoPath: REPO.path,
@@ -56,7 +55,10 @@ const state = {
   executeQuery: vi.fn(async () => [] as unknown[]),
   openModes: [] as Array<boolean | undefined>,
   closeLbug: vi.fn(async () => undefined),
-  initLbugReadOnlyNonRecovering: vi.fn(async () => state.openModes.push(true)),
+  withLbugReadOnlyNonRecovering: vi.fn((_dbPath: string, operation: () => Promise<unknown>) => {
+    state.openModes.push(true);
+    return operation().finally(() => state.closeLbug());
+  }),
   withLbugDb: vi.fn(
     async (
       _dbPath: string,
@@ -95,7 +97,7 @@ vi.doMock('../../src/core/lbug/lbug-adapter.js', async () => ({
   streamQuery: vi.fn(async () => undefined),
   flushWAL: vi.fn(async () => undefined),
   closeLbug: state.closeLbug,
-  initLbugReadOnlyNonRecovering: state.initLbugReadOnlyNonRecovering,
+  withLbugReadOnlyNonRecovering: state.withLbugReadOnlyNonRecovering,
   withLbugDb: state.withLbugDb,
   isReadOnlyDbError: vi.fn(() => false),
   inspectEmbeddingIntegrity: state.inspectEmbeddingIntegrity,
@@ -182,7 +184,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     state.executeQuery.mockResolvedValue([]);
     state.openModes.length = 0;
     state.closeLbug.mockClear();
-    state.initLbugReadOnlyNonRecovering.mockClear();
+    state.withLbugReadOnlyNonRecovering.mockClear();
     state.withLbugDb.mockClear();
     state.runEmbeddingPipeline.mockReset();
     state.runEmbeddingPipeline.mockResolvedValue(undefined);
