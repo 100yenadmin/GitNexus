@@ -116,6 +116,19 @@ vi.doMock('../../src/server/upload-sweep.js', () => ({
   sweepStaleUploads: async (): Promise<void> => {},
 }));
 
+vi.doMock('../../src/server/validation.js', async () => {
+  const actual = await vi.importActual<typeof import('../../src/server/validation.js')>(
+    '../../src/server/validation.js',
+  );
+  return {
+    ...actual,
+    createRouteLimiter: (opts?: { limit?: number }) =>
+      opts?.limit === 20
+        ? (_req: unknown, _res: unknown, next: () => void) => next()
+        : actual.createRouteLimiter(opts),
+  };
+});
+
 const allocatePort = (): Promise<number> =>
   new Promise((resolve, reject) => {
     const probe = http.createServer();
@@ -314,9 +327,12 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     const { jobId } = (await response.json()) as { jobId: string };
     const job = await waitForTerminalJob(baseUrl, jobId);
 
-    expect(job.error).toMatch(/failed embedding integrity validation|durable identity/i);
+    expect(job.error).toMatch(
+      /unknown-provider|failed embedding integrity validation|durable identity/i,
+    );
     expect(job.error).toMatch(/do not retry POST \/api\/embed/i);
     expect(job.error).toMatch(/gitnexus analyze --force --drop-embeddings --embeddings/);
+    expect(state.withLbugDb).not.toHaveBeenCalled();
     expect(state.runEmbeddingPipeline).not.toHaveBeenCalled();
     expect(state.saveMeta).not.toHaveBeenCalled();
   });
@@ -455,6 +471,9 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     };
     state.liveIntegrity = makeIntegrity(LIVE_DIGEST, 0);
     state.graphNodes = [];
+    state.runEmbeddingPipeline.mockImplementationOnce(async () => {
+      state.liveIntegrity = makeIntegrity(LIVE_DIGEST, 3);
+    });
     const firstId = 'File:\uE000';
     const validId = 'File:😀';
     const fileQueries: string[] = [];
