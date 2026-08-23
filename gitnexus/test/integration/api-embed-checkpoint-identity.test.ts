@@ -287,7 +287,9 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     const job = await waitForTerminalJob(baseUrl, jobId);
 
     expect(job.error).toMatch(/metadata changed during preflight/i);
-    expect(job.error).toMatch(/do not retry POST \/api\/embed/i);
+    expect(job.error).toMatch(/retry POST \/api\/embed after the current repository operation/i);
+    expect(job.error).toMatch(/ask the repository owner/i);
+    expect(job.error).not.toMatch(/do not retry|--drop-embeddings|analyze --force/i);
     expect(state.openModes).toEqual([undefined]);
     expect(state.getActiveEmbeddingIdentity).not.toHaveBeenCalled();
     expect(state.runEmbeddingPipeline).not.toHaveBeenCalled();
@@ -316,6 +318,9 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     const job = await waitForTerminalJob(baseUrl, jobId);
 
     expect(job.error).toMatch(/metadata changed during preflight/i);
+    expect(job.error).toMatch(/retry POST \/api\/embed after the current repository operation/i);
+    expect(job.error).toMatch(/ask the repository owner/i);
+    expect(job.error).not.toMatch(/do not retry|--drop-embeddings|analyze --force/i);
     expect(state.openModes).toEqual([true]);
     expect(state.withLbugDb).not.toHaveBeenCalled();
     expect(state.getActiveEmbeddingIdentity).not.toHaveBeenCalled();
