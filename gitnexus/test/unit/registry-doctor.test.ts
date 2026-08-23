@@ -166,6 +166,48 @@ describe('doctor --registry read-only report (#133)', () => {
     ).toBe(false);
   });
 
+  it('probes query runtime once and reuses the result across the report', async () => {
+    const first = await createEntry(
+      fixture.dbPath,
+      'runtime-probe-first',
+      'RuntimeProbeFirst',
+      'https://github.com/owner/runtime-probe-first.git',
+      { nodes: 1, edges: 0, embeddings: 1 },
+    );
+    const second = await createEntry(
+      fixture.dbPath,
+      'runtime-probe-second',
+      'RuntimeProbeSecond',
+      'https://github.com/owner/runtime-probe-second.git',
+      { nodes: 1, edges: 0, embeddings: 1 },
+    );
+    const embeddingRuntimeProbe = vi.fn(async () => ({
+      available: false as const,
+      mode: 'local' as const,
+      reason: 'local-runtime-unloadable' as const,
+    }));
+
+    const report = await buildRegistryDoctorReport({
+      entries: [first.entry, second.entry],
+      embeddingRuntimeProbe,
+      databaseProbe: async () => ({
+        nodes: 1,
+        edges: 0,
+        embeddings: 1,
+        integrity: cleanIntegrity(1),
+      }),
+      headProbe: () => 'a'.repeat(40),
+    });
+
+    expect(embeddingRuntimeProbe).toHaveBeenCalledTimes(1);
+    expect(report.entries).toHaveLength(2);
+    expect(
+      report.entries.every((entry) =>
+        entry.health.reasons.includes('embedding-query-local-runtime-unloadable'),
+      ),
+    ).toBe(true);
+  });
+
   it('reports canonical remote and alias collisions, count drift, and local-only entries', async () => {
     const alpha = await createEntry(
       fixture.dbPath,
@@ -352,7 +394,7 @@ describe('doctor --registry read-only report (#133)', () => {
     });
   });
 
-  it('keeps a clean HTTP endpoint available but rejects raw query and fragment markers', () => {
+  it('keeps a clean HTTP endpoint available but rejects raw query and fragment markers', async () => {
     const keys = [
       'GITNEXUS_EMBEDDING_URL',
       'GITNEXUS_EMBEDDING_MODEL',
@@ -364,7 +406,7 @@ describe('doctor --registry read-only report (#133)', () => {
       process.env.GITNEXUS_EMBEDDING_DIMS = '384';
       for (const suffix of ['', '?', '#']) {
         process.env.GITNEXUS_EMBEDDING_URL = `https://embedding.example/v1${suffix}`;
-        expect(getQueryEmbeddingRuntimeStatus()).toEqual(
+        await expect(getQueryEmbeddingRuntimeStatus()).resolves.toEqual(
           suffix === ''
             ? { available: true, mode: 'http', reason: null }
             : { available: false, mode: 'http', reason: 'http-config-invalid' },
@@ -395,7 +437,7 @@ describe('doctor --registry read-only report (#133)', () => {
       [undefined, 'model', incompleteHttp],
     ]) {
       await withEnv({ GITNEXUS_EMBEDDING_URL: url, GITNEXUS_EMBEDDING_MODEL: model }, () =>
-        expect(getQueryEmbeddingRuntimeStatus()).toMatchObject(expected),
+        expect(getQueryEmbeddingRuntimeStatus()).resolves.toMatchObject(expected),
       );
     }
   });
@@ -408,7 +450,7 @@ describe('doctor --registry read-only report (#133)', () => {
         GITNEXUS_EMBEDDING_THREADS: '0',
       },
       () =>
-        expect(getQueryEmbeddingRuntimeStatus()).toEqual({
+        expect(getQueryEmbeddingRuntimeStatus()).resolves.toEqual({
           available: false,
           mode: 'local',
           reason: 'local-config-invalid',

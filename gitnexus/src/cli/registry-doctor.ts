@@ -188,7 +188,9 @@ export interface RegistryDoctorOptions {
   databaseProbe?: RegistryDatabaseProbe;
   capabilityProbe?: RegistryCapabilityProbe;
   /** Provider-free query-runtime seam for deterministic semantic readiness. */
-  embeddingRuntimeProbe?: () => QueryEmbeddingRuntimeStatus;
+  embeddingRuntimeProbe?: () =>
+    | QueryEmbeddingRuntimeStatus
+    | PromiseLike<QueryEmbeddingRuntimeStatus>;
   /** Injectable live-head seam for deterministic registry diagnostics. */
   headProbe?: (repoPath: string) => string;
 }
@@ -537,6 +539,7 @@ const inspectEntry = async (
   entry: RegistryEntry,
   entryPosition: number,
   options: RegistryDoctorOptions,
+  embeddingRuntime: QueryEmbeddingRuntimeStatus,
 ): Promise<RegistryEntryDoctorReport> => {
   const normalizedRemote = normalizeRepositoryRemote(entry.remoteUrl);
   const identity: RegistryEntryDoctorReport['identity'] = normalizedRemote
@@ -555,7 +558,6 @@ const inspectEntry = async (
     registry_sha: nonEmptySha(entry.lastCommit),
     head_sha: null,
   };
-  const embeddingRuntime = (options.embeddingRuntimeProbe ?? getQueryEmbeddingRuntimeStatus)();
   const unavailableComparison = compareCounts(base.registry.counts, emptyCounts(), null);
 
   try {
@@ -820,9 +822,12 @@ export async function buildRegistryDoctorReport(
   // Open at most one LadybugDB handle at a time. Registry diagnosis is an
   // operator preflight, not a throughput path, and concurrent read-only opens
   // across a large fleet would create avoidable native-runtime pressure.
+  const embeddingRuntime = await (
+    options.embeddingRuntimeProbe ?? getQueryEmbeddingRuntimeStatus
+  )();
   const reports: RegistryEntryDoctorReport[] = [];
   for (const { entry, entryPosition } of indexed) {
-    reports.push(await inspectEntry(entry, entryPosition, options));
+    reports.push(await inspectEntry(entry, entryPosition, options, embeddingRuntime));
   }
   const remoteCollisionPositions = new Set(
     remotes.flatMap((collision) => collision.entryPositions),
