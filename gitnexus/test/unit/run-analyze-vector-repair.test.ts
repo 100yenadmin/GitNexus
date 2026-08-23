@@ -654,6 +654,31 @@ describe('runFullAnalysis VECTOR-only repair (#170)', () => {
     }
   });
 
+  it('refuses provider-less durable proof when recorded rows vanished', async () => {
+    const restoreEnv = pinDefaultEmbeddingIdentity();
+    const indexed = await createIndexedFixture(3, {
+      embeddingCheckpoint: {
+        ...completedCheckpoint,
+        nodesProcessed: 0,
+        totalNodes: 0,
+        provider: undefined,
+        physicalRows: 3,
+        validRows: 3,
+        recoverableIdentitySha256: 'a'.repeat(64),
+      },
+    });
+    try {
+      const { runFullAnalysis, mocks } = await importRepairSubject({ counts: [0, 0, 0, 0] });
+      await expect(
+        runFullAnalysis(indexed.fixture.dbPath, { repairVector: true }, { onProgress: () => {} }),
+      ).rejects.toThrow(/failed embedding integrity validation/i);
+      expect(mocks.initLbugForMaintenance).not.toHaveBeenCalled();
+    } finally {
+      restoreEnv();
+      await indexed.fixture.cleanup();
+    }
+  });
+
   it('refuses rather than returning not-indexed when ALL rows vanished after a completed checkpoint', async () => {
     const restoreEnv = pinDefaultEmbeddingIdentity();
     // The completed checkpoint recorded embedded nodes; the mocked live table

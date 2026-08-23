@@ -15,10 +15,10 @@ const REPO: RegistryEntry = {
 };
 
 const identity = { provider: 'api-checkpoint-test-provider', model: MODEL, dimensions: 384 };
-const makeIntegrity = (digest: string): EmbeddingIntegrityReport =>
+const makeIntegrity = (digest: string, physicalRows = 3): EmbeddingIntegrityReport =>
   ({
-    physicalRows: 3,
-    validRows: 3,
+    physicalRows,
+    validRows: physicalRows,
     recoverableIdentitySha256: digest,
   }) as EmbeddingIntegrityReport;
 
@@ -234,6 +234,51 @@ describe('POST /api/embed completed-checkpoint identity', () => {
       body: JSON.stringify({ repo: REPO.name }),
     });
     const { jobId } = (await response.json()) as { jobId: string };
+    expect((await waitForTerminalJob(baseUrl, jobId)).status).toBe('complete');
+    expect(state.runEmbeddingPipeline).not.toHaveBeenCalled();
+    expect(state.currentMeta.embeddingCheckpoint).toBeUndefined();
+  });
+
+  it('refuses provider-less durable proof when recorded rows vanished', async () => {
+    state.currentMeta = makeMeta(MISMATCHED_DIGEST);
+    state.currentMeta.embeddingCheckpoint = {
+      ...state.currentMeta.embeddingCheckpoint!,
+      nodesProcessed: 0,
+      totalNodes: 0,
+      provider: undefined,
+    };
+    state.liveIntegrity = makeIntegrity(LIVE_DIGEST, 0);
+    const response = await fetch(`${baseUrl}/api/embed`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ repo: REPO.name }),
+    });
+    const { jobId } = (await response.json()) as { jobId: string };
+    const job = await waitForTerminalJob(baseUrl, jobId);
+
+    expect(job.error).toMatch(/failed embedding integrity validation|durable identity/i);
+    expect(state.runEmbeddingPipeline).not.toHaveBeenCalled();
+    expect(state.saveMeta).not.toHaveBeenCalled();
+  });
+
+  it('clears matching provider-less durable proof for an empty table', async () => {
+    state.currentMeta = makeMeta(LIVE_DIGEST);
+    state.currentMeta.embeddingCheckpoint = {
+      ...state.currentMeta.embeddingCheckpoint!,
+      nodesProcessed: 0,
+      totalNodes: 0,
+      provider: undefined,
+      physicalRows: 0,
+      validRows: 0,
+    };
+    state.liveIntegrity = makeIntegrity(LIVE_DIGEST, 0);
+    const response = await fetch(`${baseUrl}/api/embed`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ repo: REPO.name }),
+    });
+    const { jobId } = (await response.json()) as { jobId: string };
+
     expect((await waitForTerminalJob(baseUrl, jobId)).status).toBe('complete');
     expect(state.runEmbeddingPipeline).not.toHaveBeenCalled();
     expect(state.currentMeta.embeddingCheckpoint).toBeUndefined();

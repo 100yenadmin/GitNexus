@@ -352,7 +352,7 @@ const assertEmbeddingIntegrity = (
   }
 };
 
-const assertCompletedCheckpointIdentity = (
+export const assertCompletedCheckpointIdentity = (
   checkpoint: NonNullable<RepoMeta['embeddingCheckpoint']>,
   report: EmbeddingIntegrityReport,
   context: string,
@@ -1704,6 +1704,11 @@ const runFullAnalysisImpl = async (
           'rows. Restore the matching embedding configuration or pass --drop-embeddings to rebuild without it.',
       );
     }
+    assertCompletedCheckpointIdentity(
+      legacyCheckpoint,
+      integrity,
+      'Cannot resume embedding checkpoint',
+    );
     existingMeta = { ...existingMeta, embeddingCheckpoint: undefined };
     await saveMeta(metaDir, existingMeta);
   }

@@ -58,6 +58,7 @@ import { UPLOAD_ROOT } from './upload-paths.js';
 import { sweepStaleUploads } from './upload-sweep.js';
 import { isRfc1918PrivateIpv4 } from './private-ip.js';
 import { logger, flushLoggerSync } from '../core/logger.js';
+import { assertCompletedCheckpointIdentity } from '../core/run-analyze.js';
 
 const _require = createRequire(import.meta.url);
 const pkg = _require('../../package.json');
@@ -1813,6 +1814,11 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
               if (isEmptyLegacyCheckpoint(priorCheckpoint)) {
                 const integrity = await inspectEmbeddingIntegrity();
                 if (integrity.physicalRows === 0) {
+                  assertCompletedCheckpointIdentity(
+                    priorCheckpoint,
+                    integrity,
+                    'Cannot resume embedding checkpoint',
+                  );
                   embeddingMeta = { ...embeddingMeta, embeddingCheckpoint: undefined };
                   await saveMeta(entry.storagePath, embeddingMeta);
                   return;
