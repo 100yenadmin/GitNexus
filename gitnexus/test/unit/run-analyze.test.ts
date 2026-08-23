@@ -70,8 +70,11 @@ describe('run-analyze module', () => {
     expect(source).toMatch(/provider: embeddingIdentity\.provider/);
     expect(source).toMatch(/unknown-provider/);
     expect(source).not.toMatch(/--drop-embeddings --embeddings(?! 0)/);
+    expect(source).not.toMatch(
+      /Restore the matching embedding configuration[^\n]*--drop-embeddings(?! --embeddings 0)/,
+    );
     expect(source).not.toMatch(/[Rr]e-run (?:analyze |with )--embeddings(?! 0)/);
-    expect(source.match(/--drop-embeddings --embeddings 0/g)).toHaveLength(3);
+    expect(source.match(/--drop-embeddings --embeddings 0/g)).toHaveLength(5);
     expect(source.match(/re-run analyze --embeddings 0/g)).toHaveLength(2);
     expect(source.match(/Re-run with --embeddings 0/g)).toHaveLength(1);
   });

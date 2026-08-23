@@ -1554,7 +1554,7 @@ const runFullAnalysisImpl = async (
             `${checkpoint.model} at ${checkpoint.dimensions} dimensions, but this run resolves ` +
             `${embeddingIdentityForRun.provider} / ${embeddingIdentityForRun.model} at ` +
             `${embeddingIdentityForRun.dimensions}. ` +
-            'Restore the matching embedding configuration or pass --drop-embeddings to rebuild without it.',
+            'Restore the matching embedding configuration or pass --drop-embeddings --embeddings 0 to rebuild without it.',
         );
       }
       resumeEmbeddingCheckpoint = true;
@@ -1655,7 +1655,7 @@ const runFullAnalysisImpl = async (
     if (integrity.physicalRows > 0) {
       throw new Error(
         'Cannot resume embedding checkpoint: it uses unknown-provider while the table contains ' +
-          'rows. Restore the matching embedding configuration or pass --drop-embeddings to rebuild without it.',
+          'rows. Restore the matching embedding configuration or pass --drop-embeddings --embeddings 0 to rebuild without it.',
       );
     }
     assertCompletedCheckpointIdentity(
