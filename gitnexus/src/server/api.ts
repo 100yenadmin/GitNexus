@@ -60,7 +60,7 @@ import { isRfc1918PrivateIpv4 } from './private-ip.js';
 import { logger, flushLoggerSync } from '../core/logger.js';
 import { assertCompletedCheckpointIdentity } from '../core/embeddings/checkpoint-identity.js';
 import { EMBEDDABLE_LABELS } from '../core/embeddings/types.js';
-import { isMissingColumnOrTableError } from '../core/lbug/schema-errors.js';
+import { escapeCypherString } from '../core/lbug/cypher-escape.js';
 
 const _require = createRequire(import.meta.url);
 const pkg = _require('../../package.json');
@@ -1770,10 +1770,13 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
     const rowHasId = (row: any): boolean => Boolean(row?.id ?? row?.[0]);
     const isMissingSchemaError = (err: unknown): boolean => {
       const message = err instanceof Error ? err.message : String(err);
-      if (/\bconnection\b/i.test(message)) return false;
       return (
-        isMissingColumnOrTableError(message) &&
-        /\b(?:table|column|property)\b/i.test(message)
+        /\b(?:table|column|property)\s+(?:[`'\"][^`'\"]+[`'\"]|[^\s]+)\s+(?:does not exist|not found)\b/i.test(
+          message,
+        ) ||
+        /\b(?:cannot|can't)\s+find\s+(?:the\s+)?(?:table|column|property)\s+(?:[`'\"][^`'\"]+[`'\"]|[^\s]+)/i.test(
+          message,
+        )
       );
     };
     for (const label of EMBEDDABLE_LABELS) {
@@ -1787,12 +1790,17 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
       }
     }
 
-    for (let offset = 0; ; offset += FILE_PREFLIGHT_PAGE_SIZE) {
+    let lastFileId: string | undefined;
+    for (;;) {
       try {
+        const afterId = lastFileId === undefined ? '' : `WHERE n.id > '${escapeCypherString(lastFileId)}' `;
         const rows = await execQuery(
-          `MATCH (n:${quoteNodeTable('File')}) RETURN n.id AS id, n.filePath AS filePath, n.content AS content ` +
-            `ORDER BY n.id SKIP ${offset} LIMIT ${FILE_PREFLIGHT_PAGE_SIZE}`,
+          `MATCH (n:${quoteNodeTable('File')}) ${afterId}RETURN n.id AS id, n.filePath AS filePath, n.content AS content ` +
+            `ORDER BY n.id LIMIT ${FILE_PREFLIGHT_PAGE_SIZE}`,
         );
+        const nextFileId = String(rows?.at(-1)?.id ?? rows?.at(-1)?.[0] ?? '');
+        if (!nextFileId || (lastFileId !== undefined && nextFileId === lastFileId)) return false;
+        lastFileId = nextFileId;
         if (
           rows?.some((row) => {
             const id = row?.id ?? row?.[0];

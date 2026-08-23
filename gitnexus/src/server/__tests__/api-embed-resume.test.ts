@@ -101,7 +101,16 @@ describe('POST /api/embed checkpoint recovery', () => {
 
   afterAll(async () => { onceSpy.mockRestore(); await shutdown?.(); exitSpy.mockRestore(); });
 
-  it.each(['connection not found', 'connection does not exist'])('propagates %s and retains the checkpoint', async (message) => {
+  it.each([
+    'connection not found',
+    'connection does not exist',
+    'database not found',
+    'database does not exist',
+    'query not found',
+    'query does not exist',
+    'transaction not found',
+    'transaction does not exist',
+  ])('propagates %s and retains the checkpoint', async (message) => {
     state.executeQuery.mockImplementation(async () => { throw new Error(message); });
     const before = JSON.stringify(state.meta.embeddingCheckpoint);
     const response = await fetch(`${url}/api/embed`, { method: 'POST', body: JSON.stringify({ repo: repo.name }) });
