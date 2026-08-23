@@ -2258,11 +2258,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
       const outcome = requestEmbedCancellation(barrier, 'Cancelled by user', () =>
         embedAborters.get(jobId)?.(),
       );
-      if (
-        !barrier.terminalOutcomePublished &&
-        (outcome === 'deferred' || outcome === 'terminal') &&
-        barrier.phase !== 'COMMITTING_CHECKPOINT'
-      ) {
+      if (!barrier.terminalOutcomePublished && (outcome === 'deferred' || outcome === 'terminal')) {
         await barrier.terminalOutcome;
         await Promise.resolve();
       }
