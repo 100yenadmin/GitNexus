@@ -12,17 +12,18 @@
  *
  * This module has no native or transformers.js import at module scope, so it
  * can be consulted *before* the dynamic import that would crash. Its query
- * readiness probe performs one guarded, lazy transformers.js import only after
- * the local config/platform gates pass. HTTP embedding mode never touches the
- * native runtime, so callers in HTTP mode must skip this guard.
- * (The runtime-install import below resolves paths and installs the existing
- * prefix hook only when the probe selected a prefix-sourced stack.)
+ * readiness probe performs the production resolver-hook chain and one guarded,
+ * lazy transformers.js import only after local config/platform gates pass. HTTP
+ * embedding mode never touches the native runtime, so callers in HTTP mode must
+ * skip this guard.
  */
 import {
   ensureEmbeddingStackResolvable,
   isPrefixRuntimeLoadable,
   resolveEmbeddingRuntime,
 } from './runtime-install.js';
+import { ensureOnnxRuntimeCommonResolvable } from './onnxruntime-common-resolver.js';
+import { ensureOnnxRuntimeNodeMatchesSystem } from './onnxruntime-node-resolver.js';
 import { resolveEmbeddingConfig } from './config.js';
 import { DEFAULT_EMBEDDING_CONFIG } from './types.js';
 
@@ -113,11 +114,13 @@ export const getQueryEmbeddingRuntimeStatus = async (): Promise<QueryEmbeddingRu
     return { available: false, mode: 'local', reason: 'local-runtime-unloadable' };
   }
 
-  // Importing transformers.js loads the native runtime without creating a
-  // pipeline, loading a model, or making a provider/network request. Register
-  // the existing prefix fallback first when resolution selected that source so
-  // this probe follows the same module path as the production embedder.
-  if (resolution.source === 'runtime-prefix') ensureEmbeddingStackResolvable();
+  // Mirror the production hook order. These hooks only register in-process ESM
+  // resolution fallbacks; importing transformers.js loads the native runtime
+  // without creating a pipeline, loading a model, or making a provider/network
+  // request.
+  ensureEmbeddingStackResolvable();
+  ensureOnnxRuntimeCommonResolvable();
+  ensureOnnxRuntimeNodeMatchesSystem();
   try {
     await import('@huggingface/transformers');
   } catch {
