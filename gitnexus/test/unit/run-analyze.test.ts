@@ -71,6 +71,49 @@ describe('run-analyze module', () => {
     expect(source).toMatch(/unknown-provider/);
   });
 
+  it('gives provider-less durable-proof mismatches actionable recovery guidance', async () => {
+    const tmpRepo = await createTempDir('gitnexus-run-analyze-checkpoint-guidance-');
+    try {
+      execSync('git init', { cwd: tmpRepo.dbPath, stdio: 'pipe' });
+      execSync('git -c user.name=test -c user.email=test@test commit --allow-empty -m init', {
+        cwd: tmpRepo.dbPath,
+        stdio: 'pipe',
+      });
+      await createReadableEmptyIndex(tmpRepo.dbPath);
+      const { storagePath } = getStoragePaths(tmpRepo.dbPath);
+      const checkpoint = {
+        at: new Date().toISOString(),
+        nodesProcessed: 0,
+        totalNodes: 0,
+        chunksProcessed: 0,
+        model: 'legacy-model',
+        dimensions: 384,
+        physicalRows: 3,
+        validRows: 3,
+        recoverableIdentitySha256: 'a'.repeat(64),
+      };
+      await saveMeta(storagePath, {
+        repoPath: tmpRepo.dbPath,
+        lastCommit: execSync('git rev-parse HEAD', {
+          cwd: tmpRepo.dbPath,
+          encoding: 'utf8',
+        }).trim(),
+        indexedAt: checkpoint.at,
+        schemaVersion: INCREMENTAL_SCHEMA_VERSION,
+        stats: { embeddings: 3 },
+        embeddingCheckpoint: checkpoint,
+      });
+
+      const { runFullAnalysis } = await import('../../src/core/run-analyze.js');
+      await expect(runFullAnalysis(tmpRepo.dbPath, {}, { onProgress: () => {} })).rejects.toThrow(
+        /gitnexus analyze --force --drop-embeddings --embeddings 0/,
+      );
+      expect((await loadMeta(storagePath))?.embeddingCheckpoint).toMatchObject(checkpoint);
+    } finally {
+      await tmpRepo.cleanup();
+    }
+  });
+
   it('refuses completed VECTOR repair checkpoints with mismatched or unknown providers', async () => {
     const tmpRepo = await createTempDir('gitnexus-run-analyze-vector-repair-identity-');
     const saved = {

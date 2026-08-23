@@ -41,7 +41,6 @@ import {
   LbugWipeError,
   DELETE_FILES_CHUNK_SIZE,
   inspectEmbeddingIntegrity,
-  embeddingIntegrityFailures,
   type EmbeddingIntegrityReport,
 } from './lbug/lbug-adapter.js';
 import { estimateBufferPool, setBufferPoolSizeHint } from './lbug/lbug-config.js';
@@ -99,6 +98,12 @@ import {
 import { DEFAULT_PDG_MAX_INTERPROC_EDGES } from './ingestion/taint/interproc-emit.js';
 import { taintModelVersion } from './ingestion/taint/typescript-model.js';
 import { parseTruthyEnv, parsePositiveIntEnv } from './ingestion/utils/env.js';
+import {
+  assertCompletedCheckpointIdentity,
+  assertEmbeddingIntegrity,
+  embeddingIntegrityIsClean,
+  embeddingIntegritySummary,
+} from './embeddings/checkpoint-identity.js';
 import { computeFileHashes, diffFileHashes } from '../storage/file-hash.js';
 import {
   extractChangedSubgraph,
@@ -327,61 +332,6 @@ const resolveEmbeddingIdentity = async (): Promise<EmbeddingIdentity> => {
   return getActiveEmbeddingIdentity();
 };
 
-const embeddingIntegrityIsClean = (report: EmbeddingIntegrityReport): boolean =>
-  embeddingIntegrityFailures(report) === 0 && report.physicalRows === report.validRows;
-
-const embeddingIntegritySummary = (report: EmbeddingIntegrityReport): string =>
-  `physical=${report.physicalRows}, valid=${report.validRows}, recoverable=${report.recoverableRows}, ` +
-  `empty-id=${report.emptyIdRows}, empty-owner=${report.emptyNodeIdRows}, ` +
-  `invalid-chunk=${report.invalidChunkRows}, noncanonical-id=${report.noncanonicalIdRows}, ` +
-  `duplicate-id=${report.duplicateIdRows}, duplicate-owner-chunk=${report.duplicateSemanticRows}, ` +
-  `orphan=${report.orphanRows}, wrong-dimension=${report.wrongDimensionRows}`;
-
-const assertEmbeddingIntegrity = (
-  report: EmbeddingIntegrityReport,
-  context: string,
-  expectedCount?: number,
-): void => {
-  if (
-    !embeddingIntegrityIsClean(report) ||
-    (expectedCount !== undefined && report.physicalRows !== expectedCount)
-  ) {
-    throw new Error(
-      `${context} failed embedding integrity validation (${embeddingIntegritySummary(report)}).`,
-    );
-  }
-};
-
-const assertCompletedCheckpointIdentity = (
-  checkpoint: NonNullable<RepoMeta['embeddingCheckpoint']>,
-  report: EmbeddingIntegrityReport,
-  context: string,
-): void => {
-  const values = [
-    checkpoint.physicalRows,
-    checkpoint.validRows,
-    checkpoint.recoverableIdentitySha256,
-  ];
-  if (values.every((value) => value === undefined)) return; // Legacy checkpoint.
-  if (
-    !Number.isSafeInteger(checkpoint.physicalRows) ||
-    !Number.isSafeInteger(checkpoint.validRows) ||
-    typeof checkpoint.recoverableIdentitySha256 !== 'string' ||
-    !/^[a-f0-9]{64}$/.test(checkpoint.recoverableIdentitySha256)
-  ) {
-    throw new Error(`${context} has an incomplete or malformed durable embedding identity.`);
-  }
-  assertEmbeddingIntegrity(report, context, checkpoint.physicalRows);
-  if (
-    report.validRows !== checkpoint.validRows ||
-    report.recoverableIdentitySha256 !== checkpoint.recoverableIdentitySha256
-  ) {
-    throw new Error(
-      `${context} no longer matches the live embedding identities (${embeddingIntegritySummary(report)}).`,
-    );
-  }
-};
-
 export const shouldRecreateStagedEmbeddingTableForResume = (
   rebuild: boolean,
   snapshotInfo: EmbeddingSnapshotInfo | undefined,
@@ -561,6 +511,10 @@ const FTS_UNAVAILABLE_MESSAGE =
   'Full-text/BM25 search will be disabled until the LadybugDB FTS extension is ' +
   'installed once with network access (GITNEXUS_LBUG_EXTENSION_INSTALL=auto) or ' +
   'pre-installed for offline use. Run `gitnexus doctor` for details.';
+const CLI_CHECKPOINT_CONTEXT =
+  'Cannot resume embedding checkpoint. Manual recovery required: do not retry ' +
+  '`gitnexus analyze`. ' +
+  'Run `gitnexus analyze --force --drop-embeddings --embeddings 0`.';
 
 // Re-export the pure flag-derivation helper so external callers (and tests)
 // keep importing from this module's stable surface.
@@ -1704,6 +1658,11 @@ const runFullAnalysisImpl = async (
           'rows. Restore the matching embedding configuration or pass --drop-embeddings to rebuild without it.',
       );
     }
+    assertCompletedCheckpointIdentity(
+      legacyCheckpoint,
+      integrity,
+      CLI_CHECKPOINT_CONTEXT,
+    );
     existingMeta = { ...existingMeta, embeddingCheckpoint: undefined };
     await saveMeta(metaDir, existingMeta);
   }
