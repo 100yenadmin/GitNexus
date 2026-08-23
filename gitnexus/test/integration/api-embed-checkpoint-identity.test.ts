@@ -482,6 +482,82 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     expect(fileQueries.every((query) => /ORDER BY n\.id LIMIT 256$/.test(query))).toBe(true);
   });
 
+  it('continues when a valid File precedes a null-ID row', async () => {
+    state.currentMeta = makeMeta(LIVE_DIGEST);
+    state.currentMeta.embeddingCheckpoint = {
+      ...state.currentMeta.embeddingCheckpoint!,
+      nodesProcessed: 0,
+      totalNodes: 0,
+      provider: undefined,
+      physicalRows: undefined,
+      validRows: undefined,
+      recoverableIdentitySha256: undefined,
+    };
+    state.liveIntegrity = makeIntegrity(LIVE_DIGEST, 0);
+    state.graphNodes = [];
+    state.executeQuery.mockImplementation(async (...args: unknown[]) => {
+      const query = String(args[0] ?? '');
+      if (!query.includes('`File`')) throw new Error('table LegacyNode does not exist');
+      return [
+        { id: 'valid-file', filePath: 'src/valid.ts', content: 'export const valid = true;' },
+        { id: null, filePath: 'invalid/last.ts', content: '' },
+      ];
+    });
+
+    const response = await fetch(`${baseUrl}/api/embed`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ repo: REPO.name }),
+    });
+    const { jobId } = (await response.json()) as { jobId: string };
+    expect((await waitForTerminalJob(baseUrl, jobId)).status).toBe('complete');
+    expect(state.runEmbeddingPipeline).toHaveBeenCalledOnce();
+  });
+
+  it('observes cancellation while a bounded preflight page is pending', async () => {
+    state.currentMeta = makeMeta(LIVE_DIGEST);
+    state.currentMeta.embeddingCheckpoint = {
+      ...state.currentMeta.embeddingCheckpoint!,
+      nodesProcessed: 0,
+      totalNodes: 0,
+      provider: undefined,
+      physicalRows: 0,
+      validRows: 0,
+    };
+    state.liveIntegrity = makeIntegrity(LIVE_DIGEST, 0);
+    state.graphNodes = [];
+    let releasePage!: () => void;
+    let pageStartedResolve!: () => void;
+    const pageStarted = new Promise<void>((resolve) => {
+      pageStartedResolve = resolve;
+    });
+    const pageReleased = new Promise<void>((resolve) => {
+      releasePage = resolve;
+    });
+    state.executeQuery.mockImplementation(async (...args: unknown[]) => {
+      const query = String(args[0] ?? '');
+      if (!query.includes('`File`')) throw new Error('table LegacyNode does not exist');
+      pageStartedResolve();
+      await pageReleased;
+      return [];
+    });
+
+    const response = await fetch(`${baseUrl}/api/embed`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ repo: REPO.name }),
+    });
+    const { jobId } = (await response.json()) as { jobId: string };
+    await pageStarted;
+    expect((await fetch(`${baseUrl}/api/embed/${jobId}`, { method: 'DELETE' })).status).toBe(200);
+    releasePage();
+
+    expect((await waitForTerminalJob(baseUrl, jobId)).status).toBe('failed');
+    expect(state.runEmbeddingPipeline).not.toHaveBeenCalled();
+    expect(state.saveMeta).not.toHaveBeenCalled();
+    expect(state.currentMeta.embeddingCheckpoint).toBeDefined();
+  });
+
   it('uses database order when a high-BMP File precedes an emoji File', async () => {
     state.currentMeta = makeMeta(LIVE_DIGEST);
     state.currentMeta.embeddingCheckpoint = {
