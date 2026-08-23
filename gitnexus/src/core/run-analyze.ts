@@ -945,6 +945,7 @@ const runFullAnalysisImpl = async (
       if (existingMeta.embeddingCheckpoint) {
         await saveMeta(canonicalMetaDir, {
           ...existingMeta,
+          stats: { ...existingMeta.stats, embeddings: 0 },
           embeddingCheckpoint: undefined,
           incrementalInProgress: undefined,
         });
@@ -1658,12 +1659,12 @@ const runFullAnalysisImpl = async (
           'rows. Restore the matching embedding configuration or pass --drop-embeddings to rebuild without it.',
       );
     }
-    assertCompletedCheckpointIdentity(
-      legacyCheckpoint,
-      integrity,
-      CLI_CHECKPOINT_CONTEXT,
-    );
-    existingMeta = { ...existingMeta, embeddingCheckpoint: undefined };
+    assertCompletedCheckpointIdentity(legacyCheckpoint, integrity, CLI_CHECKPOINT_CONTEXT);
+    existingMeta = {
+      ...existingMeta,
+      stats: { ...existingMeta.stats, embeddings: 0 },
+      embeddingCheckpoint: undefined,
+    };
     await saveMeta(metaDir, existingMeta);
   }
 

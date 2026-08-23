@@ -618,12 +618,12 @@ describe('runFullAnalysis VECTOR-only repair (#170)', () => {
     }
   });
 
-  it('clears a completed zero-node checkpoint on the not-indexed path (empty repository)', async () => {
+  it('clears a completed zero-node checkpoint and resets stats on the not-indexed path', async () => {
     const restoreEnv = pinDefaultEmbeddingIdentity();
     // An empty repository's embed run completed trivially (totalNodes 0) and
     // crashed before finalize. Repair must report not-indexed AND clear the
     // checkpoint, or the repo stays permanently marked as interrupted.
-    const indexed = await createIndexedFixture(0, {
+    const indexed = await createIndexedFixture(5, {
       embeddingCheckpoint: {
         ...completedCheckpoint,
         nodesProcessed: 0,
@@ -648,6 +648,7 @@ describe('runFullAnalysis VECTOR-only repair (#170)', () => {
       );
       expect(cleared.embeddingCheckpoint).toBeUndefined();
       expect(cleared.incrementalInProgress).toBeUndefined();
+      expect(cleared.stats.embeddings).toBe(0);
     } finally {
       restoreEnv();
       await indexed.fixture.cleanup();
