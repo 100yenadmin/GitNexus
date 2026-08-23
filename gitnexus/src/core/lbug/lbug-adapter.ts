@@ -29,6 +29,9 @@ import type { PdgEmitManifest } from './pdg-emit-sink.js';
 import { getNodeLabel as deriveNodeLabel, type WriteStreamFactory } from './rel-pair-routing.js';
 import { EMBEDDABLE_LABELS, type CachedEmbedding } from '../embeddings/types.js';
 import {
+  embeddingPhysicalRowDigest,
+  embeddingPhysicalRowsDigest,
+  embeddingPhysicalVectorInfo,
   embeddingIdentitySetDigest,
   embeddingSemanticIdentity,
 } from '../embeddings/identity-digest.js';
@@ -1824,8 +1827,29 @@ export interface EmbeddingIntegrityReport {
   orphanRows: number;
   wrongDimensionRows: number;
   recoverableIdentitySha256: string;
+  physicalRowsSha256: string;
 }
 
+const projectionField = (row: any, name: string, index: number): unknown =>
+  row && name in row ? row[name] : row?.[index];
+const normalizedText = (value: unknown): string =>
+  value === null || value === undefined ? '' : String(value);
+const strictInteger = (value: unknown): number =>
+  Number.isSafeInteger(value)
+    ? (value as number)
+    : typeof value === 'bigint' &&
+        Number.isSafeInteger(Number(value)) &&
+        BigInt(Number(value)) === value
+      ? Number(value)
+      : Number.NaN;
+const ownerLabelForNodeId = (nodeId: string): string => {
+  const separator = nodeId.indexOf(':');
+  return separator > 0 ? nodeId.slice(0, separator) : '';
+};
+export const isMissingContentHashError = (error: unknown): boolean =>
+  /^Binder exception:\s*Cannot find property contentHash(?: for e)?\.?$/.test(
+    error instanceof Error ? error.message : String(error),
+  );
 const MAX_STORED_EMBEDDING_DIMENSIONS = 65_536;
 
 /** Read the vector width declared by this database's embedding table. */
@@ -1932,33 +1956,25 @@ export const scanEmbeddingPreservationRows = async (
           `e.chunkIndex AS chunkIndex, e.startLine AS startLine, e.endLine AS endLine, ` +
           `e.embedding AS embedding${hashProjection}`,
         async (row) => {
-          const id = String(row.id ?? row[0] ?? '');
-          const nodeId = String(row.nodeId ?? row[1] ?? '');
-          const rawChunk = row.chunkIndex ?? row[2];
-          const chunkIndex =
-            rawChunk === null ||
-            rawChunk === undefined ||
-            (typeof rawChunk === 'string' && rawChunk.trim() === '')
-              ? Number.NaN
-              : Number(rawChunk);
-          const vector = row.embedding ?? row[5];
-          const values =
-            Array.isArray(vector) || ArrayBuffer.isView(vector)
-              ? Array.from(vector as ArrayLike<unknown>)
-              : [];
+          const id = normalizedText(projectionField(row, 'id', 0));
+          const nodeId = normalizedText(projectionField(row, 'nodeId', 1));
+          const rawChunk = projectionField(row, 'chunkIndex', 2);
+          const chunkIndex = strictInteger(rawChunk);
+          const vector = projectionField(row, 'embedding', 5);
+          const vectorInfo = embeddingPhysicalVectorInfo(vector);
           const observation: EmbeddingPreservationObservation = {
             id,
             nodeId,
             chunkIndex,
-            dimensions: values.length,
-            finite: values.every((value) => typeof value === 'number' && Number.isFinite(value)),
+            dimensions: vectorInfo.dimensions,
+            finite: vectorInfo.finite === 'finite',
           };
           observations.push(observation);
           physicalRows++;
           idCounts.set(id, (idCounts.get(id) ?? 0) + 1);
           const key = semanticKey(nodeId, chunkIndex);
           if (key) semanticCounts.set(key, (semanticCounts.get(key) ?? 0) + 1);
-          const label = ownerLabel(nodeId);
+          const label = ownerLabelForNodeId(nodeId);
           if (ownerLabels.has(label)) {
             let ids = ownerIdsByLabel.get(label);
             if (!ids) ownerIdsByLabel.set(label, (ids = new Set()));
@@ -2072,7 +2088,7 @@ export const scanEmbeddingPreservationRows = async (
         `e.chunkIndex AS chunkIndex, e.startLine AS startLine, e.endLine AS endLine, ` +
         `e.embedding AS embedding${hashProjection} ORDER BY e.id`,
       async (row) => {
-        const id = String(row.id ?? row[0] ?? '');
+        const id = normalizedText(projectionField(row, 'id', 0));
         if (!acceptedIds.has(id)) return;
         const vector = row.embedding ?? row[5];
         const embedding =
@@ -2082,10 +2098,10 @@ export const scanEmbeddingPreservationRows = async (
         const hash = hasContentHash ? (row.contentHash ?? row[6]) : undefined;
         pending.push({
           id,
-          nodeId: String(row.nodeId ?? row[1] ?? ''),
-          chunkIndex: Number(row.chunkIndex ?? row[2]),
-          startLine: Number(row.startLine ?? row[3] ?? 0),
-          endLine: Number(row.endLine ?? row[4] ?? 0),
+          nodeId: normalizedText(projectionField(row, 'nodeId', 1)),
+          chunkIndex: strictInteger(projectionField(row, 'chunkIndex', 2)),
+          startLine: strictInteger(projectionField(row, 'startLine', 3)),
+          endLine: strictInteger(projectionField(row, 'endLine', 4)),
           embedding,
           ...(hash === null || hash === undefined ? {} : { contentHash: String(hash) }),
         });
@@ -2116,6 +2132,7 @@ export const scanEmbeddingPreservationRows = async (
  */
 export const inspectEmbeddingIntegrity = async (
   expectedDimensions: number = EMBEDDING_DIMS,
+  fullDigest = false,
 ): Promise<EmbeddingIntegrityReport> => {
   const c = conn;
   if (!c) throw new Error('LadybugDB not initialized. Call initLbug first.');
@@ -2129,8 +2146,8 @@ export const inspectEmbeddingIntegrity = async (
       semanticKey: string;
     };
     const rows: IdentityRow[] = [];
-    const seenIds = new Set<string>();
-    const seenSemantic = new Set<string>();
+    const idCounts = new Map<string, number>();
+    const semanticCounts = new Map<string, number>();
     const ownerCandidates = new Set<string>();
     let emptyIdRows = 0;
     let emptyNodeIdRows = 0;
@@ -2165,29 +2182,26 @@ export const inspectEmbeddingIntegrity = async (
         `MATCH (e:${EMBEDDING_TABLE_NAME}) RETURN e.id AS id, e.nodeId AS nodeId, ` +
           `e.chunkIndex AS chunkIndex, size(e.embedding) AS dimensions`,
         (row) => {
-          const id = String(row.id ?? row[0] ?? '');
-          const nodeId = String(row.nodeId ?? row[1] ?? '');
-          const rawChunk = row.chunkIndex ?? row[2];
-          const chunkIndex = Number(rawChunk);
-          const dimensions = Number(row.dimensions ?? row[3] ?? -1);
+          const id = normalizedText(projectionField(row, 'id', 0));
+          const nodeId = normalizedText(projectionField(row, 'nodeId', 1));
+          const chunkIndex = strictInteger(projectionField(row, 'chunkIndex', 2));
+          const dimensions = Number(projectionField(row, 'dimensions', 3) ?? -1);
           const idEmpty = id.trim().length === 0;
           const nodeIdEmpty = nodeId.trim().length === 0;
           const chunkInvalid = !Number.isSafeInteger(chunkIndex) || chunkIndex < 0;
-          const semanticKey = embeddingSemanticIdentity(nodeId, chunkIndex);
+          const semanticKey =
+            !nodeIdEmpty && !chunkInvalid ? embeddingSemanticIdentity(nodeId, chunkIndex) : '';
           if (idEmpty) emptyIdRows++;
           if (nodeIdEmpty) emptyNodeIdRows++;
           if (chunkInvalid) invalidChunkRows++;
           if (!idEmpty && !nodeIdEmpty && !chunkInvalid && id !== `${nodeId}:${chunkIndex}`) {
             noncanonicalIdRows++;
           }
-          if (seenIds.has(id)) duplicateIdRows++;
-          else seenIds.add(id);
-          if (!nodeIdEmpty && !chunkInvalid) {
-            if (seenSemantic.has(semanticKey)) duplicateSemanticRows++;
-            else seenSemantic.add(semanticKey);
-            ownerCandidates.add(nodeId);
-          }
+          idCounts.set(id, (idCounts.get(id) ?? 0) + 1);
+          if (semanticKey)
+            semanticCounts.set(semanticKey, (semanticCounts.get(semanticKey) ?? 0) + 1);
           if (dimensions !== expectedDimensions) wrongDimensionRows++;
+          if (!nodeIdEmpty) ownerCandidates.add(`${ownerLabelForNodeId(nodeId)}\0${nodeId}`);
           rows.push({ id, nodeId, chunkIndex, dimensions, semanticKey });
         },
       );
@@ -2207,21 +2221,30 @@ export const inspectEmbeddingIntegrity = async (
           orphanRows: 0,
           wrongDimensionRows: 0,
           recoverableIdentitySha256: embeddingIdentitySetDigest(new Set()),
+          physicalRowsSha256: embeddingPhysicalRowsDigest(false, 0, []),
         };
       }
       throw error;
     }
 
-    // Node ids are small compared with vectors. Delete live owners from the
-    // candidate set one label at a time, retaining no graph payload.
+    duplicateIdRows = [...idCounts.values()].reduce(
+      (total, count) => total + Math.max(0, count - 1),
+      0,
+    );
+    duplicateSemanticRows = [...semanticCounts.values()].reduce(
+      (total, count) => total + Math.max(0, count - 1),
+      0,
+    );
+    const missingOwnerLabels = new Set<string>();
     for (const label of [...EMBEDDABLE_LABELS, 'File'] as const) {
       try {
         await stream(`MATCH (n:${escapeTableName(label)}) RETURN n.id AS id`, (row) => {
-          const id = String(row.id ?? row[0] ?? '');
-          if (id) ownerCandidates.delete(id);
+          const id = normalizedText(projectionField(row, 'id', 0));
+          if (id) ownerCandidates.delete(`${label}\0${id}`);
         });
       } catch (error) {
-        if (!isMissingEmbeddingOwnerTableError(error, label)) throw error;
+        if (isMissingEmbeddingOwnerTableError(error, label)) missingOwnerLabels.add(label);
+        else throw error;
       }
     }
 
@@ -2234,7 +2257,8 @@ export const inspectEmbeddingIntegrity = async (
       const idEmpty = row.id.trim().length === 0;
       const nodeIdEmpty = row.nodeId.trim().length === 0;
       const chunkInvalid = !Number.isSafeInteger(row.chunkIndex) || row.chunkIndex < 0;
-      const ownerMissing = !nodeIdEmpty && ownerCandidates.has(row.nodeId);
+      const ownerMissing =
+        !nodeIdEmpty && ownerCandidates.has(`${ownerLabelForNodeId(row.nodeId)}\0${row.nodeId}`);
       if (ownerMissing) orphanRows++;
       if (!nodeIdEmpty && !chunkInvalid && row.dimensions === expectedDimensions && !ownerMissing) {
         recoverable.add(row.semanticKey);
@@ -2255,10 +2279,87 @@ export const inspectEmbeddingIntegrity = async (
       }
     }
 
+    const physicalDigestRows = async (withHash: boolean): Promise<string[]> => {
+      if (!fullDigest) return [];
+      const digests: string[] = [];
+      const hashProjection = withHash ? ', e.contentHash AS contentHash' : '';
+      await stream(
+        `MATCH (e:${EMBEDDING_TABLE_NAME}) RETURN e.id AS id, e.nodeId AS nodeId, ` +
+          `e.chunkIndex AS chunkIndex, e.startLine AS startLine, e.endLine AS endLine, ` +
+          `e.embedding AS embedding${hashProjection}`,
+        (row) => {
+          const rawId = projectionField(row, 'id', 0);
+          const rawNodeId = projectionField(row, 'nodeId', 1);
+          const rawChunkIndex = projectionField(row, 'chunkIndex', 2);
+          const id = normalizedText(rawId);
+          const nodeId = normalizedText(rawNodeId);
+          const chunkIndex = strictInteger(rawChunkIndex);
+          const vector = embeddingPhysicalVectorInfo(projectionField(row, 'embedding', 5));
+          const label = ownerLabelForNodeId(nodeId);
+          const supported = label === 'File' || EMBEDDABLE_LABELS.includes(label as any);
+          const ownerState = !supported
+            ? 'unsupported-label'
+            : missingOwnerLabels.has(label)
+              ? 'missing-table'
+              : ownerCandidates.has(`${label}\0${nodeId}`)
+                ? 'missing-row'
+                : 'present';
+          const reasons = new Set<string>();
+          const emptyId = !id.trim();
+          const emptyNode = !nodeId.trim();
+          const badChunk = !Number.isSafeInteger(chunkIndex) || chunkIndex < 0;
+          if (emptyId) reasons.add('id-empty');
+          if (emptyNode) reasons.add('node-id-empty');
+          if (badChunk) reasons.add('chunk-index-invalid');
+          if (!emptyId && !emptyNode && !badChunk && id !== `${nodeId}:${chunkIndex}`) {
+            reasons.add('id-noncanonical');
+          }
+          if (vector.finite !== 'finite') reasons.add(`vector-${vector.finite}`);
+          if (vector.dimensions !== expectedDimensions) reasons.add('wrong-dimensions');
+          if (ownerState !== 'present') reasons.add(`owner-${ownerState}`);
+          if ((idCounts.get(id) ?? 0) > 1) reasons.add('duplicate-id');
+          const semantic =
+            !emptyNode && !badChunk ? embeddingSemanticIdentity(nodeId, chunkIndex) : '';
+          if (semantic && (semanticCounts.get(semantic) ?? 0) > 1)
+            reasons.add('duplicate-semantic');
+          if (reasons.size === 0) physicalValidRows++;
+          digests.push(
+            embeddingPhysicalRowDigest({
+              rawId,
+              id,
+              rawNodeId,
+              nodeId,
+              rawChunkIndex,
+              chunkIndex,
+              rawStartLine: projectionField(row, 'startLine', 3),
+              startLine: strictInteger(projectionField(row, 'startLine', 3)),
+              rawEndLine: projectionField(row, 'endLine', 4),
+              endLine: strictInteger(projectionField(row, 'endLine', 4)),
+              contentHashPresent: withHash && projectionField(row, 'contentHash', 6) !== undefined,
+              rawContentHash: withHash ? projectionField(row, 'contentHash', 6) : undefined,
+              vector,
+              ownerLabel: label,
+              ownerState,
+              rejectionReasons: [...reasons],
+            }),
+          );
+        },
+      );
+      return digests;
+    };
+    let physicalValidRows = fullDigest ? 0 : validRows;
+    let rowDigests: string[] = [];
+    try {
+      rowDigests = await physicalDigestRows(true);
+    } catch (error) {
+      if (!isMissingContentHashError(error)) throw error;
+      physicalValidRows = 0;
+      rowDigests = await physicalDigestRows(false);
+    }
     return {
       tablePresent: true,
       physicalRows: rows.length,
-      validRows,
+      validRows: Math.min(validRows, physicalValidRows),
       recoverableRows: recoverable.size,
       emptyIdRows,
       emptyNodeIdRows,
@@ -2269,6 +2370,9 @@ export const inspectEmbeddingIntegrity = async (
       orphanRows,
       wrongDimensionRows,
       recoverableIdentitySha256: embeddingIdentitySetDigest(recoverable),
+      physicalRowsSha256: fullDigest
+        ? embeddingPhysicalRowsDigest(true, rows.length, rowDigests)
+        : '',
     };
   });
 };
