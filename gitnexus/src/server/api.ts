@@ -148,14 +148,14 @@ export const requestEmbedCancellation = (
 ): 'cancelled' | 'deferred' | 'terminal' => {
   if (barrier.phase === 'RUNNING') {
     barrier.cancelRequested = true;
-    barrier.cancelReason = reason;
+    barrier.cancelReason ??= reason;
     barrier.phase = 'FAILED';
     abort();
     return 'cancelled';
   }
   if (barrier.phase === 'COMMITTING_CHECKPOINT' || barrier.phase === 'COMMITTING_TERMINAL') {
     barrier.cancelRequested = true;
-    barrier.cancelReason = reason;
+    barrier.cancelReason ??= reason;
     if (barrier.phase === 'COMMITTING_CHECKPOINT') abort();
     return 'deferred';
   }
