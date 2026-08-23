@@ -10,14 +10,19 @@
  * cannot rescue this — the failure is at native-module import time, not backend
  * selection (#1516).
  *
- * This module is intentionally free of any native or transformers.js import (at
- * module scope or inside its functions) so it can be consulted *before* the
- * dynamic import that would crash. HTTP embedding mode never touches the native
- * runtime, so callers in HTTP mode must skip this guard.
- * (The runtime-install import below only resolves paths — it never loads the
- * embedding stack.)
+ * This module has no native or transformers.js import at module scope, so it
+ * can be consulted *before* the dynamic import that would crash. Its query
+ * readiness probe performs one guarded, lazy transformers.js import only after
+ * the local config/platform gates pass. HTTP embedding mode never touches the
+ * native runtime, so callers in HTTP mode must skip this guard.
+ * (The runtime-install import below resolves paths and installs the existing
+ * prefix hook only when the probe selected a prefix-sourced stack.)
  */
-import { isPrefixRuntimeLoadable, resolveEmbeddingRuntime } from './runtime-install.js';
+import {
+  ensureEmbeddingStackResolvable,
+  isPrefixRuntimeLoadable,
+  resolveEmbeddingRuntime,
+} from './runtime-install.js';
 import { resolveEmbeddingConfig } from './config.js';
 import { DEFAULT_EMBEDDING_CONFIG } from './types.js';
 
@@ -42,12 +47,13 @@ const validHttpInteger = (name: string, max: number, allowZero: boolean): boolea
 };
 
 /**
- * Provider-free readiness for the query embedding path. This only validates
- * local module resolution/platform gates or the shape of an installed HTTP
- * wrapper configuration; it never imports a model, opens a socket, or stores
- * an endpoint, model, or secret in the returned status.
+ * Provider-free readiness for the query embedding path. This validates local
+ * module resolution/platform gates and imports the local runtime module, or
+ * validates the shape of an installed HTTP wrapper configuration. It never
+ * initializes a model, opens a socket, or stores an endpoint, model, or secret
+ * in the returned status.
  */
-export const getQueryEmbeddingRuntimeStatus = (): QueryEmbeddingRuntimeStatus => {
+export const getQueryEmbeddingRuntimeStatus = async (): Promise<QueryEmbeddingRuntimeStatus> => {
   const rawUrl = process.env.GITNEXUS_EMBEDDING_URL;
   const rawModel = process.env.GITNEXUS_EMBEDDING_MODEL;
   if (Boolean(rawUrl) !== Boolean(rawModel)) {
@@ -104,6 +110,17 @@ export const getQueryEmbeddingRuntimeStatus = (): QueryEmbeddingRuntimeStatus =>
     return { available: false, mode: 'local', reason: 'local-runtime-unavailable' };
   }
   if (resolution.source === 'runtime-prefix' && !isPrefixRuntimeLoadable()) {
+    return { available: false, mode: 'local', reason: 'local-runtime-unloadable' };
+  }
+
+  // Importing transformers.js loads the native runtime without creating a
+  // pipeline, loading a model, or making a provider/network request. Register
+  // the existing prefix fallback first when resolution selected that source so
+  // this probe follows the same module path as the production embedder.
+  if (resolution.source === 'runtime-prefix') ensureEmbeddingStackResolvable();
+  try {
+    await import('@huggingface/transformers');
+  } catch {
     return { available: false, mode: 'local', reason: 'local-runtime-unloadable' };
   }
   return { available: true, mode: 'local', reason: null };
