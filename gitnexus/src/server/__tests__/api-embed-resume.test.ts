@@ -1,5 +1,6 @@
 import http from 'node:http';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { RepoMeta } from '../../storage/repo-manager.js';
 
 const repo = {
   name: 'checkpoint-fixture',
@@ -8,7 +9,7 @@ const repo = {
   indexedAt: '2026-08-22T00:00:00.000Z',
   lastCommit: 'test-head',
 };
-const checkpoint = {
+const checkpoint: NonNullable<RepoMeta['embeddingCheckpoint']> = {
   at: repo.indexedAt,
   nodesProcessed: 0,
   totalNodes: 0,
