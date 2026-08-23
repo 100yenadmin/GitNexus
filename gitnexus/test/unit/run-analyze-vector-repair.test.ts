@@ -641,7 +641,14 @@ describe('runFullAnalysis VECTOR-only repair (#170)', () => {
       );
 
       expect(result.vectorRepairStatus).toBe('not-indexed');
+      expect(result.repoName).toBe('fixture-repo');
       expect(mocks.initLbugForMaintenance).not.toHaveBeenCalled();
+      expect(mocks.registerRepo).toHaveBeenCalledOnce();
+      expect(mocks.registerRepo.mock.calls[0]?.[1]).toMatchObject({
+        stats: { embeddings: 0 },
+        embeddingCheckpoint: undefined,
+        incrementalInProgress: undefined,
+      });
 
       const cleared = JSON.parse(
         await fs.readFile(path.join(indexed.paths.storagePath, 'gitnexus.json'), 'utf8'),
