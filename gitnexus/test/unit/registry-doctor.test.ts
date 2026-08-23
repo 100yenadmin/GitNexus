@@ -378,11 +378,20 @@ describe('doctor --registry read-only report (#133)', () => {
   });
 
   it('rejects leading and trailing whitespace in raw HTTP URL/model values', async () => {
+    const incompleteHttp = {
+      mode: 'http',
+      available: false,
+      reason: 'http-config-incomplete',
+    };
     for (const [url, model, expected] of [
       [' https://embedding.example/v1', 'model', { mode: 'http', available: false }],
       ['https://embedding.example/v1', 'model ', { mode: 'http', available: false }],
-      ['', 'model', { mode: 'local' }],
-      ['https://embedding.example/v1', '', { mode: 'local' }],
+      ['', '', { mode: 'local' }],
+      [undefined, undefined, { mode: 'local' }],
+      ['', 'model', incompleteHttp],
+      ['https://embedding.example/v1', '', incompleteHttp],
+      ['https://embedding.example/v1', undefined, incompleteHttp],
+      [undefined, 'model', incompleteHttp],
     ]) {
       await withEnv({ GITNEXUS_EMBEDDING_URL: url, GITNEXUS_EMBEDDING_MODEL: model }, () =>
         expect(getQueryEmbeddingRuntimeStatus()).toMatchObject(expected),
