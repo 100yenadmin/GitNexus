@@ -18,6 +18,8 @@ describe('isMissingColumnOrTableError', () => {
     'query against table CodeEmbedding failed: connection does not exist',
     'Runtime exception: Table Class does not exist.',
     'Runtime exception: Binder exception: Column chunkIndex does not exist',
+    'Binder exception: Table CodeEmbedding does not exist; connection reset by peer',
+    'Binder exception: Table CodeEmbedding not found; database does not exist',
     'query does not exist',
     'key does not exist',
     'path does not exist',

@@ -4,9 +4,7 @@
  * connection, query, and other runtime failures.
  */
 export const isMissingColumnOrTableError = (message: string): boolean =>
-  // Require a schema object on the same line as the missing-schema wording.
-  // Unscoped "does not exist"/"not found" messages include runtime failures
-  // such as "connection does not exist" and "key not found".
-  /^Binder exception:[ \t]*(?:table|column|property)[ \t]+[^\s]+[ \t]+(?:does not exist|not found)\b/i.test(
+  // Allow only direct Binder missing-object grammar with terminal punctuation/whitespace.
+  /^Binder exception:[ \t]*(?:table|column|property)[ \t]+[^\s]+[ \t]+(?:does not exist|not found(?:[ \t]+(?:in catalog|for e))?)[.]?[ \t]*$/i.test(
     message,
   );
