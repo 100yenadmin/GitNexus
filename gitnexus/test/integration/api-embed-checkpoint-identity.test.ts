@@ -3,6 +3,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vites
 import type { EmbeddingIntegrityReport } from '../../src/core/lbug/lbug-adapter.js';
 import type { RegistryEntry, RepoMeta } from '../../src/storage/repo-manager.js';
 import { escapeCypherString } from '../../src/core/lbug/cypher-escape.js';
+import { JobManager } from '../../src/server/analyze-job.js';
 
 const MODEL = 'api-checkpoint-test-model';
 const LIVE_DIGEST = 'a'.repeat(64);
@@ -16,22 +17,21 @@ const REPO: RegistryEntry = {
 };
 
 const identity = { provider: 'api-checkpoint-test-provider', model: MODEL, dimensions: 384 };
-const makeIntegrity = (digest: string, physicalRows = 3): EmbeddingIntegrityReport =>
-  ({
-    tablePresent: true,
-    physicalRows,
-    validRows: physicalRows,
-    recoverableRows: physicalRows,
-    emptyIdRows: 0,
-    emptyNodeIdRows: 0,
-    invalidChunkRows: 0,
-    noncanonicalIdRows: 0,
-    duplicateIdRows: 0,
-    duplicateSemanticRows: 0,
-    orphanRows: 0,
-    wrongDimensionRows: 0,
-    recoverableIdentitySha256: digest,
-  });
+const makeIntegrity = (digest: string, physicalRows = 3): EmbeddingIntegrityReport => ({
+  tablePresent: true,
+  physicalRows,
+  validRows: physicalRows,
+  recoverableRows: physicalRows,
+  emptyIdRows: 0,
+  emptyNodeIdRows: 0,
+  invalidChunkRows: 0,
+  noncanonicalIdRows: 0,
+  duplicateIdRows: 0,
+  duplicateSemanticRows: 0,
+  orphanRows: 0,
+  wrongDimensionRows: 0,
+  recoverableIdentitySha256: digest,
+});
 
 const makeMeta = (digest: string): RepoMeta => ({
   repoPath: REPO.path,
@@ -65,7 +65,16 @@ const state = {
   loadMeta: vi.fn(async () => state.currentMeta),
   listRegisteredRepos: vi.fn(async () => [REPO]),
   withLbugDb: vi.fn(async (_dbPath: string, operation: () => Promise<unknown>) => operation()),
+  deleteHandlerStarted: undefined as (() => void) | undefined,
 };
+
+const armDeleteHandlerSignal = (): Promise<void> =>
+  new Promise((resolve) => {
+    state.deleteHandlerStarted = () => {
+      state.deleteHandlerStarted = undefined;
+      resolve();
+    };
+  });
 
 vi.doMock('../../src/storage/repo-manager.js', async () => ({
   ...(await vi.importActual<typeof import('../../src/storage/repo-manager.js')>(
@@ -158,6 +167,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
   let shutdown: (() => Promise<void>) | undefined;
   let exitSpy: ReturnType<typeof vi.spyOn>;
   let onceSpy: ReturnType<typeof vi.spyOn>;
+  let getJobSpy: ReturnType<typeof vi.spyOn>;
 
   beforeAll(async () => {
     exitSpy = vi.spyOn(process, 'exit').mockImplementation(() => undefined as never);
@@ -169,6 +179,15 @@ describe('POST /api/embed completed-checkpoint identity', () => {
       }
       return originalOnce(event, listener);
     }) as typeof process.once);
+    const originalGetJob = JobManager.prototype.getJob;
+    getJobSpy = vi.spyOn(JobManager.prototype, 'getJob').mockImplementation(function (
+      this: JobManager,
+      id: string,
+    ) {
+      const job = originalGetJob.call(this, id);
+      state.deleteHandlerStarted?.();
+      return job;
+    });
 
     const { createServer } = await import('../../src/server/api.js');
     const port = await allocatePort();
@@ -187,10 +206,12 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     state.inspectEmbeddingIntegrity.mockClear();
     state.saveMeta.mockClear();
     state.withLbugDb.mockClear();
+    state.deleteHandlerStarted = undefined;
   });
 
   afterAll(async () => {
     onceSpy.mockRestore();
+    getJobSpy.mockRestore();
     await shutdown?.();
     exitSpy.mockRestore();
   });
@@ -382,9 +403,9 @@ describe('POST /api/embed completed-checkpoint identity', () => {
 
     expect((await waitForTerminalJob(baseUrl, jobId)).status).toBe('complete');
     expect(state.executeQuery).toHaveBeenCalled();
-    expect(
-      state.executeQuery.mock.calls.every(([query]) => query.startsWith('MATCH (n:')),
-    ).toBe(true);
+    expect(state.executeQuery.mock.calls.every(([query]) => query.startsWith('MATCH (n:'))).toBe(
+      true,
+    );
     expect(state.getActiveEmbeddingIdentity).not.toHaveBeenCalled();
     expect(state.runEmbeddingPipeline).not.toHaveBeenCalled();
     expect(state.currentMeta.stats?.embeddings).toBe(0);
@@ -400,39 +421,38 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     'query does not exist',
     'transaction not found',
     'transaction does not exist',
-  ])
-    ('propagates %s and retains the checkpoint', async (message) => {
-      state.currentMeta = makeMeta(MISMATCHED_DIGEST);
-      state.currentMeta.embeddingCheckpoint = {
-        ...state.currentMeta.embeddingCheckpoint!,
-        nodesProcessed: 0,
-        totalNodes: 0,
-        provider: undefined,
-        physicalRows: undefined,
-        validRows: undefined,
-        recoverableIdentitySha256: undefined,
-      };
-      state.liveIntegrity = makeIntegrity(LIVE_DIGEST, 0);
-      state.graphNodes = [];
-      state.executeQuery.mockImplementation(async () => {
-        throw new Error(message);
-      });
-      const before = JSON.stringify(state.currentMeta.embeddingCheckpoint);
-      const response = await fetch(`${baseUrl}/api/embed`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ repo: REPO.name }),
-      });
-      const { jobId } = (await response.json()) as { jobId: string };
-      const job = await waitForTerminalJob(baseUrl, jobId);
-
-      expect(job.status).toBe('failed');
-      expect(job.error).toMatch(new RegExp(message));
-      expect(state.runEmbeddingPipeline).not.toHaveBeenCalled();
-      expect(state.getActiveEmbeddingIdentity).not.toHaveBeenCalled();
-      expect(state.saveMeta).not.toHaveBeenCalled();
-      expect(JSON.stringify(state.currentMeta.embeddingCheckpoint)).toBe(before);
+  ])('propagates %s and retains the checkpoint', async (message) => {
+    state.currentMeta = makeMeta(MISMATCHED_DIGEST);
+    state.currentMeta.embeddingCheckpoint = {
+      ...state.currentMeta.embeddingCheckpoint!,
+      nodesProcessed: 0,
+      totalNodes: 0,
+      provider: undefined,
+      physicalRows: undefined,
+      validRows: undefined,
+      recoverableIdentitySha256: undefined,
+    };
+    state.liveIntegrity = makeIntegrity(LIVE_DIGEST, 0);
+    state.graphNodes = [];
+    state.executeQuery.mockImplementation(async () => {
+      throw new Error(message);
     });
+    const before = JSON.stringify(state.currentMeta.embeddingCheckpoint);
+    const response = await fetch(`${baseUrl}/api/embed`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ repo: REPO.name }),
+    });
+    const { jobId } = (await response.json()) as { jobId: string };
+    const job = await waitForTerminalJob(baseUrl, jobId);
+
+    expect(job.status).toBe('failed');
+    expect(job.error).toMatch(new RegExp(message));
+    expect(state.runEmbeddingPipeline).not.toHaveBeenCalled();
+    expect(state.getActiveEmbeddingIdentity).not.toHaveBeenCalled();
+    expect(state.saveMeta).not.toHaveBeenCalled();
+    expect(JSON.stringify(state.currentMeta.embeddingCheckpoint)).toBe(before);
+  });
 
   it('finds a text-bearing File after a full invalid page without loading all rows', async () => {
     state.currentMeta = makeMeta(LIVE_DIGEST);
@@ -464,7 +484,9 @@ describe('POST /api/embed completed-checkpoint identity', () => {
       }
       expect(query).toContain(`WHERE n.id > '${escapeCypherString("last-'\\id")}' `);
       if (fileQueries.length === 2) {
-        return [{ id: 'valid-file', filePath: 'src/valid.ts', content: 'export const valid = true;' }];
+        return [
+          { id: 'valid-file', filePath: 'src/valid.ts', content: 'export const valid = true;' },
+        ];
       }
       return [];
     });
@@ -687,5 +709,161 @@ describe('POST /api/embed completed-checkpoint identity', () => {
       recoverableIdentitySha256: LIVE_DIGEST,
       pendingNodeIds: [],
     });
+  });
+
+  it.each([
+    { label: 'successful checkpoint commit', saveError: undefined },
+    { label: 'failed checkpoint commit', saveError: 'checkpoint persistence failed' },
+  ])('keeps checkpoint cancellation pending through a $label', async ({ saveError }) => {
+    state.currentMeta = makeMeta(LIVE_DIGEST);
+    const checkpointBefore = JSON.stringify(state.currentMeta.embeddingCheckpoint);
+    let checkpointSaveStarted!: () => void;
+    const checkpointSave = new Promise<void>((resolve) => (checkpointSaveStarted = resolve));
+    let releaseSave!: () => void;
+    const saveRelease = new Promise<void>((resolve) => (releaseSave = resolve));
+    state.saveMeta.mockImplementation(async (_storagePath, next) => {
+      if (next.embeddingCheckpoint?.nodesProcessed === 2) {
+        checkpointSaveStarted();
+        await saveRelease;
+        if (saveError) throw new Error(saveError);
+      }
+      state.currentMeta = next;
+    });
+    let pipelineResumed = false;
+    state.runEmbeddingPipeline.mockImplementationOnce(async (...args: unknown[]) => {
+      const options = args[6] as {
+        onCheckpoint: (checkpoint: {
+          nodesProcessed: number;
+          totalNodes: number;
+          chunksProcessed: number;
+        }) => Promise<void>;
+      };
+      await options.onCheckpoint({ nodesProcessed: 2, totalNodes: 4, chunksProcessed: 5 });
+      pipelineResumed = true;
+    });
+
+    const response = await fetch(`${baseUrl}/api/embed`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ repo: REPO.name }),
+    });
+    const { jobId } = (await response.json()) as { jobId: string };
+    await checkpointSave;
+
+    const deleteHandlerStarted = armDeleteHandlerSignal();
+    let deleteSettled = false;
+    const deleteResponse = fetch(`${baseUrl}/api/embed/${jobId}`, { method: 'DELETE' }).then(
+      (result) => {
+        deleteSettled = true;
+        return result;
+      },
+    );
+    await deleteHandlerStarted;
+    expect(deleteSettled).toBe(false);
+    const activeJob = (await (await fetch(`${baseUrl}/api/embed/${jobId}`)).json()) as {
+      status: string;
+    };
+    expect(activeJob.status).not.toMatch(/complete|failed/);
+
+    releaseSave();
+    const deleted = await deleteResponse;
+    expect(deleted.status).toBe(400);
+    await expect(deleted.json()).resolves.toEqual({ error: 'Job already failed' });
+    const job = await waitForTerminalJob(baseUrl, jobId);
+    expect(job.status).toBe('failed');
+    expect(job.error).toBe(saveError ?? 'Cancelled by user');
+    expect(pipelineResumed).toBe(false);
+    if (saveError) {
+      expect(JSON.stringify(state.currentMeta.embeddingCheckpoint)).toBe(checkpointBefore);
+    } else {
+      expect(state.currentMeta.embeddingCheckpoint).toMatchObject({
+        nodesProcessed: 2,
+        totalNodes: 4,
+        chunksProcessed: 5,
+      });
+    }
+  });
+
+  it('keeps terminal cancellation pending until completion is published', async () => {
+    state.currentMeta = makeMeta(LIVE_DIGEST);
+    let terminalSaveStarted!: () => void;
+    const terminalSave = new Promise<void>((resolve) => (terminalSaveStarted = resolve));
+    let releaseSave!: () => void;
+    const saveRelease = new Promise<void>((resolve) => (releaseSave = resolve));
+    state.saveMeta.mockImplementation(async (_storagePath, next) => {
+      if (next.embeddingCheckpoint === undefined) {
+        terminalSaveStarted();
+        await saveRelease;
+      }
+      state.currentMeta = next;
+    });
+
+    const response = await fetch(`${baseUrl}/api/embed`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ repo: REPO.name }),
+    });
+    const { jobId } = (await response.json()) as { jobId: string };
+    await terminalSave;
+
+    const deleteHandlerStarted = armDeleteHandlerSignal();
+    let deleteSettled = false;
+    const deleteResponse = fetch(`${baseUrl}/api/embed/${jobId}`, { method: 'DELETE' }).then(
+      (result) => {
+        deleteSettled = true;
+        return result;
+      },
+    );
+    await deleteHandlerStarted;
+    expect(deleteSettled).toBe(false);
+
+    releaseSave();
+    const deleted = await deleteResponse;
+    expect(deleted.status).toBe(400);
+    await expect(deleted.json()).resolves.toEqual({ error: 'Job already complete' });
+    expect((await waitForTerminalJob(baseUrl, jobId)).status).toBe('complete');
+  });
+
+  it('keeps terminal cancellation pending until failure is published', async () => {
+    state.currentMeta = makeMeta(LIVE_DIGEST);
+    let terminalSaveStarted!: () => void;
+    const terminalSave = new Promise<void>((resolve) => (terminalSaveStarted = resolve));
+    let releaseSave!: () => void;
+    const saveRelease = new Promise<void>((resolve) => (releaseSave = resolve));
+    state.saveMeta.mockImplementation(async (_storagePath, next) => {
+      if (next.embeddingCheckpoint === undefined) {
+        terminalSaveStarted();
+        await saveRelease;
+        throw new Error('terminal persistence failed');
+      }
+      state.currentMeta = next;
+    });
+
+    const response = await fetch(`${baseUrl}/api/embed`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ repo: REPO.name }),
+    });
+    const { jobId } = (await response.json()) as { jobId: string };
+    await terminalSave;
+
+    const deleteHandlerStarted = armDeleteHandlerSignal();
+    let deleteSettled = false;
+    const deleteResponse = fetch(`${baseUrl}/api/embed/${jobId}`, { method: 'DELETE' }).then(
+      (result) => {
+        deleteSettled = true;
+        return result;
+      },
+    );
+    await deleteHandlerStarted;
+    expect(deleteSettled).toBe(false);
+
+    releaseSave();
+    const deleted = await deleteResponse;
+    expect(deleted.status).toBe(400);
+    await expect(deleted.json()).resolves.toEqual({ error: 'Job already failed' });
+    const job = await waitForTerminalJob(baseUrl, jobId);
+    expect(job.status).toBe('failed');
+    expect(job.error).toBe('terminal persistence failed');
   });
 });
