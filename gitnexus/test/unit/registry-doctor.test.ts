@@ -496,7 +496,19 @@ describe('doctor --registry read-only report (#133)', () => {
       lastCommit: 'a'.repeat(40),
     };
     try {
-      for (const stats of [undefined, {}, { nodes: 0, edges: 0, embeddings: 0 }]) {
+      for (const stats of [
+        undefined,
+        {},
+        { nodes: 0, edges: 0, embeddings: 0 },
+        {
+          files: 4,
+          nodes: 2,
+          edges: 1,
+          communities: 1,
+          processes: 3,
+          embeddings: Number.MAX_SAFE_INTEGER,
+        },
+      ]) {
         await fs.writeFile(
           path.join(fixture.dbPath, 'registry.json'),
           JSON.stringify([stats === undefined ? base : { ...base, stats }]),
@@ -511,10 +523,22 @@ describe('doctor --registry read-only report (#133)', () => {
         ['communities', [1]],
         ['processes', -1],
         ['embeddings', Number.NaN],
+        ['nodes', 1.5],
+        ['edges', Number.MAX_SAFE_INTEGER + 1],
+        ['unexpected', 1],
       ] as const) {
         await fs.writeFile(
           path.join(fixture.dbPath, 'registry.json'),
           JSON.stringify([{ ...base, stats: { [key]: value } }]),
+        );
+        expect(await readRegistryStrict()).toEqual({ status: 'failed', reason: 'malformed' });
+      }
+
+      const baseJson = JSON.stringify(base);
+      for (const stats of ['{"nodes":NaN}', '{"nodes":Infinity}', '{"nodes":-Infinity}']) {
+        await fs.writeFile(
+          path.join(fixture.dbPath, 'registry.json'),
+          `[${baseJson.slice(0, -1)},"stats":${stats}}]`,
         );
         expect(await readRegistryStrict()).toEqual({ status: 'failed', reason: 'malformed' });
       }

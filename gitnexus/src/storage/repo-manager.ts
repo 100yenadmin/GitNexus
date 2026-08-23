@@ -943,14 +943,16 @@ const REGISTRY_STATS_KEYS = [
   'embeddings',
 ] as const;
 
-const isFiniteNonnegativeNumber = (value: unknown): value is number =>
-  typeof value === 'number' && Number.isFinite(value) && value >= 0;
+const isFiniteNonnegativeSafeInteger = (value: unknown): value is number =>
+  typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 
 const isStatsShape = (value: unknown): boolean =>
   value === undefined ||
   (isRecord(value) &&
-    REGISTRY_STATS_KEYS.every(
-      (key) => value[key] === undefined || isFiniteNonnegativeNumber(value[key]),
+    Object.entries(value).every(
+      ([key, stat]) =>
+        REGISTRY_STATS_KEYS.includes(key as (typeof REGISTRY_STATS_KEYS)[number]) &&
+        isFiniteNonnegativeSafeInteger(stat),
     ));
 
 const isBranchSummaryShape = (value: unknown): boolean =>
