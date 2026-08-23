@@ -225,7 +225,8 @@ describe('POST /api/embed completed-checkpoint identity', () => {
 
     expect(job.error).toMatch(/unknown-provider/);
     expect(job.error).toMatch(/do not retry POST \/api\/embed/i);
-    expect(job.error).toMatch(/gitnexus analyze --force --drop-embeddings --embeddings/);
+    expect(job.error).toMatch(/gitnexus analyze --force --drop-embeddings --embeddings 0/);
+    expect(job.error).not.toMatch(/POST \/api\/analyze/);
     expect(JSON.stringify(state.currentMeta.embeddingCheckpoint)).toBe(before);
   });
 
@@ -271,7 +272,8 @@ describe('POST /api/embed completed-checkpoint identity', () => {
 
     expect(job.error).toMatch(/failed embedding integrity validation|durable identity/i);
     expect(job.error).toMatch(/do not retry POST \/api\/embed/i);
-    expect(job.error).toMatch(/gitnexus analyze --force --drop-embeddings --embeddings/);
+    expect(job.error).toMatch(/gitnexus analyze --force --drop-embeddings --embeddings 0/);
+    expect(job.error).not.toMatch(/POST \/api\/analyze/);
     expect(state.runEmbeddingPipeline).not.toHaveBeenCalled();
     expect(state.saveMeta).not.toHaveBeenCalled();
   });
