@@ -274,8 +274,8 @@ describe('POST /api/embed completed-checkpoint identity', () => {
       nodesProcessed: 0,
       totalNodes: 0,
       provider: undefined,
-      physicalRows: 0,
-      validRows: 0,
+      physicalRows: undefined,
+      validRows: undefined,
       recoverableIdentitySha256: undefined,
     };
     state.liveIntegrity = makeIntegrity(LIVE_DIGEST, 0);
