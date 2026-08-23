@@ -974,6 +974,7 @@ const isRawSafeIntegerToken = (token: string): boolean => {
     integerDigits = coefficient.slice(0, split);
   }
 
+  if (integerDigits.length > 16) return false;
   const magnitude = BigInt(integerDigits);
   return magnitude <= BigInt(Number.MAX_SAFE_INTEGER) && !(negative && magnitude === 0n);
 };

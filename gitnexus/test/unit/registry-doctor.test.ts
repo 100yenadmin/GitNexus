@@ -585,6 +585,15 @@ describe('doctor --registry read-only report (#133)', () => {
         }
       }
 
+      await writeRawStats('{"nodes":90071992547409910e-1}');
+      expect(await readRegistryStrict()).toEqual({
+        status: 'available',
+        entries: [{ ...base, stats: { nodes: Number.MAX_SAFE_INTEGER } }],
+      });
+
+      await writeRawStats(`{"nodes":1${'0'.repeat(1_000_000)}e-1}`);
+      expect(await readRegistryStrict()).toEqual({ status: 'failed', reason: 'malformed' });
+
       for (const firstValue of ['"corrupt"', 'null', 'true']) {
         for (const branchSummary of [false, true]) {
           await writeRawStats(`{"nodes":${firstValue},"nodes":1}`, branchSummary);
