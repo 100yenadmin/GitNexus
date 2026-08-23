@@ -106,6 +106,70 @@ const assertEmbeddingCheckpointIdentity = (
   );
 };
 
+export type EmbedCommitPhase =
+  | 'RUNNING'
+  | 'COMMITTING_CHECKPOINT'
+  | 'COMMITTING_TERMINAL'
+  | 'COMPLETE'
+  | 'FAILED';
+
+export interface EmbedCommitBarrier {
+  phase: EmbedCommitPhase;
+  cancelRequested: boolean;
+  cancelReason?: string;
+}
+
+export const createEmbedCommitBarrier = (): EmbedCommitBarrier => ({
+  phase: 'RUNNING',
+  cancelRequested: false,
+});
+
+export const requestEmbedCancellation = (
+  barrier: EmbedCommitBarrier,
+  reason: string,
+  abort: () => void,
+): 'cancelled' | 'deferred' | 'terminal' => {
+  if (barrier.phase === 'RUNNING') {
+    barrier.cancelRequested = true;
+    barrier.cancelReason = reason;
+    barrier.phase = 'FAILED';
+    abort();
+    return 'cancelled';
+  }
+  if (
+    barrier.phase === 'COMMITTING_CHECKPOINT' ||
+    barrier.phase === 'COMMITTING_TERMINAL'
+  ) {
+    barrier.cancelRequested = true;
+    barrier.cancelReason = reason;
+    if (barrier.phase === 'COMMITTING_CHECKPOINT') abort();
+    return 'deferred';
+  }
+  return 'terminal';
+};
+
+export const commitEmbedMetadata = async (
+  barrier: EmbedCommitBarrier,
+  phase: 'COMMITTING_CHECKPOINT' | 'COMMITTING_TERMINAL',
+  write: () => Promise<void>,
+): Promise<void> => {
+  if (barrier.phase !== 'RUNNING') {
+    throw new Error(barrier.cancelReason || 'Embedding job was cancelled');
+  }
+  barrier.phase = phase;
+  try {
+    await write();
+  } catch (error) {
+    barrier.phase = 'FAILED';
+    throw error;
+  }
+  if (phase === 'COMMITTING_CHECKPOINT' && barrier.cancelRequested) {
+    barrier.phase = 'FAILED';
+    throw new Error(barrier.cancelReason || 'Embedding job was cancelled');
+  }
+  barrier.phase = phase === 'COMMITTING_TERMINAL' ? 'COMPLETE' : 'RUNNING';
+};
+
 /**
  * Determine whether an HTTP Origin header value is allowed by CORS policy.
  *
@@ -1854,6 +1918,8 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
   };
 
   const embedJobManager = new JobManager();
+  const embedBarriers = new Map<string, EmbedCommitBarrier>();
+  const embedAborters = new Map<string, () => void>();
 
   // POST /api/embed — trigger server-side embedding generation
   app.post(
@@ -1884,13 +1950,27 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         });
         const embedController = new AbortController();
         embedJobManager.registerAbortController(job.id, embedController);
+        const barrier = createEmbedCommitBarrier();
+        embedBarriers.set(job.id, barrier);
+        embedAborters.set(job.id, () => embedController.abort());
+        const cancelEmbedding = (reason: string): boolean => {
+          const current = embedJobManager.getJob(job.id);
+          if (!current || current.status === 'complete' || current.status === 'failed') {
+            return false;
+          }
+          const outcome = requestEmbedCancellation(barrier, reason, () => embedController.abort());
+          if (outcome === 'cancelled') {
+            embedJobManager.cancelJob(job.id, reason);
+          }
+          return true;
+        };
 
         // 30-minute timeout for embedding jobs (same as analyze jobs)
         const EMBED_TIMEOUT_MS = 30 * 60 * 1000;
         const embedTimeout = setTimeout(() => {
           const current = embedJobManager.getJob(job.id);
           if (current && current.status !== 'complete' && current.status !== 'failed') {
-            embedJobManager.cancelJob(job.id, 'Embedding timed out (30 minute limit)');
+            cancelEmbedding('Embedding timed out (30 minute limit)');
           }
         }, EMBED_TIMEOUT_MS);
 
@@ -1933,12 +2013,16 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                     API_CHECKPOINT_CONTEXT,
                   );
                   if (!(await hasEmbeddableNodes(executeQuery))) {
-                    embeddingMeta = {
+                    const clearedMeta = {
                       ...embeddingMeta,
                       stats: { ...embeddingMeta.stats, embeddings: integrity.validRows },
                       embeddingCheckpoint: undefined,
                     };
-                    await saveMeta(entry.storagePath, embeddingMeta);
+                    await commitEmbedMetadata(barrier, 'COMMITTING_TERMINAL', () =>
+                      saveMeta(entry.storagePath, clearedMeta),
+                    );
+                    embeddingMeta = clearedMeta;
+                    embedJobManager.updateJob(job.id, { status: 'complete' });
                     return;
                   }
                   // Keep the old checkpoint persisted until the fresh pipeline
@@ -1974,7 +2058,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                 pendingNodeIds: string[],
                 integrity?: Awaited<ReturnType<typeof inspectEmbeddingIntegrity>>,
               ): Promise<void> => {
-                embeddingMeta = {
+                const checkpointMeta = {
                   ...embeddingMeta,
                   embeddingCheckpoint: {
                     at: new Date().toISOString(),
@@ -1986,7 +2070,10 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                     recoverableIdentitySha256: integrity?.recoverableIdentitySha256,
                   },
                 };
-                await saveMeta(entry.storagePath, embeddingMeta);
+                await commitEmbedMetadata(barrier, 'COMMITTING_CHECKPOINT', () =>
+                  saveMeta(entry.storagePath, checkpointMeta),
+                );
+                embeddingMeta = checkpointMeta;
               };
               // Fetch existing content hashes for incremental embedding.
               // Delegated to lbug-adapter which owns the DB query logic and legacy-fallback handling.
@@ -2054,12 +2141,16 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
               ) {
                 throw new Error('Embedding finalization failed identity validation');
               }
-              embeddingMeta = {
+              const terminalMeta = {
                 ...embeddingMeta,
                 stats: { ...embeddingMeta.stats, embeddings: terminalIntegrity.validRows },
                 embeddingCheckpoint: undefined,
               };
-              await saveMeta(entry.storagePath, embeddingMeta);
+              await commitEmbedMetadata(barrier, 'COMMITTING_TERMINAL', () =>
+                saveMeta(entry.storagePath, terminalMeta),
+              );
+              embeddingMeta = terminalMeta;
+              embedJobManager.updateJob(job.id, { status: 'complete' });
             });
 
             // Don't overwrite 'failed' if the job was cancelled while the pipeline was running
@@ -2068,6 +2159,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
               embedJobManager.updateJob(job.id, { status: 'complete' });
             }
           } catch (err: any) {
+            if (barrier.phase !== 'COMPLETE') barrier.phase = 'FAILED';
             const current = embedJobManager.getJob(job.id);
             if (!current || current.status !== 'failed') {
               embedJobManager.updateJob(job.id, {
@@ -2077,6 +2169,8 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
             }
           } finally {
             clearTimeout(embedTimeout);
+            embedBarriers.delete(job.id);
+            embedAborters.delete(job.id);
             releaseRepoLock(repoLockPath);
           }
         })();
@@ -2125,7 +2219,17 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
       res.status(400).json({ error: `Job already ${job.status}` });
       return;
     }
-    embedJobManager.cancelJob(jobId, 'Cancelled by user');
+    const barrier = embedBarriers.get(jobId);
+    if (barrier) {
+      const outcome = requestEmbedCancellation(
+        barrier,
+        'Cancelled by user',
+        () => embedAborters.get(jobId)?.(),
+      );
+      if (outcome === 'cancelled') embedJobManager.cancelJob(jobId, 'Cancelled by user');
+    } else {
+      embedJobManager.cancelJob(jobId, 'Cancelled by user');
+    }
     res.json({ id: job.id, status: 'failed', error: 'Cancelled by user' });
   });
 
