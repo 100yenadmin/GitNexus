@@ -260,7 +260,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     };
     state.liveIntegrity = { ...state.liveIntegrity, physicalRows: 0, validRows: 0 };
     state.executeQuery.mockImplementation(async (query: string) =>
-      query.includes('MATCH (n:File)') && !query.includes("trim(n.content) <> ''")
+      query.includes('MATCH (n:`File`)') && !query.includes("trim(n.content) <> ''")
         ? [{ id: 'File:whitespace', content: '   ' }]
         : [],
     );
