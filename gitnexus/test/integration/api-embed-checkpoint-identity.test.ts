@@ -330,7 +330,8 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     state.liveIntegrity = makeIntegrity(LIVE_DIGEST, 0);
     state.graphNodes = [];
     const fileQueries: string[] = [];
-    state.executeQuery.mockImplementation(async (query: string) => {
+    state.executeQuery.mockImplementation(async (...args: unknown[]) => {
+      const query = String(args[0] ?? '');
       if (!query.includes('`File`')) {
         throw new Error('table LegacyNode does not exist');
       }
