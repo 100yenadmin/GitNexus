@@ -279,7 +279,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
       recoverableIdentitySha256: undefined,
     };
     state.liveIntegrity = makeIntegrity(LIVE_DIGEST, 0);
-    state.executeQuery.mockResolvedValue([{ id: 'Function:current' }]);
+    state.executeQuery.mockImplementationOnce(async () => [{ id: 'Function:current' }]);
     const response = await fetch(`${baseUrl}/api/embed`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
