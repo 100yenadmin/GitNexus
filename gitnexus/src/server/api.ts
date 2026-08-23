@@ -77,6 +77,9 @@ const isEmptyLegacyCheckpoint = (checkpoint?: RepoMeta['embeddingCheckpoint']): 
 const API_CHECKPOINT_CONTEXT =
   'Cannot resume embedding checkpoint. Manual recovery required: do not retry POST /api/embed. ' +
   'Run `gitnexus analyze --force --drop-embeddings --embeddings 0`.';
+const API_METADATA_DRIFT_CONTEXT =
+  'Repository metadata changed during preflight. Retry POST /api/embed after the current repository operation finishes. ' +
+  'If this repeats, stop and ask the repository owner to inspect concurrent analyze/embed activity.';
 const embeddingMetaFingerprint = (meta: RepoMeta): string =>
   createHash('sha256').update(JSON.stringify(meta)).digest('hex');
 
@@ -1874,9 +1877,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                   embeddingMetaFingerprint(embeddingMeta) !== tentativeFingerprint ||
                   !isEmptyLegacyCheckpoint(embeddingMeta.embeddingCheckpoint)
                 ) {
-                  throw new Error(
-                    `Repository metadata changed during preflight. ${API_CHECKPOINT_CONTEXT}`,
-                  );
+                  throw new Error(API_METADATA_DRIFT_CONTEXT);
                 }
                 const priorCheckpoint = embeddingMeta.embeddingCheckpoint;
                 const integrity = await inspectEmbeddingIntegrity();
@@ -1904,9 +1905,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                 embeddingMetaFingerprint(embeddingMeta) !== tentativeFingerprint ||
                 authoritativeLegacy !== tentativeLegacy
               ) {
-                throw new Error(
-                  `Repository metadata changed during preflight. ${API_CHECKPOINT_CONTEXT}`,
-                );
+                throw new Error(API_METADATA_DRIFT_CONTEXT);
               }
               let priorCheckpoint = embeddingMeta.embeddingCheckpoint;
               if (isEmptyLegacyCheckpoint(priorCheckpoint)) {
