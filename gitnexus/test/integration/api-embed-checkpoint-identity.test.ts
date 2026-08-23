@@ -221,7 +221,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     expect(JSON.stringify(state.currentMeta.embeddingCheckpoint)).toBe(checkpointBefore);
   });
 
-  it('accepts a matching digest and finalizes clean metadata', async () => {
+  it('routes an ordinary checkpoint through writable recovery and finalizes metadata', async () => {
     state.currentMeta = makeMeta(LIVE_DIGEST);
     const response = await fetch(`${baseUrl}/api/embed`, {
       method: 'POST',
@@ -233,6 +233,8 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     const job = await waitForTerminalJob(baseUrl, jobId);
 
     expect(job.status).toBe('complete');
+    expect(state.openModes).toEqual([undefined]);
+    expect(state.withLbugReadOnlyNonRecovering).not.toHaveBeenCalled();
     expect(state.runEmbeddingPipeline).toHaveBeenCalledOnce();
     expect(state.currentMeta.stats?.embeddings).toBe(3);
     expect(state.currentMeta.embeddingCheckpoint).toBeUndefined();
@@ -256,7 +258,8 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     expect(job.error).toMatch(/do not retry POST \/api\/embed/i);
     expect(job.error).toMatch(/gitnexus analyze --force --drop-embeddings --embeddings 0/);
     expect(job.error).not.toMatch(/POST \/api\/analyze/);
-    expect(state.openModes).toEqual([true]);
+    expect(state.openModes).toEqual([]);
+    expect(state.withLbugReadOnlyNonRecovering).not.toHaveBeenCalled();
     expect(state.withLbugDb).not.toHaveBeenCalled();
     expect(state.getActiveEmbeddingIdentity).toHaveBeenCalledOnce();
     expect(JSON.stringify(state.currentMeta.embeddingCheckpoint)).toBe(before);
@@ -264,7 +267,16 @@ describe('POST /api/embed completed-checkpoint identity', () => {
 
   it('refuses metadata drift before provider-capable work', async () => {
     const initial = { ...makeMeta(LIVE_DIGEST), embeddingCheckpoint: undefined };
-    const changed = { ...initial, indexedAt: '2026-08-23T00:00:00.000Z' };
+    const changed = makeMeta(LIVE_DIGEST);
+    changed.embeddingCheckpoint = {
+      ...changed.embeddingCheckpoint!,
+      nodesProcessed: 0,
+      totalNodes: 0,
+      provider: undefined,
+      physicalRows: undefined,
+      validRows: undefined,
+      recoverableIdentitySha256: undefined,
+    };
     state.loadMeta.mockResolvedValueOnce(initial).mockResolvedValue(changed);
     const response = await fetch(`${baseUrl}/api/embed`, {
       method: 'POST',
@@ -276,10 +288,38 @@ describe('POST /api/embed completed-checkpoint identity', () => {
 
     expect(job.error).toMatch(/metadata changed during preflight/i);
     expect(job.error).toMatch(/do not retry POST \/api\/embed/i);
-    expect(state.openModes).toEqual([true, undefined]);
+    expect(state.openModes).toEqual([undefined]);
     expect(state.getActiveEmbeddingIdentity).not.toHaveBeenCalled();
     expect(state.runEmbeddingPipeline).not.toHaveBeenCalled();
     expect(state.saveMeta).not.toHaveBeenCalled();
+  });
+
+  it('refuses tentative legacy classification drift before writable Ladybug', async () => {
+    const initial = makeMeta(LIVE_DIGEST);
+    initial.embeddingCheckpoint = {
+      ...initial.embeddingCheckpoint!,
+      nodesProcessed: 0,
+      totalNodes: 0,
+      provider: undefined,
+      physicalRows: undefined,
+      validRows: undefined,
+      recoverableIdentitySha256: undefined,
+    };
+    const changed = { ...initial, embeddingCheckpoint: undefined };
+    state.loadMeta.mockResolvedValueOnce(initial).mockResolvedValue(changed);
+    const response = await fetch(`${baseUrl}/api/embed`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ repo: REPO.name }),
+    });
+    const { jobId } = (await response.json()) as { jobId: string };
+    const job = await waitForTerminalJob(baseUrl, jobId);
+
+    expect(job.error).toMatch(/metadata changed during preflight/i);
+    expect(state.openModes).toEqual([true]);
+    expect(state.withLbugDb).not.toHaveBeenCalled();
+    expect(state.getActiveEmbeddingIdentity).not.toHaveBeenCalled();
+    expect(state.runEmbeddingPipeline).not.toHaveBeenCalled();
   });
 
   it('refuses legacy zero-row drift after writable open', async () => {

@@ -1841,32 +1841,44 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
           try {
             const lbugPath = path.join(entry.storagePath, 'lbug');
             const { inspectEmbeddingIntegrity } = await import('../core/lbug/lbug-adapter.js');
-            const preflight = await withLbugReadOnlyNonRecovering(lbugPath, async () => {
-              const embeddingMeta = await loadMeta(entry.storagePath);
-              if (!embeddingMeta) {
-                throw new Error('Repository metadata is missing; run gitnexus analyze first');
+            const tentativeMeta = await loadMeta(entry.storagePath);
+            if (!tentativeMeta) {
+              throw new Error('Repository metadata is missing; run gitnexus analyze first');
+            }
+            const tentativeFingerprint = embeddingMetaFingerprint(tentativeMeta);
+            const tentativeCheckpoint = tentativeMeta.embeddingCheckpoint;
+            const tentativeLegacy = isEmptyLegacyCheckpoint(tentativeCheckpoint);
+            let embeddingIdentity: EmbeddingIdentity | undefined;
+            if (tentativeCheckpoint && !tentativeLegacy) {
+              const { getActiveEmbeddingIdentity } = await import('../core/embeddings/embedder.js');
+              embeddingIdentity = getActiveEmbeddingIdentity();
+              if (
+                tentativeCheckpoint.provider === undefined ||
+                tentativeCheckpoint.provider !== embeddingIdentity.provider ||
+                tentativeCheckpoint.model !== embeddingIdentity.model ||
+                tentativeCheckpoint.dimensions !== embeddingIdentity.dimensions
+              ) {
+                throw new Error(
+                  `Cannot resume embedding checkpoint: it uses ${tentativeCheckpoint.provider ?? 'unknown-provider'} / ` +
+                    `${tentativeCheckpoint.model} at ${tentativeCheckpoint.dimensions} dimensions, but this run resolves ` +
+                    `${embeddingIdentity.provider} / ${embeddingIdentity.model} at ${embeddingIdentity.dimensions}. ` +
+                    API_CHECKPOINT_CONTEXT,
+                );
               }
-              const priorCheckpoint = embeddingMeta.embeddingCheckpoint;
-              let embeddingIdentity: EmbeddingIdentity | undefined;
-              if (priorCheckpoint && !isEmptyLegacyCheckpoint(priorCheckpoint)) {
-                const { getActiveEmbeddingIdentity } =
-                  await import('../core/embeddings/embedder.js');
-                embeddingIdentity = getActiveEmbeddingIdentity();
+            }
+            if (tentativeLegacy) {
+              await withLbugReadOnlyNonRecovering(lbugPath, async () => {
+                const embeddingMeta = await loadMeta(entry.storagePath);
                 if (
-                  priorCheckpoint.provider === undefined ||
-                  priorCheckpoint.provider !== embeddingIdentity.provider ||
-                  priorCheckpoint.model !== embeddingIdentity.model ||
-                  priorCheckpoint.dimensions !== embeddingIdentity.dimensions
+                  !embeddingMeta ||
+                  embeddingMetaFingerprint(embeddingMeta) !== tentativeFingerprint ||
+                  !isEmptyLegacyCheckpoint(embeddingMeta.embeddingCheckpoint)
                 ) {
                   throw new Error(
-                    `Cannot resume embedding checkpoint: it uses ${priorCheckpoint.provider ?? 'unknown-provider'} / ` +
-                      `${priorCheckpoint.model} at ${priorCheckpoint.dimensions} dimensions, but this run resolves ` +
-                      `${embeddingIdentity.provider} / ${embeddingIdentity.model} at ${embeddingIdentity.dimensions}. ` +
-                      API_CHECKPOINT_CONTEXT,
+                    `Repository metadata changed during preflight. ${API_CHECKPOINT_CONTEXT}`,
                   );
                 }
-              }
-              if (isEmptyLegacyCheckpoint(priorCheckpoint)) {
+                const priorCheckpoint = embeddingMeta.embeddingCheckpoint;
                 const integrity = await inspectEmbeddingIntegrity();
                 if (integrity.physicalRows > 0) {
                   throw new Error(
@@ -1880,17 +1892,17 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                   API_CHECKPOINT_CONTEXT,
                 );
                 await hasEmbeddableNodes(executeQuery);
-              }
-              return {
-                fingerprint: embeddingMetaFingerprint(embeddingMeta),
-                embeddingIdentity,
-              };
-            });
+              });
+            }
             await withLbugDb(lbugPath, async () => {
               let embeddingMeta = await loadMeta(entry.storagePath);
+              const authoritativeLegacy = isEmptyLegacyCheckpoint(
+                embeddingMeta?.embeddingCheckpoint,
+              );
               if (
                 !embeddingMeta ||
-                embeddingMetaFingerprint(embeddingMeta) !== preflight.fingerprint
+                embeddingMetaFingerprint(embeddingMeta) !== tentativeFingerprint ||
+                authoritativeLegacy !== tentativeLegacy
               ) {
                 throw new Error(
                   `Repository metadata changed during preflight. ${API_CHECKPOINT_CONTEXT}`,
@@ -1922,9 +1934,9 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
               const { runEmbeddingPipeline } =
                 await import('../core/embeddings/embedding-pipeline.js');
               const { embeddingIntegrityFailures } = await import('../core/lbug/lbug-adapter.js');
-              const embeddingIdentity =
-                preflight.embeddingIdentity ??
-                (await import('../core/embeddings/embedder.js')).getActiveEmbeddingIdentity();
+              embeddingIdentity ??= (
+                await import('../core/embeddings/embedder.js')
+              ).getActiveEmbeddingIdentity();
               if (
                 priorCheckpoint &&
                 (priorCheckpoint.provider === undefined ||
