@@ -1901,6 +1901,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
             if (!embeddingMeta) {
               throw new Error('Repository metadata is missing; run gitnexus analyze first');
             }
+            const initialMetadataFingerprint = JSON.stringify(embeddingMeta);
             let priorCheckpoint = embeddingMeta.embeddingCheckpoint;
             let preflightEmbeddingIdentity: EmbeddingIdentity | undefined;
             if (priorCheckpoint && !isLegacyZeroRowCheckpoint(priorCheckpoint)) {
@@ -1910,6 +1911,15 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
             }
             const lbugPath = path.join(entry.storagePath, 'lbug');
             await withLbugDb(lbugPath, async () => {
+              const currentMeta = await loadMeta(entry.storagePath);
+              if (!currentMeta || JSON.stringify(currentMeta) !== initialMetadataFingerprint) {
+                throw new Error(
+                  'Embedding metadata changed while acquiring writable LadybugDB; ' +
+                    'refusing to overwrite newer metadata',
+                );
+              }
+              embeddingMeta = currentMeta;
+              priorCheckpoint = embeddingMeta.embeddingCheckpoint;
               const { runEmbeddingPipeline } =
                 await import('../core/embeddings/embedding-pipeline.js');
               const { inspectEmbeddingIntegrity, embeddingIntegrityFailures } =

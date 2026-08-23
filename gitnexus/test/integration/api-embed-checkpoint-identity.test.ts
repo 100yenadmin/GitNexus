@@ -261,6 +261,30 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     expect(state.currentMeta.embeddingCheckpoint).toBeUndefined();
   });
 
+  it('fails closed when metadata changes while acquiring writable LadybugDB', async () => {
+    state.currentMeta = makeMeta(LIVE_DIGEST);
+    const newerMeta = { ...makeMeta(LIVE_DIGEST), lastCommit: 'newer-head' };
+    state.withLbugDb.mockImplementationOnce(async (_dbPath, operation) => {
+      state.currentMeta = newerMeta;
+      return operation();
+    });
+
+    const response = await fetch(`${baseUrl}/api/embed`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ repo: REPO.name }),
+    });
+    const { jobId } = (await response.json()) as { jobId: string };
+    const job = await waitForTerminalJob(baseUrl, jobId);
+
+    expect(job.status).toBe('failed');
+    expect(job.error).toMatch(/metadata changed.*newer metadata/i);
+    expect(state.runEmbeddingPipeline).not.toHaveBeenCalled();
+    expect(state.executeQuery).not.toHaveBeenCalled();
+    expect(state.saveMeta).not.toHaveBeenCalled();
+    expect(JSON.stringify(state.currentMeta)).toBe(JSON.stringify(newerMeta));
+  });
+
   it('gives legacy checkpoints an explicit recovery action instead of a blind retry', async () => {
     state.currentMeta.embeddingCheckpoint = {
       ...state.currentMeta.embeddingCheckpoint!,
