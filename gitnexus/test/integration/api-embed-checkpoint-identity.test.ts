@@ -258,6 +258,11 @@ describe('POST /api/embed completed-checkpoint identity', () => {
       recoverableIdentitySha256: undefined,
     };
     state.liveIntegrity = { ...state.liveIntegrity, physicalRows: 0, validRows: 0 };
+    state.executeQuery.mockImplementation(async (query: string) =>
+      query.includes('MATCH (n:File)') && !query.includes("trim(n.content) <> ''")
+        ? [{ id: 'File:whitespace', content: '   ' }]
+        : [],
+    );
     const response = await fetch(`${baseUrl}/api/embed`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -265,6 +270,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     });
     const { jobId } = (await response.json()) as { jobId: string };
     expect((await waitForTerminalJob(baseUrl, jobId)).status).toBe('complete');
+    expect(state.openModes).toEqual([true]);
     expect(state.runEmbeddingPipeline).not.toHaveBeenCalled();
     expect(state.currentMeta.embeddingCheckpoint).toBeUndefined();
   });
