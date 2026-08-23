@@ -955,7 +955,7 @@ const runFullAnalysisImpl = async (
       if (existingMeta.embeddingCheckpoint) {
         const clearedMeta = {
           ...existingMeta,
-          stats: { ...existingMeta.stats, embeddings: 0 },
+          stats: { ...existingMeta.stats, nodes: stats.nodes, edges: stats.edges, embeddings: 0 },
           embeddingCheckpoint: undefined,
           incrementalInProgress: undefined,
         };

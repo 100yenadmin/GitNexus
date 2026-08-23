@@ -628,6 +628,7 @@ describe('runFullAnalysis VECTOR-only repair (#170)', () => {
     // crashed before finalize. Repair must report not-indexed AND clear the
     // checkpoint, or the repo stays permanently marked as interrupted.
     const indexed = await createIndexedFixture(5, {
+      stats: { files: 2, nodes: 1, edges: 2, embeddings: 5 },
       embeddingCheckpoint: {
         ...completedCheckpoint,
         nodesProcessed: 0,
@@ -649,7 +650,7 @@ describe('runFullAnalysis VECTOR-only repair (#170)', () => {
       expect(mocks.initLbugForMaintenance).not.toHaveBeenCalled();
       expect(mocks.registerRepo).toHaveBeenCalledOnce();
       expect(mocks.registerRepo.mock.calls[0]?.[1]).toMatchObject({
-        stats: { embeddings: 0 },
+        stats: { nodes: 5, edges: 4, embeddings: 0 },
         embeddingCheckpoint: undefined,
         incrementalInProgress: undefined,
       });
@@ -660,6 +661,8 @@ describe('runFullAnalysis VECTOR-only repair (#170)', () => {
       expect(cleared.embeddingCheckpoint).toBeUndefined();
       expect(cleared.incrementalInProgress).toBeUndefined();
       expect(cleared.stats.embeddings).toBe(0);
+      expect(cleared.stats.nodes).toBe(5);
+      expect(cleared.stats.edges).toBe(4);
     } finally {
       restoreEnv();
       await indexed.fixture.cleanup();
