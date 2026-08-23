@@ -715,9 +715,7 @@ const inspectEntry = async (
   const freshness = freshnessFor(indexedSha, base.registry_sha, headSha);
   const embeddings = database.status === 'available' ? database.counts.embeddings : 0;
   const embeddingBearing =
-    embeddings > 0 ||
-    (base.registry.counts.embeddings ?? 0) > 0 ||
-    (counts.embeddings ?? 0) > 0;
+    embeddings > 0 || (base.registry.counts.embeddings ?? 0) > 0 || (counts.embeddings ?? 0) > 0;
   const queryDimensions = getQueryEmbeddingDimensions();
   const queryDimensionMismatch =
     embeddingBearing &&
