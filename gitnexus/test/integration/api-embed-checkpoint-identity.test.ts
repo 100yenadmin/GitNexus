@@ -316,6 +316,40 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     expect(state.currentMeta.embeddingCheckpoint).toBeUndefined();
   });
 
+  it.each(['connection not found', 'connection does not exist'])
+    ('propagates %s and retains the checkpoint', async (message) => {
+      state.currentMeta = makeMeta(MISMATCHED_DIGEST);
+      state.currentMeta.embeddingCheckpoint = {
+        ...state.currentMeta.embeddingCheckpoint!,
+        nodesProcessed: 0,
+        totalNodes: 0,
+        provider: undefined,
+        physicalRows: undefined,
+        validRows: undefined,
+        recoverableIdentitySha256: undefined,
+      };
+      state.liveIntegrity = makeIntegrity(LIVE_DIGEST, 0);
+      state.graphNodes = [];
+      state.executeQuery.mockImplementation(async () => {
+        throw new Error(message);
+      });
+      const before = JSON.stringify(state.currentMeta.embeddingCheckpoint);
+      const response = await fetch(`${baseUrl}/api/embed`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ repo: REPO.name }),
+      });
+      const { jobId } = (await response.json()) as { jobId: string };
+      const job = await waitForTerminalJob(baseUrl, jobId);
+
+      expect(job.status).toBe('failed');
+      expect(job.error).toMatch(new RegExp(message));
+      expect(state.runEmbeddingPipeline).not.toHaveBeenCalled();
+      expect(state.getActiveEmbeddingIdentity).not.toHaveBeenCalled();
+      expect(state.saveMeta).not.toHaveBeenCalled();
+      expect(JSON.stringify(state.currentMeta.embeddingCheckpoint)).toBe(before);
+    });
+
   it('finds a text-bearing File after a full invalid page without loading all rows', async () => {
     state.currentMeta = makeMeta(LIVE_DIGEST);
     state.currentMeta.embeddingCheckpoint = {

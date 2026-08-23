@@ -101,14 +101,15 @@ describe('POST /api/embed checkpoint recovery', () => {
 
   afterAll(async () => { onceSpy.mockRestore(); await shutdown?.(); exitSpy.mockRestore(); });
 
-  it('propagates connection failures and retains the checkpoint', async () => {
+  it.each(['connection not found', 'connection does not exist'])('propagates %s and retains the checkpoint', async (message) => {
+    state.executeQuery.mockImplementation(async () => { throw new Error(message); });
     const before = JSON.stringify(state.meta.embeddingCheckpoint);
     const response = await fetch(`${url}/api/embed`, { method: 'POST', body: JSON.stringify({ repo: repo.name }) });
     const { jobId } = await response.json() as { jobId: string };
     const job = await terminal(url, jobId);
     expect(response.status).toBe(202);
     expect(job.status).toBe('failed');
-    expect(job.error).toMatch(/connection not found/);
+    expect(job.error).toMatch(new RegExp(message));
     expect(state.pipeline).not.toHaveBeenCalled();
     expect(state.identity).not.toHaveBeenCalled();
     expect(state.saveMeta).not.toHaveBeenCalled();

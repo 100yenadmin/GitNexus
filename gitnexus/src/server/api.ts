@@ -1768,8 +1768,14 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
     execQuery: (cypher: string) => Promise<any[]>,
   ): Promise<boolean> => {
     const rowHasId = (row: any): boolean => Boolean(row?.id ?? row?.[0]);
-    const isMissingSchemaError = (err: unknown): boolean =>
-      isMissingColumnOrTableError(err instanceof Error ? err.message : String(err));
+    const isMissingSchemaError = (err: unknown): boolean => {
+      const message = err instanceof Error ? err.message : String(err);
+      if (/\bconnection\b/i.test(message)) return false;
+      return (
+        isMissingColumnOrTableError(message) &&
+        /\b(?:table|column|property)\b/i.test(message)
+      );
+    };
     for (const label of EMBEDDABLE_LABELS) {
       try {
         const rows = await execQuery(
