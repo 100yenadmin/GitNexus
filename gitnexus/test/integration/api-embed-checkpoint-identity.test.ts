@@ -56,15 +56,30 @@ const state = {
   liveIntegrity: makeIntegrity(LIVE_DIGEST),
   graphNodes: [{ id: 'node-1' }],
   executeQuery: vi.fn(async () => state.graphNodes),
-  getActiveEmbeddingIdentity: vi.fn(() => identity),
+  openModes: [] as Array<boolean | undefined>,
+  closeLbug: vi.fn(async () => undefined),
+  withLbugReadOnlyNonRecovering: vi.fn((_dbPath: string, operation: () => Promise<unknown>) => {
+    state.openModes.push(true);
+    return operation().finally(() => state.closeLbug());
+  }),
+  withLbugDb: vi.fn(
+    async (
+      _dbPath: string,
+      operation: () => Promise<unknown>,
+      options?: { readOnly?: boolean },
+    ) => {
+      state.openModes.push(options?.readOnly);
+      return operation();
+    },
+  ),
   runEmbeddingPipeline: vi.fn(async (..._args: unknown[]) => undefined),
+  getActiveEmbeddingIdentity: vi.fn(() => identity),
   inspectEmbeddingIntegrity: vi.fn(async () => state.liveIntegrity),
   saveMeta: vi.fn(async (_storagePath: string, next: RepoMeta) => {
     state.currentMeta = next;
   }),
   loadMeta: vi.fn(async () => state.currentMeta),
   listRegisteredRepos: vi.fn(async () => [REPO]),
-  withLbugDb: vi.fn(async (_dbPath: string, operation: () => Promise<unknown>) => operation()),
   deleteHandlerStarted: undefined as (() => void) | undefined,
 };
 
@@ -86,12 +101,16 @@ vi.doMock('../../src/storage/repo-manager.js', async () => ({
 }));
 
 vi.doMock('../../src/core/lbug/lbug-adapter.js', async () => ({
+  ...(await vi.importActual<typeof import('../../src/core/lbug/lbug-adapter.js')>(
+    '../../src/core/lbug/lbug-adapter.js',
+  )),
   executeQuery: state.executeQuery,
   executePrepared: vi.fn(async () => []),
   executeWithReusedStatement: vi.fn(async () => undefined),
   streamQuery: vi.fn(async () => undefined),
   flushWAL: vi.fn(async () => undefined),
-  closeLbug: vi.fn(async () => undefined),
+  closeLbug: state.closeLbug,
+  withLbugReadOnlyNonRecovering: state.withLbugReadOnlyNonRecovering,
   withLbugDb: state.withLbugDb,
   isReadOnlyDbError: vi.fn(() => false),
   queryFTS: vi.fn(async () => []),
@@ -199,13 +218,20 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     state.currentMeta = makeMeta(MISMATCHED_DIGEST);
     state.liveIntegrity = makeIntegrity(LIVE_DIGEST);
     state.graphNodes = [{ id: 'node-1' }];
-    state.executeQuery.mockClear();
+    state.executeQuery.mockReset();
+    state.executeQuery.mockImplementation(async () => state.graphNodes);
+    state.openModes.length = 0;
+    state.closeLbug.mockClear();
+    state.withLbugReadOnlyNonRecovering.mockClear();
+    state.withLbugDb.mockClear();
     state.getActiveEmbeddingIdentity.mockClear();
+    state.inspectEmbeddingIntegrity.mockReset();
+    state.inspectEmbeddingIntegrity.mockImplementation(async () => state.liveIntegrity);
     state.runEmbeddingPipeline.mockReset();
     state.runEmbeddingPipeline.mockResolvedValue(undefined);
-    state.inspectEmbeddingIntegrity.mockClear();
     state.saveMeta.mockClear();
-    state.withLbugDb.mockClear();
+    state.loadMeta.mockReset();
+    state.loadMeta.mockImplementation(async () => state.currentMeta);
     state.deleteHandlerStarted = undefined;
   });
 
@@ -265,7 +291,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     expect(JSON.stringify(state.currentMeta.embeddingCheckpoint)).toBe(checkpointBefore);
   });
 
-  it('accepts a matching digest and finalizes clean metadata', async () => {
+  it('routes an ordinary checkpoint through writable recovery and finalizes metadata', async () => {
     state.currentMeta = makeMeta(LIVE_DIGEST);
     const response = await fetch(`${baseUrl}/api/embed`, {
       method: 'POST',
@@ -277,39 +303,17 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     const job = await waitForTerminalJob(baseUrl, jobId);
 
     expect(job.status).toBe('complete');
+    expect(state.openModes).toEqual([undefined]);
+    expect(state.withLbugReadOnlyNonRecovering).not.toHaveBeenCalled();
     expect(state.runEmbeddingPipeline).toHaveBeenCalledOnce();
     expect(state.currentMeta.stats?.embeddings).toBe(3);
     expect(state.currentMeta.embeddingCheckpoint).toBeUndefined();
   });
 
-  it('fails closed when metadata changes while acquiring writable LadybugDB', async () => {
-    state.currentMeta = makeMeta(LIVE_DIGEST);
-    const newerMeta = { ...makeMeta(LIVE_DIGEST), lastCommit: 'newer-head' };
-    state.withLbugDb.mockImplementationOnce(async (_dbPath, operation) => {
-      state.currentMeta = newerMeta;
-      return operation();
-    });
-
-    const response = await fetch(`${baseUrl}/api/embed`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ repo: REPO.name }),
-    });
-    const { jobId } = (await response.json()) as { jobId: string };
-    const job = await waitForTerminalJob(baseUrl, jobId);
-
-    expect(job.status).toBe('failed');
-    expect(job.error).toMatch(/metadata changed.*newer metadata/i);
-    expect(state.runEmbeddingPipeline).not.toHaveBeenCalled();
-    expect(state.executeQuery).not.toHaveBeenCalled();
-    expect(state.saveMeta).not.toHaveBeenCalled();
-    expect(JSON.stringify(state.currentMeta)).toBe(JSON.stringify(newerMeta));
-  });
-
-  it('gives legacy checkpoints an explicit recovery action instead of a blind retry', async () => {
+  it('rejects a nonlegacy provider mismatch before writable Ladybug', async () => {
     state.currentMeta.embeddingCheckpoint = {
       ...state.currentMeta.embeddingCheckpoint!,
-      provider: undefined,
+      model: 'other-model',
     };
     const before = JSON.stringify(state.currentMeta.embeddingCheckpoint);
     const response = await fetch(`${baseUrl}/api/embed`, {
@@ -320,13 +324,109 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     const { jobId } = (await response.json()) as { jobId: string };
     const job = await waitForTerminalJob(baseUrl, jobId);
 
-    expect(job.error).toMatch(/unknown-provider/);
+    expect(job.error).toMatch(/but this run resolves/);
     expect(job.error).toMatch(/do not retry POST \/api\/embed/i);
-    expect(job.error).toMatch(/gitnexus analyze --force --drop-embeddings --embeddings/);
+    expect(job.error).toMatch(/gitnexus analyze --force --drop-embeddings --embeddings 0/);
+    expect(job.error).not.toMatch(/POST \/api\/analyze/);
+    expect(state.openModes).toEqual([]);
+    expect(state.withLbugReadOnlyNonRecovering).not.toHaveBeenCalled();
+    expect(state.withLbugDb).not.toHaveBeenCalled();
+    expect(state.getActiveEmbeddingIdentity).toHaveBeenCalledOnce();
     expect(JSON.stringify(state.currentMeta.embeddingCheckpoint)).toBe(before);
   });
 
-  it('clears a legacy zero-node checkpoint and runs a fresh pipeline for current graph nodes', async () => {
+  it('refuses metadata drift before provider-capable work', async () => {
+    const initial = { ...makeMeta(LIVE_DIGEST), embeddingCheckpoint: undefined };
+    const changed = makeMeta(LIVE_DIGEST);
+    changed.embeddingCheckpoint = {
+      ...changed.embeddingCheckpoint!,
+      nodesProcessed: 0,
+      totalNodes: 0,
+      provider: undefined,
+      physicalRows: undefined,
+      validRows: undefined,
+      recoverableIdentitySha256: undefined,
+    };
+    state.loadMeta.mockResolvedValueOnce(initial).mockResolvedValue(changed);
+    const response = await fetch(`${baseUrl}/api/embed`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ repo: REPO.name }),
+    });
+    const { jobId } = (await response.json()) as { jobId: string };
+    const job = await waitForTerminalJob(baseUrl, jobId);
+
+    expect(job.error).toMatch(/metadata changed during preflight/i);
+    expect(job.error).toMatch(/retry POST \/api\/embed after the current repository operation/i);
+    expect(job.error).toMatch(/ask the repository owner/i);
+    expect(job.error).not.toMatch(/do not retry|--drop-embeddings|analyze --force/i);
+    expect(state.openModes).toEqual([undefined]);
+    expect(state.getActiveEmbeddingIdentity).not.toHaveBeenCalled();
+    expect(state.runEmbeddingPipeline).not.toHaveBeenCalled();
+    expect(state.saveMeta).not.toHaveBeenCalled();
+  });
+
+  it('refuses tentative legacy classification drift before writable Ladybug', async () => {
+    const initial = makeMeta(LIVE_DIGEST);
+    initial.embeddingCheckpoint = {
+      ...initial.embeddingCheckpoint!,
+      nodesProcessed: 0,
+      totalNodes: 0,
+      provider: undefined,
+      physicalRows: undefined,
+      validRows: undefined,
+      recoverableIdentitySha256: undefined,
+    };
+    const changed = { ...initial, embeddingCheckpoint: undefined };
+    state.loadMeta.mockResolvedValueOnce(initial).mockResolvedValue(changed);
+    const response = await fetch(`${baseUrl}/api/embed`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ repo: REPO.name }),
+    });
+    const { jobId } = (await response.json()) as { jobId: string };
+    const job = await waitForTerminalJob(baseUrl, jobId);
+
+    expect(job.error).toMatch(/metadata changed during preflight/i);
+    expect(job.error).toMatch(/retry POST \/api\/embed after the current repository operation/i);
+    expect(job.error).toMatch(/ask the repository owner/i);
+    expect(job.error).not.toMatch(/do not retry|--drop-embeddings|analyze --force/i);
+    expect(state.openModes).toEqual([true]);
+    expect(state.withLbugDb).not.toHaveBeenCalled();
+    expect(state.getActiveEmbeddingIdentity).not.toHaveBeenCalled();
+    expect(state.runEmbeddingPipeline).not.toHaveBeenCalled();
+  });
+
+  it('refuses legacy zero-row drift after writable open', async () => {
+    state.currentMeta.embeddingCheckpoint = {
+      ...state.currentMeta.embeddingCheckpoint!,
+      nodesProcessed: 0,
+      totalNodes: 0,
+      provider: undefined,
+      physicalRows: undefined,
+      validRows: undefined,
+      recoverableIdentitySha256: undefined,
+    };
+    state.inspectEmbeddingIntegrity
+      .mockResolvedValueOnce(makeIntegrity(LIVE_DIGEST, 0))
+      .mockResolvedValueOnce(makeIntegrity(LIVE_DIGEST, 1));
+    state.executeQuery.mockResolvedValue([{ id: 'Function:current' }]);
+    const response = await fetch(`${baseUrl}/api/embed`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ repo: REPO.name }),
+    });
+    const { jobId } = (await response.json()) as { jobId: string };
+    const job = await waitForTerminalJob(baseUrl, jobId);
+
+    expect(job.error).toMatch(/unknown-provider while the table contains rows/i);
+    expect(state.openModes).toEqual([true, undefined]);
+    expect(state.getActiveEmbeddingIdentity).not.toHaveBeenCalled();
+    expect(state.runEmbeddingPipeline).not.toHaveBeenCalled();
+    expect(state.saveMeta).not.toHaveBeenCalled();
+  });
+
+  it('clears a legacy zero-node checkpoint only when the table is empty', async () => {
     state.currentMeta = makeMeta(LIVE_DIGEST);
     state.currentMeta.embeddingCheckpoint = {
       ...state.currentMeta.embeddingCheckpoint!,
@@ -338,10 +438,11 @@ describe('POST /api/embed completed-checkpoint identity', () => {
       recoverableIdentitySha256: undefined,
     };
     state.liveIntegrity = { ...state.liveIntegrity, physicalRows: 0, validRows: 0 };
-    state.graphNodes = [{ id: 'node-1' }, { id: 'node-2' }];
-    state.runEmbeddingPipeline.mockImplementationOnce(async (executeQuery) => {
-      expect(await (executeQuery as () => Promise<unknown[]>)()).toEqual(state.graphNodes);
-    });
+    state.executeQuery.mockImplementation(async (query: string) =>
+      query.includes('MATCH (n:`File`)') && !query.includes("trim(n.content) <> ''")
+        ? [{ id: 'File:whitespace', content: '   ' }]
+        : [],
+    );
     const response = await fetch(`${baseUrl}/api/embed`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -349,10 +450,39 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     });
     const { jobId } = (await response.json()) as { jobId: string };
     expect((await waitForTerminalJob(baseUrl, jobId)).status).toBe('complete');
-    expect(state.executeQuery).toHaveBeenCalled();
-    expect(state.getActiveEmbeddingIdentity).toHaveBeenCalledOnce();
-    expect(state.runEmbeddingPipeline).toHaveBeenCalledOnce();
+    expect(state.openModes).toEqual([true, undefined]);
+    expect(state.closeLbug).toHaveBeenCalledOnce();
+    expect(state.runEmbeddingPipeline).not.toHaveBeenCalled();
     expect(state.currentMeta.embeddingCheckpoint).toBeUndefined();
+  });
+
+  it('runs the pipeline after read-only proof finds current graph nodes', async () => {
+    state.currentMeta = makeMeta(LIVE_DIGEST);
+    state.currentMeta.embeddingCheckpoint = {
+      ...state.currentMeta.embeddingCheckpoint!,
+      nodesProcessed: 0,
+      totalNodes: 0,
+      provider: undefined,
+      physicalRows: undefined,
+      validRows: undefined,
+      recoverableIdentitySha256: undefined,
+    };
+    state.liveIntegrity = makeIntegrity(LIVE_DIGEST, 0);
+    state.executeQuery.mockResolvedValue([{ id: 'Function:current' }]);
+    const response = await fetch(`${baseUrl}/api/embed`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ repo: REPO.name }),
+    });
+    const { jobId } = (await response.json()) as { jobId: string };
+    expect((await waitForTerminalJob(baseUrl, jobId)).status).toBe('complete');
+    expect(state.openModes).toEqual([true, undefined]);
+    expect(state.runEmbeddingPipeline).toHaveBeenCalledOnce();
+    expect(state.getActiveEmbeddingIdentity).toHaveBeenCalledOnce();
+    expect(state.inspectEmbeddingIntegrity).toHaveBeenCalledTimes(3);
+    expect(state.inspectEmbeddingIntegrity.mock.invocationCallOrder[1]).toBeLessThan(
+      state.getActiveEmbeddingIdentity.mock.invocationCallOrder[0],
+    );
   });
 
   it('refuses provider-less durable proof when recorded rows vanished', async () => {
@@ -376,7 +506,8 @@ describe('POST /api/embed completed-checkpoint identity', () => {
       /unknown-provider|failed embedding integrity validation|durable identity/i,
     );
     expect(job.error).toMatch(/do not retry POST \/api\/embed/i);
-    expect(job.error).toMatch(/gitnexus analyze --force --drop-embeddings --embeddings/);
+    expect(job.error).toMatch(/gitnexus analyze --force --drop-embeddings --embeddings 0/);
+    expect(job.error).not.toMatch(/POST \/api\/analyze/);
     expect(state.withLbugDb).not.toHaveBeenCalled();
     expect(state.runEmbeddingPipeline).not.toHaveBeenCalled();
     expect(state.saveMeta).not.toHaveBeenCalled();
@@ -475,7 +606,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
       }
       fileQueries.push(query);
       expect(query).toMatch(/ORDER BY n\.id LIMIT 256$/);
-      if (fileQueries.length === 1) {
+      if (fileQueries.length % 2 === 1) {
         return Array.from({ length: 256 }, (_, index) => ({
           id: index === 255 ? "last-'\\id" : `invalid-${index}`,
           filePath: `invalid/${index}`,
@@ -483,12 +614,9 @@ describe('POST /api/embed completed-checkpoint identity', () => {
         }));
       }
       expect(query).toContain(`WHERE n.id > '${escapeCypherString("last-'\\id")}' `);
-      if (fileQueries.length === 2) {
-        return [
-          { id: 'valid-file', filePath: 'src/valid.ts', content: 'export const valid = true;' },
-        ];
-      }
-      return [];
+      return [
+        { id: 'valid-file', filePath: 'src/valid.ts', content: 'export const valid = true;' },
+      ];
     });
 
     const response = await fetch(`${baseUrl}/api/embed`, {
@@ -500,7 +628,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
 
     expect((await waitForTerminalJob(baseUrl, jobId)).status).toBe('complete');
     expect(state.runEmbeddingPipeline).toHaveBeenCalledOnce();
-    expect(fileQueries).toHaveLength(2);
+    expect(fileQueries).toHaveLength(4);
     expect(fileQueries.every((query) => /ORDER BY n\.id LIMIT 256$/.test(query))).toBe(true);
   });
 
@@ -604,7 +732,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
       if (!query.includes('`File`')) throw new Error('table LegacyNode does not exist');
       fileQueries.push(query);
       expect(query).toMatch(/ORDER BY n\.id LIMIT 256$/);
-      if (fileQueries.length === 1) {
+      if (fileQueries.length % 2 === 1) {
         return Array.from({ length: 256 }, (_, index) => ({
           id: index === 255 ? firstId : `File:invalid-${index}`,
           filePath: `invalid/${index}`,
@@ -622,7 +750,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     });
     const { jobId } = (await response.json()) as { jobId: string };
     expect((await waitForTerminalJob(baseUrl, jobId)).status).toBe('complete');
-    expect(fileQueries).toHaveLength(2);
+    expect(fileQueries).toHaveLength(4);
     expect(state.runEmbeddingPipeline).toHaveBeenCalledOnce();
     expect(state.getActiveEmbeddingIdentity).toHaveBeenCalledOnce();
     expect(state.currentMeta.stats?.embeddings).toBe(3);
@@ -651,7 +779,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
       const query = String(args[0] ?? '');
       if (!query.includes('`File`')) throw new Error(schemaError);
       fileQueries.push(query);
-      if (fileQueries.length === 1) {
+      if (fileQueries.length % 2 === 1) {
         return Array.from({ length: 256 }, (_, index) => ({
           id: `invalid-${index}`,
           filePath: `invalid/${index}`,
@@ -669,14 +797,42 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     const { jobId } = (await response.json()) as { jobId: string };
 
     expect((await waitForTerminalJob(baseUrl, jobId)).status).toBe('complete');
-    expect(fileQueries).toHaveLength(2);
+    expect(fileQueries).toHaveLength(4);
     expect(fileQueries[1]).toContain("WHERE n.id > 'invalid-255' ");
+    expect(fileQueries[3]).toContain("WHERE n.id > 'invalid-255' ");
     expect(state.runEmbeddingPipeline).not.toHaveBeenCalled();
     expect(state.getActiveEmbeddingIdentity).not.toHaveBeenCalled();
     expect(state.currentMeta.stats?.embeddings).toBe(0);
+    expect(state.openModes).toEqual([true, undefined]);
     expect(state.currentMeta.embeddingCheckpoint).toBeUndefined();
   });
 
+  it('fails the preflight without opening writable Ladybug when graph proof errors', async () => {
+    state.currentMeta.embeddingCheckpoint = {
+      ...state.currentMeta.embeddingCheckpoint!,
+      nodesProcessed: 0,
+      totalNodes: 0,
+      provider: undefined,
+      physicalRows: undefined,
+      validRows: undefined,
+      recoverableIdentitySha256: undefined,
+    };
+    state.liveIntegrity = makeIntegrity(LIVE_DIGEST, 0);
+    state.executeQuery.mockRejectedValue(new Error('preflight query failed'));
+    const before = JSON.stringify(state.currentMeta.embeddingCheckpoint);
+    const response = await fetch(`${baseUrl}/api/embed`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ repo: REPO.name }),
+    });
+    const { jobId } = (await response.json()) as { jobId: string };
+    const job = await waitForTerminalJob(baseUrl, jobId);
+    expect(job.status).toBe('failed');
+    expect(job.error).toMatch(/preflight query failed/);
+    expect(state.openModes).toEqual([true]);
+    expect(state.closeLbug).toHaveBeenCalledOnce();
+    expect(JSON.stringify(state.currentMeta.embeddingCheckpoint)).toBe(before);
+  });
   it('persists completed-window identity before an interrupted finalization', async () => {
     state.currentMeta = makeMeta(LIVE_DIGEST);
     state.runEmbeddingPipeline.mockImplementationOnce(async (...args: unknown[]) => {

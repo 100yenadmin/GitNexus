@@ -743,8 +743,16 @@ export const initLbugForMaintenance = async (dbPath: string) =>
  * an init lock, or opens the database writable. Callers must close the shared
  * handle with {@link closeLbug} when their bounded read is complete.
  */
-export const initLbugReadOnlyNonRecovering = async (dbPath: string) =>
-  runWithSessionLock(async () => {
+async function runLbugReadOnlyNonRecovering(dbPath: string): Promise<LbugConnectionHandle>;
+async function runLbugReadOnlyNonRecovering<T>(
+  dbPath: string,
+  operation: () => Promise<T>,
+): Promise<T>;
+async function runLbugReadOnlyNonRecovering<T>(
+  dbPath: string,
+  operation?: () => Promise<T>,
+): Promise<LbugConnectionHandle | T> {
+  return runWithSessionLock(async () => {
     if (conn || db) await safeClose();
     resetOpenConnectionState();
 
@@ -780,8 +788,22 @@ export const initLbugReadOnlyNonRecovering = async (dbPath: string) =>
     conn = opened.conn;
     currentDbPath = dbPath;
     currentDbReadOnly = true;
-    return { db, conn };
+    if (!operation) return opened;
+    try {
+      return await operation();
+    } finally {
+      await safeClose().finally(resetOpenConnectionState);
+    }
   });
+}
+
+export const initLbugReadOnlyNonRecovering = (dbPath: string) =>
+  runLbugReadOnlyNonRecovering(dbPath);
+
+export const withLbugReadOnlyNonRecovering = async <T>(
+  dbPath: string,
+  operation: () => Promise<T>,
+): Promise<T> => runLbugReadOnlyNonRecovering(dbPath, operation);
 
 /**
  * Execute multiple queries against one repo DB atomically.
