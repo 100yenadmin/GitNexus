@@ -612,4 +612,85 @@ describe('POST /api/embed completed-checkpoint identity', () => {
       pendingNodeIds: [],
     });
   });
+
+  it('keeps terminal cancellation pending until completion is published', async () => {
+    state.currentMeta = makeMeta(LIVE_DIGEST);
+    let terminalSaveStarted!: () => void;
+    const terminalSave = new Promise<void>((resolve) => (terminalSaveStarted = resolve));
+    let releaseSave!: () => void;
+    const saveRelease = new Promise<void>((resolve) => (releaseSave = resolve));
+    state.saveMeta.mockImplementation(async (_storagePath, next) => {
+      if (next.embeddingCheckpoint === undefined) {
+        terminalSaveStarted();
+        await saveRelease;
+      }
+      state.currentMeta = next;
+    });
+
+    const response = await fetch(`${baseUrl}/api/embed`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ repo: REPO.name }),
+    });
+    const { jobId } = (await response.json()) as { jobId: string };
+    await terminalSave;
+
+    let deleteSettled = false;
+    const deleteResponse = fetch(`${baseUrl}/api/embed/${jobId}`, { method: 'DELETE' }).then(
+      (result) => {
+        deleteSettled = true;
+        return result;
+      },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(deleteSettled).toBe(false);
+
+    releaseSave();
+    const deleted = await deleteResponse;
+    expect(deleted.status).toBe(400);
+    await expect(deleted.json()).resolves.toEqual({ error: 'Job already complete' });
+    expect((await waitForTerminalJob(baseUrl, jobId)).status).toBe('complete');
+  });
+
+  it('keeps terminal cancellation pending until failure is published', async () => {
+    state.currentMeta = makeMeta(LIVE_DIGEST);
+    let terminalSaveStarted!: () => void;
+    const terminalSave = new Promise<void>((resolve) => (terminalSaveStarted = resolve));
+    let releaseSave!: () => void;
+    const saveRelease = new Promise<void>((resolve) => (releaseSave = resolve));
+    state.saveMeta.mockImplementation(async (_storagePath, next) => {
+      if (next.embeddingCheckpoint === undefined) {
+        terminalSaveStarted();
+        await saveRelease;
+        throw new Error('terminal persistence failed');
+      }
+      state.currentMeta = next;
+    });
+
+    const response = await fetch(`${baseUrl}/api/embed`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ repo: REPO.name }),
+    });
+    const { jobId } = (await response.json()) as { jobId: string };
+    await terminalSave;
+
+    let deleteSettled = false;
+    const deleteResponse = fetch(`${baseUrl}/api/embed/${jobId}`, { method: 'DELETE' }).then(
+      (result) => {
+        deleteSettled = true;
+        return result;
+      },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(deleteSettled).toBe(false);
+
+    releaseSave();
+    const deleted = await deleteResponse;
+    expect(deleted.status).toBe(400);
+    await expect(deleted.json()).resolves.toEqual({ error: 'Job already failed' });
+    const job = await waitForTerminalJob(baseUrl, jobId);
+    expect(job.status).toBe('failed');
+    expect(job.error).toBe('terminal persistence failed');
+  });
 });
