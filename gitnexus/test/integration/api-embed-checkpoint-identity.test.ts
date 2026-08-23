@@ -75,6 +75,7 @@ const state = {
   runEmbeddingPipeline: vi.fn(async (..._args: unknown[]) => undefined),
   getActiveEmbeddingIdentity: vi.fn(() => identity),
   inspectEmbeddingIntegrity: vi.fn(async () => state.liveIntegrity),
+  getLbugStats: vi.fn(async () => ({ nodes: 4, edges: 5 })),
   saveMeta: vi.fn(async (_storagePath: string, next: RepoMeta) => {
     state.currentMeta = next;
   }),
@@ -115,6 +116,7 @@ vi.doMock('../../src/core/lbug/lbug-adapter.js', async () => ({
   isReadOnlyDbError: vi.fn(() => false),
   queryFTS: vi.fn(async () => []),
   inspectEmbeddingIntegrity: state.inspectEmbeddingIntegrity,
+  getLbugStats: state.getLbugStats,
   embeddingIntegrityFailures: vi.fn(() => 0),
   fetchExistingEmbeddingHashes: vi.fn(async () => undefined),
 }));
@@ -227,6 +229,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     state.getActiveEmbeddingIdentity.mockClear();
     state.inspectEmbeddingIntegrity.mockReset();
     state.inspectEmbeddingIntegrity.mockImplementation(async () => state.liveIntegrity);
+    state.getLbugStats.mockClear();
     state.runEmbeddingPipeline.mockReset();
     state.runEmbeddingPipeline.mockResolvedValue(undefined);
     state.saveMeta.mockClear();
@@ -428,6 +431,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
 
   it('clears a legacy zero-node checkpoint only when the table is empty', async () => {
     state.currentMeta = makeMeta(LIVE_DIGEST);
+    state.currentMeta.stats = { nodes: 17, edges: 19, embeddings: 3 };
     state.currentMeta.embeddingCheckpoint = {
       ...state.currentMeta.embeddingCheckpoint!,
       nodesProcessed: 0,
@@ -453,6 +457,11 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     expect(state.openModes).toEqual([true, undefined]);
     expect(state.closeLbug).toHaveBeenCalledOnce();
     expect(state.runEmbeddingPipeline).not.toHaveBeenCalled();
+    expect(state.getLbugStats).toHaveBeenCalledOnce();
+    expect(state.getLbugStats.mock.invocationCallOrder[0]).toBeLessThan(
+      state.saveMeta.mock.invocationCallOrder[0],
+    );
+    expect(state.currentMeta.stats).toEqual({ nodes: 4, edges: 5, embeddings: 0 });
     expect(state.currentMeta.embeddingCheckpoint).toBeUndefined();
   });
 
@@ -540,6 +549,54 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     expect(state.getActiveEmbeddingIdentity).not.toHaveBeenCalled();
     expect(state.runEmbeddingPipeline).not.toHaveBeenCalled();
     expect(state.currentMeta.stats?.embeddings).toBe(0);
+    expect(state.currentMeta.embeddingCheckpoint).toBeUndefined();
+  });
+
+  it('publishes completion only after the writable session returns', async () => {
+    state.currentMeta = makeMeta(LIVE_DIGEST);
+    let sessionOperationFinished!: () => void;
+    const operationFinished = new Promise<void>((resolve) => (sessionOperationFinished = resolve));
+    let releaseSession!: () => void;
+    const sessionRelease = new Promise<void>((resolve) => (releaseSession = resolve));
+    state.withLbugDb.mockImplementationOnce(async (_dbPath, operation, options) => {
+      state.openModes.push(options?.readOnly);
+      await operation();
+      sessionOperationFinished();
+      await sessionRelease;
+    });
+
+    const response = await fetch(`${baseUrl}/api/embed`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ repo: REPO.name }),
+    });
+    const { jobId } = (await response.json()) as { jobId: string };
+    await operationFinished;
+    const pending = (await (await fetch(`${baseUrl}/api/embed/${jobId}`)).json()) as {
+      status: string;
+    };
+    expect(pending.status).not.toBe('complete');
+    releaseSession();
+    expect((await waitForTerminalJob(baseUrl, jobId)).status).toBe('complete');
+  });
+
+  it('fails after a writable session teardown error despite a successful terminal save', async () => {
+    state.currentMeta = makeMeta(LIVE_DIGEST);
+    state.withLbugDb.mockImplementationOnce(async (_dbPath, operation, options) => {
+      state.openModes.push(options?.readOnly);
+      await operation();
+      throw new Error('writable session teardown failed');
+    });
+
+    const response = await fetch(`${baseUrl}/api/embed`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ repo: REPO.name }),
+    });
+    const { jobId } = (await response.json()) as { jobId: string };
+    const job = await waitForTerminalJob(baseUrl, jobId);
+    expect(job.status).toBe('failed');
+    expect(job.error).toBe('writable session teardown failed');
     expect(state.currentMeta.embeddingCheckpoint).toBeUndefined();
   });
 
@@ -923,8 +980,12 @@ describe('POST /api/embed completed-checkpoint identity', () => {
 
     releaseSave();
     const deleted = await deleteResponse;
-    expect(deleted.status).toBe(400);
-    await expect(deleted.json()).resolves.toEqual({ error: 'Job already failed' });
+    expect(deleted.status).toBe(saveError ? 400 : 200);
+    await expect(deleted.json()).resolves.toEqual(
+      saveError
+        ? { error: 'Job already failed' }
+        : { id: jobId, status: 'failed', error: 'Cancelled by user' },
+    );
     const job = await waitForTerminalJob(baseUrl, jobId);
     expect(job.status).toBe('failed');
     expect(job.error).toBe(saveError ?? 'Cancelled by user');

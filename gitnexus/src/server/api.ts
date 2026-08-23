@@ -31,6 +31,7 @@ import {
   executeWithReusedStatement,
   streamQuery,
   flushWAL,
+  getLbugStats,
   closeLbug,
   withLbugReadOnlyNonRecovering,
   withLbugDb,
@@ -159,7 +160,7 @@ export const commitEmbedMetadata = async (
     barrier.phase = 'FAILED';
     throw new Error(barrier.cancelReason || 'Embedding job was cancelled');
   }
-  barrier.phase = phase === 'COMMITTING_TERMINAL' ? 'COMPLETE' : 'RUNNING';
+  if (phase === 'COMMITTING_CHECKPOINT') barrier.phase = 'RUNNING';
 };
 
 /**
@@ -2068,17 +2069,17 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                 );
                 if (!graphHasNodes) {
                   embedController.signal.throwIfAborted();
+                  const graphStats = await getLbugStats();
+                  embedController.signal.throwIfAborted();
                   const clearedMeta = {
                     ...embeddingMeta,
-                    stats: { ...embeddingMeta.stats, embeddings: integrity.validRows },
+                    stats: { ...embeddingMeta.stats, ...graphStats, embeddings: 0 },
                     embeddingCheckpoint: undefined,
                   };
                   await commitEmbedMetadata(barrier, 'COMMITTING_TERMINAL', () =>
                     saveMeta(entry.storagePath, clearedMeta),
                   );
                   embeddingMeta = clearedMeta;
-                  embedJobManager.updateJob(job.id, { status: 'complete' });
-                  barrier.publishTerminalOutcome();
                   return;
                 }
                 // Keep the old checkpoint persisted until the fresh pipeline
@@ -2221,13 +2222,12 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                 saveMeta(entry.storagePath, terminalMeta),
               );
               embeddingMeta = terminalMeta;
-              embedJobManager.updateJob(job.id, { status: 'complete' });
-              barrier.publishTerminalOutcome();
             });
 
             // Don't overwrite 'failed' if the job was cancelled while the pipeline was running
             const current = embedJobManager.getJob(job.id);
             if (!current || current.status !== 'failed') {
+              barrier.phase = 'COMPLETE';
               embedJobManager.updateJob(job.id, { status: 'complete' });
             }
             barrier.publishTerminalOutcome();
@@ -2295,14 +2295,28 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
     }
     const barrier = embedBarriers.get(jobId);
     if (barrier) {
+      const phaseAtRequest = barrier.phase;
+      const cancellationAlreadyRequested = barrier.cancelRequested;
       const outcome = requestEmbedCancellation(barrier, 'Cancelled by user', () =>
         embedAborters.get(jobId)?.(),
       );
+      const acceptedDeferredCancellation =
+        !cancellationAlreadyRequested &&
+        phaseAtRequest === 'COMMITTING_CHECKPOINT' &&
+        outcome === 'deferred';
       if (!barrier.terminalOutcomePublished && (outcome === 'deferred' || outcome === 'terminal')) {
         await barrier.terminalOutcome;
         await Promise.resolve();
       }
       const settledJob = embedJobManager.getJob(jobId);
+      if (
+        acceptedDeferredCancellation &&
+        settledJob?.status === 'failed' &&
+        settledJob.error === barrier.cancelReason
+      ) {
+        res.json({ id: job.id, status: 'failed', error: 'Cancelled by user' });
+        return;
+      }
       if (settledJob?.status === 'complete' || settledJob?.status === 'failed') {
         res.status(400).json({ error: `Job already ${settledJob.status}` });
         return;
