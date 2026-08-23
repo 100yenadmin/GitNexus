@@ -12,6 +12,43 @@ const blockedWrite = () => {
 };
 
 describe('/api/embed metadata commit barrier', () => {
+  it.each([
+    ['RUNNING', 'Embedding timed out', 'Cancelled by user', 'cancelled', 'terminal', 1],
+    ['RUNNING', 'Cancelled by user', 'Embedding timed out', 'cancelled', 'terminal', 1],
+    [
+      'COMMITTING_CHECKPOINT',
+      'Embedding timed out',
+      'Cancelled by user',
+      'deferred',
+      'deferred',
+      2,
+    ],
+    [
+      'COMMITTING_CHECKPOINT',
+      'Cancelled by user',
+      'Embedding timed out',
+      'deferred',
+      'deferred',
+      2,
+    ],
+    ['COMMITTING_TERMINAL', 'Embedding timed out', 'Cancelled by user', 'deferred', 'deferred', 0],
+    ['COMMITTING_TERMINAL', 'Cancelled by user', 'Embedding timed out', 'deferred', 'deferred', 0],
+  ] as const)(
+    'latches the first reason in %s for %s then %s',
+    (phase, firstReason, secondReason, firstOutcome, secondOutcome, abortCalls) => {
+      const barrier = createEmbedCommitBarrier();
+      barrier.phase = phase;
+      const abort = vi.fn();
+
+      expect(requestEmbedCancellation(barrier, firstReason, abort)).toBe(firstOutcome);
+      expect(requestEmbedCancellation(barrier, secondReason, abort)).toBe(secondOutcome);
+
+      expect(barrier.cancelRequested).toBe(true);
+      expect(barrier.cancelReason).toBe(firstReason);
+      expect(abort).toHaveBeenCalledTimes(abortCalls);
+    },
+  );
+
   it('rejects a write after cancellation wins before its claim', async () => {
     const barrier = createEmbedCommitBarrier();
     const abort = vi.fn();
