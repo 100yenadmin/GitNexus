@@ -514,7 +514,7 @@ const FTS_UNAVAILABLE_MESSAGE =
 const CLI_CHECKPOINT_CONTEXT =
   'Cannot resume embedding checkpoint. Manual recovery required: do not retry ' +
   '`gitnexus analyze`. ' +
-  'Run `gitnexus analyze --force --drop-embeddings --embeddings`.';
+  'Run `gitnexus analyze --force --drop-embeddings --embeddings 0`.';
 
 // Re-export the pure flag-derivation helper so external callers (and tests)
 // keep importing from this module's stable surface.

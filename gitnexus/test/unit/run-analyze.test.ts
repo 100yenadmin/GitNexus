@@ -106,7 +106,7 @@ describe('run-analyze module', () => {
 
       const { runFullAnalysis } = await import('../../src/core/run-analyze.js');
       await expect(runFullAnalysis(tmpRepo.dbPath, {}, { onProgress: () => {} })).rejects.toThrow(
-        /gitnexus analyze --force --drop-embeddings --embeddings/,
+        /gitnexus analyze --force --drop-embeddings --embeddings 0/,
       );
       expect((await loadMeta(storagePath))?.embeddingCheckpoint).toMatchObject(checkpoint);
     } finally {
