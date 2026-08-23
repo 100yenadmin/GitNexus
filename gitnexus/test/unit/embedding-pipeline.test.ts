@@ -386,10 +386,10 @@ describe('runEmbeddingPipeline incremental filter', () => {
     expect(result.nodesProcessed).toBe(1);
   });
 
-  it('propagates unexpected symbol-query failures instead of building a partial index', async () => {
+  it('propagates connection does-not-exist failures instead of building a partial index', async () => {
     mockEmbedderSetup();
 
-    const executeQuery = vi.fn().mockRejectedValue(new Error('connection reset by peer'));
+    const executeQuery = vi.fn().mockRejectedValue(new Error('connection does not exist'));
     const executeWithReusedStatement = mockExecuteWithReusedStatement();
 
     const { runEmbeddingPipeline } =
@@ -397,7 +397,7 @@ describe('runEmbeddingPipeline incremental filter', () => {
 
     await expect(
       runEmbeddingPipeline(executeQuery, executeWithReusedStatement, onProgress),
-    ).rejects.toThrow('connection reset by peer');
+    ).rejects.toThrow('connection does not exist');
     expect(vectorIndexMock).not.toHaveBeenCalled();
   });
 
