@@ -942,21 +942,40 @@ const runFullAnalysisImpl = async (
       // threw above). Clear it before returning, or an empty repository stays
       // permanently marked as interrupted and later repair/resume keeps
       // observing stale recovery state.
+      let projectName =
+        options.registryName ??
+        getInferredRepoName(repoPath) ??
+        path.basename(resolveRepoIdentityRoot(repoPath));
+      let resultStats = {
+        ...existingMeta.stats,
+        nodes: stats.nodes,
+        edges: stats.edges,
+        embeddings: 0,
+      };
       if (existingMeta.embeddingCheckpoint) {
-        await saveMeta(canonicalMetaDir, {
+        const clearedMeta = {
           ...existingMeta,
+          stats: { ...existingMeta.stats, embeddings: 0 },
           embeddingCheckpoint: undefined,
           incrementalInProgress: undefined,
-        });
+        };
+        if (await isRepoRegistered(repoPath)) {
+          projectName = await commitStagedMetadataAndRegistry(clearedMeta);
+        } else {
+          await saveMeta(canonicalMetaDir, clearedMeta);
+        }
+        resultStats = {
+          ...clearedMeta.stats,
+          nodes: stats.nodes,
+          edges: stats.edges,
+          embeddings: 0,
+        };
       }
       progress('done', 100, 'No embeddings are indexed; VECTOR repair was not needed.');
       return {
-        repoName:
-          options.registryName ??
-          getInferredRepoName(repoPath) ??
-          path.basename(resolveRepoIdentityRoot(repoPath)),
+        repoName: projectName,
         repoPath,
-        stats: { ...existingMeta.stats, nodes: stats.nodes, edges: stats.edges, embeddings: 0 },
+        stats: resultStats,
         vectorRepairStatus: 'not-indexed',
       };
     }
@@ -1658,13 +1677,17 @@ const runFullAnalysisImpl = async (
           'rows. Restore the matching embedding configuration or pass --drop-embeddings to rebuild without it.',
       );
     }
-    assertCompletedCheckpointIdentity(
-      legacyCheckpoint,
-      integrity,
-      CLI_CHECKPOINT_CONTEXT,
-    );
-    existingMeta = { ...existingMeta, embeddingCheckpoint: undefined };
-    await saveMeta(metaDir, existingMeta);
+    assertCompletedCheckpointIdentity(legacyCheckpoint, integrity, CLI_CHECKPOINT_CONTEXT);
+    existingMeta = {
+      ...existingMeta,
+      stats: { ...existingMeta.stats, embeddings: 0 },
+      embeddingCheckpoint: undefined,
+    };
+    if (stagedPaths || !(await isRepoRegistered(repoPath))) {
+      await saveMeta(metaDir, existingMeta);
+    } else {
+      await commitStagedMetadataAndRegistry(existingMeta);
+    }
   }
 
   // Checkpoint windows are durable boundaries even before the final window.
