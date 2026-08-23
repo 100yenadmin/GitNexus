@@ -15,6 +15,9 @@ describe('isMissingColumnOrTableError', () => {
 
   it.each([
     'connection does not exist',
+    'query against table CodeEmbedding failed: connection does not exist',
+    'Runtime exception: Table Class does not exist.',
+    'Runtime exception: Binder exception: Column chunkIndex does not exist',
     'query does not exist',
     'key does not exist',
     'path does not exist',

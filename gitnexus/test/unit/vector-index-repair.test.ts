@@ -100,6 +100,7 @@ describe('VECTOR repair shared schema-error contract', () => {
       };
       await saveMeta(paths.storagePath, meta);
       const before = await fs.readFile(`${paths.storagePath}/gitnexus.json`);
+      const beforeLegacy = await fs.readFile(`${paths.storagePath}/meta.json`);
       const { runFullAnalysis, mocks } = await importRepairSubject();
 
       await expect(
@@ -108,6 +109,7 @@ describe('VECTOR repair shared schema-error contract', () => {
       expect(mocks.dropVectorIndex).not.toHaveBeenCalled();
       expect(mocks.createVectorIndex).not.toHaveBeenCalled();
       await expect(fs.readFile(`${paths.storagePath}/gitnexus.json`)).resolves.toEqual(before);
+      await expect(fs.readFile(`${paths.storagePath}/meta.json`)).resolves.toEqual(beforeLegacy);
     } finally {
       await fixture.cleanup();
     }
