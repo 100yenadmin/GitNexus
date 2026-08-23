@@ -13,6 +13,7 @@ import {
 import type { DoctorPoolProbe } from './doctor-pool-probe.js';
 import type { EmbeddingIntegrityReport } from '../core/lbug/lbug-adapter.js';
 import {
+  getQueryEmbeddingDimensions,
   getQueryEmbeddingRuntimeStatus,
   type QueryEmbeddingRuntimeStatus,
 } from '../core/embeddings/runtime-support.js';
@@ -623,6 +624,7 @@ const inspectEntry = async (
 
   let database: RegistryEntryDoctorReport['database'];
   let availableCounts: RegistryDatabaseCounts | null = null;
+  let storedEmbeddingDimensions: number | undefined;
   if (databaseFile.status === 'absent') {
     database = { status: 'skipped', reason: 'database-missing' };
   } else if (databaseFile.status === 'inaccessible') {
@@ -642,6 +644,7 @@ const inspectEntry = async (
         embeddingDimensions,
         ...scannedCounts
       } = await (options.databaseProbe ?? probeRegistryDatabaseCounts)(lbugPath);
+      storedEmbeddingDimensions = embeddingDimensions;
       availableCounts = scannedCounts;
       let integrity =
         scannedIntegrity ??
@@ -719,7 +722,14 @@ const inspectEntry = async (
   const freshness = freshnessFor(indexedSha, base.registry_sha, headSha);
   const embeddings = database.status === 'available' ? database.counts.embeddings : 0;
   const embeddingBearing =
-    embeddings > 0 || (base.registry.counts.embeddings ?? counts.embeddings ?? 0) > 0;
+    embeddings > 0 ||
+    (base.registry.counts.embeddings ?? 0) > 0 ||
+    (counts.embeddings ?? 0) > 0;
+  const queryDimensions = getQueryEmbeddingDimensions();
+  const queryDimensionMismatch =
+    storedEmbeddingDimensions !== undefined &&
+    Number.isSafeInteger(queryDimensions) &&
+    queryDimensions !== storedEmbeddingDimensions;
   const semanticReady =
     database.status === 'available' &&
     database.counts.embeddings > 0 &&
@@ -731,7 +741,8 @@ const inspectEntry = async (
     capabilities.graph === 'available' &&
     capabilities.fts === 'available' &&
     capabilities.vectorSearch === 'vector-index' &&
-    embeddingRuntime.available;
+    embeddingRuntime.available &&
+    !queryDimensionMismatch;
   const reasons: string[] = [];
   const integrity = database.status === 'available' ? database.integrity.status : 'unavailable';
   if (integrity !== 'clean') reasons.push(`embedding-identity-${integrity}`);
@@ -748,6 +759,7 @@ const inspectEntry = async (
   if (embeddingBearing && !embeddingRuntime.available) {
     reasons.push(`embedding-query-${embeddingRuntime.reason ?? 'runtime-unavailable'}`);
   }
+  if (queryDimensionMismatch) reasons.push('embedding-query-dimensions-mismatch');
 
   return {
     ...base,

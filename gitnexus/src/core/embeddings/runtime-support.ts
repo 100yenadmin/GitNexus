@@ -18,6 +18,8 @@
  * embedding stack.)
  */
 import { isPrefixRuntimeLoadable, resolveEmbeddingRuntime } from './runtime-install.js';
+import { resolveEmbeddingConfig } from './config.js';
+import { DEFAULT_EMBEDDING_CONFIG } from './types.js';
 
 export type QueryEmbeddingRuntimeStatus = {
   available: boolean;
@@ -25,6 +27,7 @@ export type QueryEmbeddingRuntimeStatus = {
   reason:
     | 'http-config-incomplete'
     | 'http-config-invalid'
+    | 'local-config-invalid'
     | 'local-runtime-unavailable'
     | 'local-runtime-unloadable'
     | null;
@@ -45,17 +48,20 @@ const validHttpInteger = (name: string, max: number, allowZero: boolean): boolea
  * an endpoint, model, or secret in the returned status.
  */
 export const getQueryEmbeddingRuntimeStatus = (): QueryEmbeddingRuntimeStatus => {
-  const configuredUrl = process.env.GITNEXUS_EMBEDDING_URL?.trim();
-  const configuredModel = process.env.GITNEXUS_EMBEDDING_MODEL?.trim();
-  if (configuredUrl || configuredModel) {
-    if (!configuredUrl || !configuredModel) {
+  const rawUrl = process.env.GITNEXUS_EMBEDDING_URL;
+  const rawModel = process.env.GITNEXUS_EMBEDDING_MODEL;
+  if (rawUrl !== undefined || rawModel !== undefined) {
+    if (!rawUrl || !rawModel) {
       return { available: false, mode: 'http', reason: 'http-config-incomplete' };
     }
+    if (rawUrl !== rawUrl.trim() || rawModel !== rawModel.trim()) {
+      return { available: false, mode: 'http', reason: 'http-config-invalid' };
+    }
     try {
-      const endpoint = new URL(configuredUrl);
+      const endpoint = new URL(rawUrl);
       if (
-        configuredUrl.includes('?') ||
-        configuredUrl.includes('#') ||
+        rawUrl.includes('?') ||
+        rawUrl.includes('#') ||
         (endpoint.protocol !== 'http:' && endpoint.protocol !== 'https:') ||
         endpoint.username !== '' ||
         endpoint.password !== '' ||
@@ -82,6 +88,15 @@ export const getQueryEmbeddingRuntimeStatus = (): QueryEmbeddingRuntimeStatus =>
     return { available: true, mode: 'http', reason: null };
   }
 
+  try {
+    // Keep this in lockstep with the production MCP query path, but stop before
+    // any model or native runtime import. The resolver only validates the local
+    // batch/device/thread environment values and applies production defaults.
+    resolveEmbeddingConfig();
+  } catch {
+    return { available: false, mode: 'local', reason: 'local-config-invalid' };
+  }
+
   const blocker = getLocalEmbeddingRuntimeBlocker();
   if (blocker) return { available: false, mode: 'local', reason: 'local-runtime-unavailable' };
   const resolution = resolveEmbeddingRuntime();
@@ -92,6 +107,19 @@ export const getQueryEmbeddingRuntimeStatus = (): QueryEmbeddingRuntimeStatus =>
     return { available: false, mode: 'local', reason: 'local-runtime-unloadable' };
   }
   return { available: true, mode: 'local', reason: null };
+};
+
+/**
+ * Return the dimensions produced by the query path without loading a model or
+ * importing the HTTP client. Validated HTTP callers use the configured value;
+ * an unset value and local queries use the production default.
+ */
+export const getQueryEmbeddingDimensions = (): number => {
+  if (process.env.GITNEXUS_EMBEDDING_URL && process.env.GITNEXUS_EMBEDDING_MODEL) {
+    const raw = process.env.GITNEXUS_EMBEDDING_DIMS;
+    return raw === undefined ? DEFAULT_EMBEDDING_CONFIG.dimensions : Number(raw);
+  }
+  return DEFAULT_EMBEDDING_CONFIG.dimensions;
 };
 
 /**
