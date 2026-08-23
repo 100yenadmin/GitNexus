@@ -31,7 +31,7 @@ import {
   streamQuery,
   flushWAL,
   closeLbug,
-  initLbugReadOnlyNonRecovering,
+  withLbugReadOnlyNonRecovering,
   withLbugDb,
   isReadOnlyDbError,
 } from '../core/lbug/lbug-adapter.js';
@@ -1775,7 +1775,8 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         );
         if (rows?.some(rowHasId)) return true;
       } catch (err) {
-        if (!isMissingColumnOrTableError(err instanceof Error ? err.message : String(err))) throw err;
+        if (!isMissingColumnOrTableError(err instanceof Error ? err.message : String(err)))
+          throw err;
       }
     }
     try {
@@ -1844,8 +1845,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
             let priorCheckpoint = embeddingMeta.embeddingCheckpoint;
             let preflightEmbeddingIdentity: EmbeddingIdentity | undefined;
             if (priorCheckpoint && !isEmptyLegacyCheckpoint(priorCheckpoint)) {
-              const { getActiveEmbeddingIdentity } =
-                await import('../core/embeddings/embedder.js');
+              const { getActiveEmbeddingIdentity } = await import('../core/embeddings/embedder.js');
               preflightEmbeddingIdentity = getActiveEmbeddingIdentity();
               if (
                 priorCheckpoint.provider === undefined ||
@@ -1862,19 +1862,14 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
               }
             }
             if (isEmptyLegacyCheckpoint(priorCheckpoint)) {
-              await initLbugReadOnlyNonRecovering(lbugPath);
-              const preflight = await (async () => {
-                try {
-                  const integrity = await inspectEmbeddingIntegrity();
-                  return {
-                    integrity,
-                    graphHasNodes:
-                      integrity.physicalRows === 0 && (await hasEmbeddableNodes(executeQuery)),
-                  };
-                } finally {
-                  await closeLbug();
-                }
-              })();
+              const preflight = await withLbugReadOnlyNonRecovering(lbugPath, async () => {
+                const integrity = await inspectEmbeddingIntegrity();
+                return {
+                  integrity,
+                  graphHasNodes:
+                    integrity.physicalRows === 0 && (await hasEmbeddableNodes(executeQuery)),
+                };
+              });
               if (preflight.integrity.physicalRows > 0) {
                 throw new Error(
                   'Cannot resume embedding checkpoint: it uses unknown-provider while the table contains ' +
@@ -1895,7 +1890,8 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
               priorCheckpoint = undefined;
             }
             await withLbugDb(lbugPath, async () => {
-              const { runEmbeddingPipeline } = await import('../core/embeddings/embedding-pipeline.js');
+              const { runEmbeddingPipeline } =
+                await import('../core/embeddings/embedding-pipeline.js');
               const { embeddingIntegrityFailures } = await import('../core/lbug/lbug-adapter.js');
               const embeddingIdentity =
                 preflightEmbeddingIdentity ??
