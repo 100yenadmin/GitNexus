@@ -485,7 +485,7 @@ describe('doctor --registry read-only report (#133)', () => {
     );
   });
 
-  it('rejects malformed registry stats values while accepting missing and zero stats', async () => {
+  it('rejects malformed registry stats values while accepting missing and safe-integer stats', async () => {
     const previousHome = process.env.GITNEXUS_HOME;
     process.env.GITNEXUS_HOME = fixture.dbPath;
     const base = {
@@ -516,6 +516,24 @@ describe('doctor --registry read-only report (#133)', () => {
         expect((await readRegistryStrict()).status).toBe('available');
       }
 
+      await fs.writeFile(
+        path.join(fixture.dbPath, 'registry.json'),
+        JSON.stringify([
+          {
+            ...base,
+            branches: [
+              {
+                branch: 'main',
+                indexedAt: base.indexedAt,
+                lastCommit: 'b'.repeat(40),
+                stats: { nodes: 0, edges: Number.MAX_SAFE_INTEGER },
+              },
+            ],
+          },
+        ]),
+      );
+      expect((await readRegistryStrict()).status).toBe('available');
+
       for (const [key, value] of [
         ['files', true],
         ['nodes', null],
@@ -535,12 +553,27 @@ describe('doctor --registry read-only report (#133)', () => {
       }
 
       const baseJson = JSON.stringify(base);
+      const branchJson = JSON.stringify({
+        branch: 'main',
+        indexedAt: base.indexedAt,
+        lastCommit: 'b'.repeat(40),
+      });
+      const writeRawStats = async (stats: string, branchSummary = false) => {
+        const entry = branchSummary
+          ? `${baseJson.slice(0, -1)},"branches":[${branchJson.slice(0, -1)},"stats":${stats}}]}`
+          : `${baseJson.slice(0, -1)},"stats":${stats}}`;
+        await fs.writeFile(path.join(fixture.dbPath, 'registry.json'), `[${entry}]`);
+      };
+
       for (const stats of ['{"nodes":NaN}', '{"nodes":Infinity}', '{"nodes":-Infinity}']) {
-        await fs.writeFile(
-          path.join(fixture.dbPath, 'registry.json'),
-          `[${baseJson.slice(0, -1)},"stats":${stats}}]`,
-        );
+        await writeRawStats(stats);
         expect(await readRegistryStrict()).toEqual({ status: 'failed', reason: 'malformed' });
+      }
+      for (const stats of ['-0', '-1e-324', '9007199254740991.1', '9007199254740992.0']) {
+        for (const branchSummary of [false, true]) {
+          await writeRawStats(`{"nodes":${stats}}`, branchSummary);
+          expect(await readRegistryStrict()).toEqual({ status: 'failed', reason: 'malformed' });
+        }
       }
     } finally {
       if (previousHome === undefined) delete process.env.GITNEXUS_HOME;
