@@ -379,36 +379,33 @@ describe('doctor --registry read-only report (#133)', () => {
   });
 
   it('rejects leading and trailing whitespace in raw HTTP URL/model values', async () => {
-    for (const [url, model] of [
-      [' https://embedding.example/v1', 'model'],
-      ['https://embedding.example/v1', 'model '],
+    for (const [url, model, expected] of [
+      [' https://embedding.example/v1', 'model', { mode: 'http', available: false }],
+      ['https://embedding.example/v1', 'model ', { mode: 'http', available: false }],
+      ['', 'model', { mode: 'local' }],
+      ['https://embedding.example/v1', '', { mode: 'local' }],
     ]) {
       await withEnv({ GITNEXUS_EMBEDDING_URL: url, GITNEXUS_EMBEDDING_MODEL: model }, () =>
-        expect(getQueryEmbeddingRuntimeStatus()).toMatchObject({ available: false }),
+        expect(getQueryEmbeddingRuntimeStatus()).toMatchObject(expected),
       );
     }
   });
 
-  it.each([
-    ['GITNEXUS_EMBEDDING_THREADS', '0'],
-  ] as const)(
-    'rejects invalid local query config %s=%s without loading a model',
-    async (key, value) => {
-      const values: Record<string, string | undefined> = {
+  it('rejects invalid local query config without loading a model', async () => {
+    await withEnv(
+      {
         GITNEXUS_EMBEDDING_URL: undefined,
         GITNEXUS_EMBEDDING_MODEL: undefined,
-        GITNEXUS_EMBEDDING_THREADS: undefined,
-      };
-      values[key] = value;
-      await withEnv(values, () => {
+        GITNEXUS_EMBEDDING_THREADS: '0',
+      },
+      () =>
         expect(getQueryEmbeddingRuntimeStatus()).toEqual({
           available: false,
           mode: 'local',
           reason: 'local-config-invalid',
-        });
-      });
-    },
-  );
+        }),
+    );
+  });
 
   it('requires query runtime when metadata reports embeddings despite zero registry/database counts', async () => {
     const indexed = await createEntry(
@@ -435,9 +432,7 @@ describe('doctor --registry read-only report (#133)', () => {
       headProbe: () => 'a'.repeat(40),
     });
 
-    expect(report.entries[0]?.health.reasons).toContain(
-      'embedding-query-local-runtime-unavailable',
-    );
+    expect(report.entries[0]?.health.reasons).toContain('embedding-query-local-runtime-unavailable');
   });
 
   it('compares explicit and default HTTP query dimensions with stored index width', async () => {
@@ -465,20 +460,15 @@ describe('doctor --registry read-only report (#133)', () => {
               embeddingDimensions: stored,
               integrity: cleanIntegrity(1),
             }),
-            embeddingRuntimeProbe: () => ({ available: true, mode: 'http', reason: null }),
             headProbe: () => 'a'.repeat(40),
           }),
       );
 
     const explicitMismatch = await reportFor('512', 384);
-    expect(explicitMismatch.entries[0]?.health).toMatchObject({
-      semantic_ready: false,
-      reasons: ['embedding-query-dimensions-mismatch'],
-    });
+    expect(explicitMismatch.entries[0]?.health.reasons).toEqual(['embedding-query-dimensions-mismatch']);
+    expect(explicitMismatch.entries[0]?.health.semantic_ready).toBe(false);
     const unsetMismatch = await reportFor(undefined, 512);
-    expect(unsetMismatch.entries[0]?.health.reasons).toContain(
-      'embedding-query-dimensions-mismatch',
-    );
+    expect(unsetMismatch.entries[0]?.health.reasons).toContain('embedding-query-dimensions-mismatch');
   });
 
   it('rejects malformed registry stats values while accepting missing and zero stats', async () => {
@@ -528,16 +518,25 @@ describe('doctor --registry read-only report (#133)', () => {
       'https://github.com/owner/graph-only.git',
       { nodes: 1, edges: 0, embeddings: 0 },
     );
-    const report = await buildRegistryDoctorReport({
-      entries: [indexed.entry],
-      databaseProbe: async () => ({
-        nodes: 1,
-        edges: 0,
-        embeddings: 0,
-        integrity: { ...cleanIntegrity(0), tablePresent: false },
-      }),
-      headProbe: () => 'a'.repeat(40),
-    });
+    const report = await withEnv(
+      {
+        GITNEXUS_EMBEDDING_URL: 'https://embedding.example/v1',
+        GITNEXUS_EMBEDDING_MODEL: 'model',
+        GITNEXUS_EMBEDDING_DIMS: '512',
+      },
+      () =>
+        buildRegistryDoctorReport({
+          entries: [indexed.entry],
+          databaseProbe: async () => ({
+            nodes: 1,
+            edges: 0,
+            embeddings: 0,
+            embeddingDimensions: 384,
+            integrity: { ...cleanIntegrity(0), tablePresent: false },
+          }),
+          headProbe: () => 'a'.repeat(40),
+        }),
+    );
     expect(report.entries[0]?.health).toMatchObject({
       state: 'healthy',
       semantic_ready: false,
