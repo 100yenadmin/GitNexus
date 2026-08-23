@@ -448,7 +448,7 @@ export const assertVectorRepairPreflight = async (
         `Cannot repair VECTOR: the completed embedding checkpoint records ${checkpoint.provider ?? 'unknown-provider'} / ` +
           `${checkpoint.model} at ${checkpoint.dimensions} dimensions, but this run resolves ` +
           `${identity.provider} / ${identity.model} at ${identity.dimensions}. Restore the matching ` +
-          'embedding configuration, or rebuild with analyze --drop-embeddings --embeddings.',
+          'embedding configuration, or rebuild with analyze --drop-embeddings --embeddings 0.',
       );
     }
   }
@@ -901,7 +901,7 @@ const runFullAnalysisImpl = async (
         throw new Error(
           'Cannot repair VECTOR: the completed embedding checkpoint has unknown-provider ' +
             'provenance while the table contains rows. Re-run analyze with ' +
-            '--force --drop-embeddings --embeddings.',
+            '--force --drop-embeddings --embeddings 0.',
         );
       }
       assertCompletedCheckpointIdentity(
@@ -932,7 +932,7 @@ const runFullAnalysisImpl = async (
       throw new Error(
         `Cannot repair VECTOR: the completed embedding checkpoint recorded ` +
           `${existingMeta.embeddingCheckpoint.totalNodes} embedded nodes but the table holds no ` +
-          'rows. The embedding table was lost after the checkpoint; re-run analyze --embeddings ' +
+          'rows. The embedding table was lost after the checkpoint; re-run analyze --embeddings 0 ' +
           'to regenerate it.',
       );
     }
@@ -1846,7 +1846,7 @@ const runFullAnalysisImpl = async (
         }
         if ((recordedEmbeddingCount ?? 0) > 0 && fastPathIntegrity.validRows === 0) {
           throw new Error(
-            'Already-up-to-date index lost all recorded embeddings; re-run analyze --embeddings.',
+            'Already-up-to-date index lost all recorded embeddings; re-run analyze --embeddings 0.',
           );
         }
         let fastPathMeta = existingMeta;
@@ -1980,7 +1980,7 @@ const runFullAnalysisImpl = async (
   if (options.dropEmbeddings && existingEmbeddingCount > 0) {
     log(
       `Dropping ${existingEmbeddingCount} existing embeddings (--drop-embeddings). ` +
-        `Re-run with --embeddings to regenerate.`,
+        `Re-run with --embeddings 0 to regenerate.`,
     );
   } else if (forceRegenerateEmbeddings) {
     log(
