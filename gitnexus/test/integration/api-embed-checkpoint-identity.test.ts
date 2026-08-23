@@ -414,7 +414,15 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     'property content not found',
   ])('treats an all-invalid File scan as true empty for %s', async (schemaError) => {
     state.currentMeta = makeMeta(LIVE_DIGEST);
-    state.currentMeta.embeddingCheckpoint = undefined;
+    state.currentMeta.embeddingCheckpoint = {
+      at: REPO.indexedAt,
+      nodesProcessed: 0,
+      totalNodes: 0,
+      chunksProcessed: 0,
+      model: MODEL,
+      dimensions: identity.dimensions,
+      pendingNodeIds: [],
+    };
     state.liveIntegrity = makeIntegrity(LIVE_DIGEST, 0);
     state.graphNodes = [];
     const fileQueries: string[] = [];
@@ -445,6 +453,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     expect(state.runEmbeddingPipeline).not.toHaveBeenCalled();
     expect(state.getActiveEmbeddingIdentity).not.toHaveBeenCalled();
     expect(state.currentMeta.stats?.embeddings).toBe(0);
+    expect(state.currentMeta.embeddingCheckpoint).toBeUndefined();
   });
 
   it('persists completed-window identity before an interrupted finalization', async () => {
