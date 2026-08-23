@@ -70,6 +70,15 @@ describe('run-analyze module', () => {
     expect(source).toMatch(/provider: embeddingIdentity\.provider/);
   });
 
+  it.each([' http://test:8080/v1', 'http://test:8080/v1 ', '\thttp://test:8080/v1\n'])(
+    'rejects endpoint surrounding whitespace before hashing (%j)',
+    (endpoint) => {
+      expect(() => httpEmbeddingProvider(endpoint)).toThrow(
+        'HTTP embedding endpoint must not have surrounding whitespace.',
+      );
+    },
+  );
+
   it('refuses a completed VECTOR repair checkpoint with a provider mismatch but accepts legacy metadata', async () => {
     const tmpRepo = await createTempDir('gitnexus-run-analyze-vector-repair-identity-');
     const saved = {
@@ -84,12 +93,13 @@ describe('run-analyze module', () => {
       const { storagePath, lbugPath } = getStoragePaths(tmpRepo.dbPath);
       await fs.mkdir(storagePath, { recursive: true });
       await fs.writeFile(lbugPath, '');
+      const mismatchedProvider = httpEmbeddingProvider('http://other:8080/v1');
       const checkpoint = {
         at: new Date().toISOString(),
         nodesProcessed: 1,
         totalNodes: 1,
         chunksProcessed: 1,
-        provider: httpEmbeddingProvider('http://other:8080/v1'),
+        provider: mismatchedProvider,
         model: 'test-model',
         dimensions: 384,
       };
@@ -102,7 +112,7 @@ describe('run-analyze module', () => {
 
       const { assertVectorRepairPreflight } = await import('../../src/core/run-analyze.js');
       await expect(assertVectorRepairPreflight(tmpRepo.dbPath)).rejects.toThrow(
-        /completed embedding checkpoint records .*other.* but this run resolves/i,
+        `completed embedding checkpoint records ${mismatchedProvider} / test-model at 384 dimensions`,
       );
 
       await saveMeta(storagePath, {
@@ -111,9 +121,8 @@ describe('run-analyze module', () => {
         indexedAt: new Date().toISOString(),
         embeddingCheckpoint: { ...checkpoint, provider: undefined },
       });
-      await expect(assertVectorRepairPreflight(tmpRepo.dbPath)).resolves.toMatchObject({
-        embeddingCheckpoint: { provider: undefined },
-      });
+      const legacyMeta = await assertVectorRepairPreflight(tmpRepo.dbPath);
+      expect(legacyMeta.embeddingCheckpoint?.provider).toBeUndefined();
     } finally {
       const restore = (key: string, value: string | undefined) => {
         if (value === undefined) delete process.env[key];
@@ -435,6 +444,7 @@ describe('run-analyze module', () => {
       const resumedPending = await loadMeta(storagePath);
       if (!resumedPending) throw new Error('expected pending-window resume metadata');
       fetchMock.mockClear();
+      const mismatchedProvider = httpEmbeddingProvider('http://other:8080/v1');
       await saveMeta(storagePath, {
         ...resumedPending,
         embeddingCheckpoint: {
@@ -442,7 +452,7 @@ describe('run-analyze module', () => {
           nodesProcessed: 1,
           totalNodes: 2,
           chunksProcessed: 1,
-          provider: httpEmbeddingProvider('http://other:8080/v1'),
+          provider: mismatchedProvider,
           model: 'test-model',
           dimensions: 384,
         },
@@ -453,7 +463,9 @@ describe('run-analyze module', () => {
           { skipAgentsMd: true, skipSkills: true },
           { onProgress: () => {} },
         ),
-      ).rejects.toThrow('Cannot resume embedding checkpoint');
+      ).rejects.toThrow(
+        `Cannot resume embedding checkpoint: it uses ${mismatchedProvider} / test-model at 384 dimensions`,
+      );
       expect(fetchMock).not.toHaveBeenCalled();
 
       await saveMeta(storagePath, {
