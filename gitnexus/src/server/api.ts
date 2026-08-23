@@ -59,6 +59,9 @@ import { sweepStaleUploads } from './upload-sweep.js';
 import { isRfc1918PrivateIpv4 } from './private-ip.js';
 import { logger, flushLoggerSync } from '../core/logger.js';
 import { assertCompletedCheckpointIdentity } from '../core/embeddings/checkpoint-identity.js';
+import type { EmbeddingIdentity } from '../core/embeddings/embedding-identity.js';
+import { EMBEDDABLE_LABELS } from '../core/embeddings/types.js';
+import { isMissingColumnOrTableError } from '../core/lbug/schema-errors.js';
 
 const _require = createRequire(import.meta.url);
 const pkg = _require('../../package.json');
@@ -1760,6 +1763,33 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
 
   // ── Embedding endpoints ────────────────────────────────────────────
 
+  const hasEmbeddableNodes = async (
+    execQuery: (cypher: string) => Promise<any[]>,
+  ): Promise<boolean> => {
+    const rowHasId = (row: any): boolean => Boolean(row?.id ?? row?.[0]);
+    for (const label of EMBEDDABLE_LABELS) {
+      try {
+        const rows = await execQuery(
+          `MATCH (n:${quoteNodeTable(label)}) RETURN n.id AS id LIMIT 1`,
+        );
+        if (rows?.some(rowHasId)) return true;
+      } catch (err) {
+        if (!isMissingColumnOrTableError(err instanceof Error ? err.message : String(err))) throw err;
+      }
+    }
+    try {
+      const rows = await execQuery(
+        `MATCH (n:${quoteNodeTable('File')}) WHERE n.id IS NOT NULL AND n.filePath IS NOT NULL ` +
+          `AND n.filePath <> '' AND n.content IS NOT NULL AND n.content <> '' ` +
+          `AND n.content <> '[Binary file - content not stored]' RETURN n.id AS id LIMIT 1`,
+      );
+      return rows?.some(rowHasId) ?? false;
+    } catch (err) {
+      if (!isMissingColumnOrTableError(err instanceof Error ? err.message : String(err))) throw err;
+      return false;
+    }
+  };
+
   const embedJobManager = new JobManager();
 
   // POST /api/embed — trigger server-side embedding generation
@@ -1805,31 +1835,69 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         (async () => {
           try {
             const lbugPath = path.join(entry.storagePath, 'lbug');
-            await withLbugDb(lbugPath, async () => {
-              const { runEmbeddingPipeline } =
-                await import('../core/embeddings/embedding-pipeline.js');
-              const { inspectEmbeddingIntegrity, embeddingIntegrityFailures } =
-                await import('../core/lbug/lbug-adapter.js');
-              let embeddingMeta = await loadMeta(entry.storagePath);
-              if (!embeddingMeta) {
-                throw new Error('Repository metadata is missing; run gitnexus analyze first');
-              }
-              const priorCheckpoint = embeddingMeta.embeddingCheckpoint;
-              if (isEmptyLegacyCheckpoint(priorCheckpoint)) {
-                const integrity = await inspectEmbeddingIntegrity();
-                if (integrity.physicalRows === 0) {
-                  assertCompletedCheckpointIdentity(
-                    priorCheckpoint,
-                    integrity,
+            const { inspectEmbeddingIntegrity } = await import('../core/lbug/lbug-adapter.js');
+            let embeddingMeta = await loadMeta(entry.storagePath);
+            if (!embeddingMeta) {
+              throw new Error('Repository metadata is missing; run gitnexus analyze first');
+            }
+            let priorCheckpoint = embeddingMeta.embeddingCheckpoint;
+            let preflightEmbeddingIdentity: EmbeddingIdentity | undefined;
+            if (priorCheckpoint && !isEmptyLegacyCheckpoint(priorCheckpoint)) {
+              const { getActiveEmbeddingIdentity } =
+                await import('../core/embeddings/embedder.js');
+              preflightEmbeddingIdentity = getActiveEmbeddingIdentity();
+              if (
+                priorCheckpoint.provider === undefined ||
+                priorCheckpoint.provider !== preflightEmbeddingIdentity.provider ||
+                priorCheckpoint.model !== preflightEmbeddingIdentity.model ||
+                priorCheckpoint.dimensions !== preflightEmbeddingIdentity.dimensions
+              ) {
+                throw new Error(
+                  `Cannot resume embedding checkpoint: it uses ${priorCheckpoint.provider ?? 'unknown-provider'} / ` +
+                    `${priorCheckpoint.model} at ${priorCheckpoint.dimensions} dimensions, but this run resolves ` +
+                    `${preflightEmbeddingIdentity.provider} / ${preflightEmbeddingIdentity.model} at ${preflightEmbeddingIdentity.dimensions}. ` +
                     API_CHECKPOINT_CONTEXT,
-                  );
-                  embeddingMeta = { ...embeddingMeta, embeddingCheckpoint: undefined };
-                  await saveMeta(entry.storagePath, embeddingMeta);
-                  return;
-                }
+                );
               }
-              const { getActiveEmbeddingIdentity } = await import('../core/embeddings/embedder.js');
-              const embeddingIdentity = getActiveEmbeddingIdentity();
+            }
+            if (isEmptyLegacyCheckpoint(priorCheckpoint)) {
+              const preflight = await withLbugDb(
+                lbugPath,
+                async () => {
+                  const integrity = await inspectEmbeddingIntegrity();
+                  return {
+                    integrity,
+                    graphHasNodes:
+                      integrity.physicalRows === 0 && (await hasEmbeddableNodes(executeQuery)),
+                  };
+                },
+                { readOnly: true },
+              );
+              if (preflight.integrity.physicalRows > 0) {
+                throw new Error(
+                  'Cannot resume embedding checkpoint: it uses unknown-provider while the table contains ' +
+                    'rows. Restore the matching embedding configuration or pass --drop-embeddings to rebuild without it.',
+                );
+              }
+              assertCompletedCheckpointIdentity(
+                priorCheckpoint,
+                preflight.integrity,
+                API_CHECKPOINT_CONTEXT,
+              );
+              if (!preflight.graphHasNodes) {
+                embeddingMeta = { ...embeddingMeta, embeddingCheckpoint: undefined };
+                await saveMeta(entry.storagePath, embeddingMeta);
+                embedJobManager.updateJob(job.id, { status: 'complete' });
+                return;
+              }
+              priorCheckpoint = undefined;
+            }
+            await withLbugDb(lbugPath, async () => {
+              const { runEmbeddingPipeline } = await import('../core/embeddings/embedding-pipeline.js');
+              const { embeddingIntegrityFailures } = await import('../core/lbug/lbug-adapter.js');
+              const embeddingIdentity =
+                preflightEmbeddingIdentity ??
+                (await import('../core/embeddings/embedder.js')).getActiveEmbeddingIdentity();
               if (
                 priorCheckpoint &&
                 (priorCheckpoint.provider === undefined ||
