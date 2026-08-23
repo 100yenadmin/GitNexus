@@ -61,7 +61,7 @@ export const assertCompletedCheckpointIdentity = (
     report.recoverableIdentitySha256 !== checkpoint.recoverableIdentitySha256
   ) {
     throw new Error(
-      `${context} no longer matches the live embedding identities (${embeddingIntegritySummary(report)}).`,
+      `${context}: durable identity no longer matches the live embedding identities (${embeddingIntegritySummary(report)}).`,
     );
   }
 };
