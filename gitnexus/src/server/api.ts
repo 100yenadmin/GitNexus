@@ -71,8 +71,7 @@ const isEmptyLegacyCheckpoint = (checkpoint?: RepoMeta['embeddingCheckpoint']): 
 
 const API_CHECKPOINT_CONTEXT =
   'Cannot resume embedding checkpoint. Manual recovery required: do not retry POST /api/embed. ' +
-  'Run `gitnexus analyze --force --drop-embeddings --embeddings` or POST /api/analyze with force, ' +
-  'dropEmbeddings, and embeddings set to true.';
+  'Run `gitnexus analyze --force --drop-embeddings --embeddings 0`.';
 
 /**
  * Determine whether an HTTP Origin header value is allowed by CORS policy.
@@ -1842,9 +1841,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                   `Cannot resume embedding checkpoint: it uses ${priorCheckpoint.provider ?? 'unknown-provider'} / ` +
                     `${priorCheckpoint.model} at ${priorCheckpoint.dimensions} dimensions, but this run resolves ` +
                     `${embeddingIdentity.provider} / ${embeddingIdentity.model} at ${embeddingIdentity.dimensions}. ` +
-                    'Manual recovery required: do not retry POST /api/embed. Run ' +
-                    '`gitnexus analyze --force --drop-embeddings --embeddings` or POST /api/analyze ' +
-                    'with force, dropEmbeddings, and embeddings set to true.',
+                    API_CHECKPOINT_CONTEXT,
                 );
               }
               if (priorCheckpoint && !priorCheckpoint.pendingNodeIds?.length) {
