@@ -3,6 +3,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vites
 import type { EmbeddingIntegrityReport } from '../../src/core/lbug/lbug-adapter.js';
 import type { RegistryEntry, RepoMeta } from '../../src/storage/repo-manager.js';
 import { escapeCypherString } from '../../src/core/lbug/cypher-escape.js';
+import { JobManager } from '../../src/server/analyze-job.js';
 
 const MODEL = 'api-checkpoint-test-model';
 const LIVE_DIGEST = 'a'.repeat(64);
@@ -65,7 +66,16 @@ const state = {
   loadMeta: vi.fn(async () => state.currentMeta),
   listRegisteredRepos: vi.fn(async () => [REPO]),
   withLbugDb: vi.fn(async (_dbPath: string, operation: () => Promise<unknown>) => operation()),
+  deleteHandlerStarted: undefined as (() => void) | undefined,
 };
+
+const armDeleteHandlerSignal = (): Promise<void> =>
+  new Promise((resolve) => {
+    state.deleteHandlerStarted = () => {
+      state.deleteHandlerStarted = undefined;
+      resolve();
+    };
+  });
 
 vi.doMock('../../src/storage/repo-manager.js', async () => ({
   ...(await vi.importActual<typeof import('../../src/storage/repo-manager.js')>(
@@ -158,6 +168,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
   let shutdown: (() => Promise<void>) | undefined;
   let exitSpy: ReturnType<typeof vi.spyOn>;
   let onceSpy: ReturnType<typeof vi.spyOn>;
+  let getJobSpy: ReturnType<typeof vi.spyOn>;
 
   beforeAll(async () => {
     exitSpy = vi.spyOn(process, 'exit').mockImplementation(() => undefined as never);
@@ -169,6 +180,15 @@ describe('POST /api/embed completed-checkpoint identity', () => {
       }
       return originalOnce(event, listener);
     }) as typeof process.once);
+    const originalGetJob = JobManager.prototype.getJob;
+    getJobSpy = vi.spyOn(JobManager.prototype, 'getJob').mockImplementation(function (
+      this: JobManager,
+      id: string,
+    ) {
+      const job = originalGetJob.call(this, id);
+      state.deleteHandlerStarted?.();
+      return job;
+    });
 
     const { createServer } = await import('../../src/server/api.js');
     const port = await allocatePort();
@@ -187,10 +207,12 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     state.inspectEmbeddingIntegrity.mockClear();
     state.saveMeta.mockClear();
     state.withLbugDb.mockClear();
+    state.deleteHandlerStarted = undefined;
   });
 
   afterAll(async () => {
     onceSpy.mockRestore();
+    getJobSpy.mockRestore();
     await shutdown?.();
     exitSpy.mockRestore();
   });
@@ -635,6 +657,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     const { jobId } = (await response.json()) as { jobId: string };
     await terminalSave;
 
+    const deleteHandlerStarted = armDeleteHandlerSignal();
     let deleteSettled = false;
     const deleteResponse = fetch(`${baseUrl}/api/embed/${jobId}`, { method: 'DELETE' }).then(
       (result) => {
@@ -642,7 +665,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
         return result;
       },
     );
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    await deleteHandlerStarted;
     expect(deleteSettled).toBe(false);
 
     releaseSave();
@@ -675,6 +698,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     const { jobId } = (await response.json()) as { jobId: string };
     await terminalSave;
 
+    const deleteHandlerStarted = armDeleteHandlerSignal();
     let deleteSettled = false;
     const deleteResponse = fetch(`${baseUrl}/api/embed/${jobId}`, { method: 'DELETE' }).then(
       (result) => {
@@ -682,7 +706,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
         return result;
       },
     );
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    await deleteHandlerStarted;
     expect(deleteSettled).toBe(false);
 
     releaseSave();
