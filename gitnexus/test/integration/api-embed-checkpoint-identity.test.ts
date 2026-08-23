@@ -2,6 +2,7 @@ import http from 'node:http';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { EmbeddingIntegrityReport } from '../../src/core/lbug/lbug-adapter.js';
 import type { RegistryEntry, RepoMeta } from '../../src/storage/repo-manager.js';
+import { escapeCypherString } from '../../src/core/lbug/cypher-escape.js';
 
 const MODEL = 'api-checkpoint-test-model';
 const LIVE_DIGEST = 'a'.repeat(64);
@@ -312,6 +313,191 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     ).toBe(true);
     expect(state.getActiveEmbeddingIdentity).not.toHaveBeenCalled();
     expect(state.runEmbeddingPipeline).not.toHaveBeenCalled();
+    expect(state.currentMeta.stats?.embeddings).toBe(0);
+    expect(state.currentMeta.embeddingCheckpoint).toBeUndefined();
+  });
+
+  it.each([
+    'connection not found',
+    'connection does not exist',
+    'database not found',
+    'database does not exist',
+    'query not found',
+    'query does not exist',
+    'transaction not found',
+    'transaction does not exist',
+  ])
+    ('propagates %s and retains the checkpoint', async (message) => {
+      state.currentMeta = makeMeta(MISMATCHED_DIGEST);
+      state.currentMeta.embeddingCheckpoint = {
+        ...state.currentMeta.embeddingCheckpoint!,
+        nodesProcessed: 0,
+        totalNodes: 0,
+        provider: undefined,
+        physicalRows: undefined,
+        validRows: undefined,
+        recoverableIdentitySha256: undefined,
+      };
+      state.liveIntegrity = makeIntegrity(LIVE_DIGEST, 0);
+      state.graphNodes = [];
+      state.executeQuery.mockImplementation(async () => {
+        throw new Error(message);
+      });
+      const before = JSON.stringify(state.currentMeta.embeddingCheckpoint);
+      const response = await fetch(`${baseUrl}/api/embed`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ repo: REPO.name }),
+      });
+      const { jobId } = (await response.json()) as { jobId: string };
+      const job = await waitForTerminalJob(baseUrl, jobId);
+
+      expect(job.status).toBe('failed');
+      expect(job.error).toMatch(new RegExp(message));
+      expect(state.runEmbeddingPipeline).not.toHaveBeenCalled();
+      expect(state.getActiveEmbeddingIdentity).not.toHaveBeenCalled();
+      expect(state.saveMeta).not.toHaveBeenCalled();
+      expect(JSON.stringify(state.currentMeta.embeddingCheckpoint)).toBe(before);
+    });
+
+  it('finds a text-bearing File after a full invalid page without loading all rows', async () => {
+    state.currentMeta = makeMeta(LIVE_DIGEST);
+    state.currentMeta.embeddingCheckpoint = {
+      ...state.currentMeta.embeddingCheckpoint!,
+      nodesProcessed: 0,
+      totalNodes: 0,
+      provider: undefined,
+      physicalRows: undefined,
+      validRows: undefined,
+      recoverableIdentitySha256: undefined,
+    };
+    state.liveIntegrity = makeIntegrity(LIVE_DIGEST, 0);
+    state.graphNodes = [];
+    const fileQueries: string[] = [];
+    state.executeQuery.mockImplementation(async (...args: unknown[]) => {
+      const query = String(args[0] ?? '');
+      if (!query.includes('`File`')) {
+        throw new Error('table LegacyNode does not exist');
+      }
+      fileQueries.push(query);
+      expect(query).toMatch(/ORDER BY n\.id LIMIT 256$/);
+      if (fileQueries.length === 1) {
+        return Array.from({ length: 256 }, (_, index) => ({
+          id: index === 255 ? "last-'\\id" : `invalid-${index}`,
+          filePath: `invalid/${index}`,
+          content: index % 2 === 0 ? '' : '[Binary file - content not stored]',
+        }));
+      }
+      expect(query).toContain(`WHERE n.id > '${escapeCypherString("last-'\\id")}' `);
+      if (fileQueries.length === 2) {
+        return [{ id: 'valid-file', filePath: 'src/valid.ts', content: 'export const valid = true;' }];
+      }
+      return [];
+    });
+
+    const response = await fetch(`${baseUrl}/api/embed`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ repo: REPO.name }),
+    });
+    const { jobId } = (await response.json()) as { jobId: string };
+
+    expect((await waitForTerminalJob(baseUrl, jobId)).status).toBe('complete');
+    expect(state.runEmbeddingPipeline).toHaveBeenCalledOnce();
+    expect(fileQueries).toHaveLength(2);
+    expect(fileQueries.every((query) => /ORDER BY n\.id LIMIT 256$/.test(query))).toBe(true);
+  });
+
+  it('uses database order when a high-BMP File precedes an emoji File', async () => {
+    state.currentMeta = makeMeta(LIVE_DIGEST);
+    state.currentMeta.embeddingCheckpoint = {
+      at: REPO.indexedAt,
+      nodesProcessed: 0,
+      totalNodes: 0,
+      chunksProcessed: 0,
+      model: MODEL,
+      dimensions: identity.dimensions,
+      pendingNodeIds: [],
+    };
+    state.liveIntegrity = makeIntegrity(LIVE_DIGEST, 0);
+    state.graphNodes = [];
+    const firstId = 'File:\uE000';
+    const validId = 'File:😀';
+    const fileQueries: string[] = [];
+    state.executeQuery.mockImplementation(async (...args: unknown[]) => {
+      const query = String(args[0] ?? '');
+      if (!query.includes('`File`')) throw new Error('table LegacyNode does not exist');
+      fileQueries.push(query);
+      expect(query).toMatch(/ORDER BY n\.id LIMIT 256$/);
+      if (fileQueries.length === 1) {
+        return Array.from({ length: 256 }, (_, index) => ({
+          id: index === 255 ? firstId : `File:invalid-${index}`,
+          filePath: `invalid/${index}`,
+          content: '',
+        }));
+      }
+      expect(query).toContain(`WHERE n.id > '${escapeCypherString(firstId)}' `);
+      return [{ id: validId, filePath: 'src/emoji.ts', content: 'export const emoji = true;' }];
+    });
+
+    const response = await fetch(`${baseUrl}/api/embed`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ repo: REPO.name }),
+    });
+    const { jobId } = (await response.json()) as { jobId: string };
+    expect((await waitForTerminalJob(baseUrl, jobId)).status).toBe('complete');
+    expect(fileQueries).toHaveLength(2);
+    expect(state.runEmbeddingPipeline).toHaveBeenCalledOnce();
+    expect(state.getActiveEmbeddingIdentity).toHaveBeenCalledOnce();
+    expect(state.currentMeta.stats?.embeddings).toBe(3);
+    expect(state.currentMeta.embeddingCheckpoint).toBeUndefined();
+  });
+
+  it.each([
+    'table LegacyNode does not exist',
+    'column LegacyNode does not exist',
+    'property content not found',
+  ])('treats an all-invalid File scan as true empty for %s', async (schemaError) => {
+    state.currentMeta = makeMeta(LIVE_DIGEST);
+    state.currentMeta.embeddingCheckpoint = {
+      at: REPO.indexedAt,
+      nodesProcessed: 0,
+      totalNodes: 0,
+      chunksProcessed: 0,
+      model: MODEL,
+      dimensions: identity.dimensions,
+      pendingNodeIds: [],
+    };
+    state.liveIntegrity = makeIntegrity(LIVE_DIGEST, 0);
+    state.graphNodes = [];
+    const fileQueries: string[] = [];
+    state.executeQuery.mockImplementation(async (...args: unknown[]) => {
+      const query = String(args[0] ?? '');
+      if (!query.includes('`File`')) throw new Error(schemaError);
+      fileQueries.push(query);
+      if (fileQueries.length === 1) {
+        return Array.from({ length: 256 }, (_, index) => ({
+          id: `invalid-${index}`,
+          filePath: `invalid/${index}`,
+          content: index % 2 === 0 ? '' : '[Binary file - content not stored]',
+        }));
+      }
+      return [];
+    });
+
+    const response = await fetch(`${baseUrl}/api/embed`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ repo: REPO.name }),
+    });
+    const { jobId } = (await response.json()) as { jobId: string };
+
+    expect((await waitForTerminalJob(baseUrl, jobId)).status).toBe('complete');
+    expect(fileQueries).toHaveLength(2);
+    expect(fileQueries[1]).toContain("WHERE n.id > 'invalid-255' ");
+    expect(state.runEmbeddingPipeline).not.toHaveBeenCalled();
+    expect(state.getActiveEmbeddingIdentity).not.toHaveBeenCalled();
     expect(state.currentMeta.stats?.embeddings).toBe(0);
     expect(state.currentMeta.embeddingCheckpoint).toBeUndefined();
   });
