@@ -117,12 +117,29 @@ export interface EmbedCommitBarrier {
   phase: EmbedCommitPhase;
   cancelRequested: boolean;
   cancelReason?: string;
+  terminalOutcome: Promise<void>;
+  terminalOutcomePublished: boolean;
+  publishTerminalOutcome: () => void;
 }
 
-export const createEmbedCommitBarrier = (): EmbedCommitBarrier => ({
-  phase: 'RUNNING',
-  cancelRequested: false,
-});
+export const createEmbedCommitBarrier = (): EmbedCommitBarrier => {
+  let resolveTerminalOutcome!: () => void;
+  const terminalOutcome = new Promise<void>((resolve) => {
+    resolveTerminalOutcome = resolve;
+  });
+  const barrier: EmbedCommitBarrier = {
+    phase: 'RUNNING',
+    cancelRequested: false,
+    terminalOutcome,
+    terminalOutcomePublished: false,
+    publishTerminalOutcome: () => {
+      if (barrier.terminalOutcomePublished) return;
+      barrier.terminalOutcomePublished = true;
+      resolveTerminalOutcome();
+    },
+  };
+  return barrier;
+};
 
 export const requestEmbedCancellation = (
   barrier: EmbedCommitBarrier,
@@ -2023,6 +2040,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                     );
                     embeddingMeta = clearedMeta;
                     embedJobManager.updateJob(job.id, { status: 'complete' });
+                    barrier.publishTerminalOutcome();
                     return;
                   }
                   // Keep the old checkpoint persisted until the fresh pipeline
@@ -2151,6 +2169,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
               );
               embeddingMeta = terminalMeta;
               embedJobManager.updateJob(job.id, { status: 'complete' });
+              barrier.publishTerminalOutcome();
             });
 
             // Don't overwrite 'failed' if the job was cancelled while the pipeline was running
@@ -2158,6 +2177,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
             if (!current || current.status !== 'failed') {
               embedJobManager.updateJob(job.id, { status: 'complete' });
             }
+            barrier.publishTerminalOutcome();
           } catch (err: any) {
             if (barrier.phase !== 'COMPLETE') barrier.phase = 'FAILED';
             const current = embedJobManager.getJob(job.id);
@@ -2167,6 +2187,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                 error: err.message || 'Embedding generation failed',
               });
             }
+            barrier.publishTerminalOutcome();
           } finally {
             clearTimeout(embedTimeout);
             embedBarriers.delete(job.id);
@@ -2208,7 +2229,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
   mountSSEProgress(app, '/api/embed/:jobId/progress', embedJobManager);
 
   // DELETE /api/embed/:jobId — cancel embedding job
-  app.delete('/api/embed/:jobId', requireLocalhostOrigin, (req, res) => {
+  app.delete('/api/embed/:jobId', requireLocalhostOrigin, async (req, res) => {
     const jobId = req.params.jobId as string;
     const job = embedJobManager.getJob(jobId);
     if (!job) {
@@ -2226,6 +2247,19 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         'Cancelled by user',
         () => embedAborters.get(jobId)?.(),
       );
+      if (
+        !barrier.terminalOutcomePublished &&
+        (outcome === 'deferred' || outcome === 'terminal') &&
+        barrier.phase !== 'COMMITTING_CHECKPOINT'
+      ) {
+        await barrier.terminalOutcome;
+        await Promise.resolve();
+      }
+      const settledJob = embedJobManager.getJob(jobId);
+      if (settledJob?.status === 'complete' || settledJob?.status === 'failed') {
+        res.status(400).json({ error: `Job already ${settledJob.status}` });
+        return;
+      }
       if (outcome === 'cancelled') embedJobManager.cancelJob(jobId, 'Cancelled by user');
     } else {
       embedJobManager.cancelJob(jobId, 'Cancelled by user');
