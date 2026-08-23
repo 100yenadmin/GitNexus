@@ -1,5 +1,5 @@
 import http from 'node:http';
-import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const repo = {
   name: 'checkpoint-fixture',
@@ -82,16 +82,33 @@ describe('POST /api/embed checkpoint recovery', () => {
     url = `http://127.0.0.1:${testPort}`;
   });
 
+  beforeEach(() => {
+    state.meta = {
+      repoPath: repo.path,
+      lastCommit: repo.lastCommit,
+      indexedAt: repo.indexedAt,
+      stats: {},
+      embeddingCheckpoint: { ...checkpoint },
+    };
+    state.executeQuery.mockReset();
+    state.executeQuery.mockImplementation(async () => {
+      throw new Error('connection not found');
+    });
+    state.pipeline.mockReset();
+    state.identity.mockReset();
+    state.saveMeta.mockClear();
+  });
+
   afterAll(async () => { onceSpy.mockRestore(); await shutdown?.(); exitSpy.mockRestore(); });
 
-  it('retains the checkpoint when the provider-free graph preflight fails', async () => {
+  it('propagates connection failures and retains the checkpoint', async () => {
     const before = JSON.stringify(state.meta.embeddingCheckpoint);
     const response = await fetch(`${url}/api/embed`, { method: 'POST', body: JSON.stringify({ repo: repo.name }) });
     const { jobId } = await response.json() as { jobId: string };
     const job = await terminal(url, jobId);
     expect(response.status).toBe(202);
     expect(job.status).toBe('failed');
-    expect(job.error).toMatch(/graph preflight failed/);
+    expect(job.error).toMatch(/connection not found/);
     expect(state.pipeline).not.toHaveBeenCalled();
     expect(state.identity).not.toHaveBeenCalled();
     expect(state.saveMeta).not.toHaveBeenCalled();

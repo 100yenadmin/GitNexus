@@ -60,6 +60,7 @@ import { isRfc1918PrivateIpv4 } from './private-ip.js';
 import { logger, flushLoggerSync } from '../core/logger.js';
 import { assertCompletedCheckpointIdentity } from '../core/embeddings/checkpoint-identity.js';
 import { EMBEDDABLE_LABELS } from '../core/embeddings/types.js';
+import { isMissingColumnOrTableError } from '../core/lbug/schema-errors.js';
 
 const _require = createRequire(import.meta.url);
 const pkg = _require('../../package.json');
@@ -74,6 +75,7 @@ const API_CHECKPOINT_CONTEXT =
   'Cannot resume embedding checkpoint. Manual recovery required: do not retry POST /api/embed. ' +
   'Run `gitnexus analyze --force --drop-embeddings --embeddings` or POST /api/analyze with force, ' +
   'dropEmbeddings, and embeddings set to true.';
+const FILE_PREFLIGHT_PAGE_SIZE = 256;
 
 /**
  * Determine whether an HTTP Origin header value is allowed by CORS policy.
@@ -1766,6 +1768,8 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
     execQuery: (cypher: string) => Promise<any[]>,
   ): Promise<boolean> => {
     const rowHasId = (row: any): boolean => Boolean(row?.id ?? row?.[0]);
+    const isMissingSchemaError = (err: unknown): boolean =>
+      isMissingColumnOrTableError(err instanceof Error ? err.message : String(err));
     for (const label of EMBEDDABLE_LABELS) {
       try {
         const rows = await execQuery(
@@ -1773,30 +1777,36 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         );
         if (rows?.some(rowHasId)) return true;
       } catch (err) {
-        if (!isIgnorableGraphQueryError(err)) throw err;
+        if (!isMissingSchemaError(err)) throw err;
       }
     }
 
-    try {
-      const rows = await execQuery(
-        `MATCH (n:${quoteNodeTable('File')}) RETURN n.id AS id, n.filePath AS filePath, n.content AS content`,
-      );
-      return (
-        rows?.some((row) => {
-          const id = row?.id ?? row?.[0];
-          const filePath = row?.filePath ?? row?.[1];
-          const content = row?.content ?? row?.[2];
-          return (
-            Boolean(id && filePath) &&
-            typeof content === 'string' &&
-            content.trim().length > 0 &&
-            content !== '[Binary file - content not stored]'
-          );
-        }) ?? false
-      );
-    } catch (err) {
-      if (!isIgnorableGraphQueryError(err)) throw err;
-      return false;
+    for (let offset = 0; ; offset += FILE_PREFLIGHT_PAGE_SIZE) {
+      try {
+        const rows = await execQuery(
+          `MATCH (n:${quoteNodeTable('File')}) RETURN n.id AS id, n.filePath AS filePath, n.content AS content ` +
+            `ORDER BY n.id SKIP ${offset} LIMIT ${FILE_PREFLIGHT_PAGE_SIZE}`,
+        );
+        if (
+          rows?.some((row) => {
+            const id = row?.id ?? row?.[0];
+            const filePath = row?.filePath ?? row?.[1];
+            const content = row?.content ?? row?.[2];
+            return (
+              Boolean(id && filePath) &&
+              typeof content === 'string' &&
+              content.trim().length > 0 &&
+              content !== '[Binary file - content not stored]'
+            );
+          })
+        ) {
+          return true;
+        }
+        if (!rows?.length || rows.length < FILE_PREFLIGHT_PAGE_SIZE) return false;
+      } catch (err) {
+        if (!isMissingSchemaError(err)) throw err;
+        return false;
+      }
     }
   };
 

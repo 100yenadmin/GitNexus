@@ -316,6 +316,55 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     expect(state.currentMeta.embeddingCheckpoint).toBeUndefined();
   });
 
+  it('finds a text-bearing File after a full invalid page without loading all rows', async () => {
+    state.currentMeta = makeMeta(LIVE_DIGEST);
+    state.currentMeta.embeddingCheckpoint = {
+      ...state.currentMeta.embeddingCheckpoint!,
+      nodesProcessed: 0,
+      totalNodes: 0,
+      provider: undefined,
+      physicalRows: undefined,
+      validRows: undefined,
+      recoverableIdentitySha256: undefined,
+    };
+    state.liveIntegrity = makeIntegrity(LIVE_DIGEST, 0);
+    state.graphNodes = [];
+    const fileQueries: string[] = [];
+    state.executeQuery.mockImplementation(async (query: string) => {
+      if (!query.includes('`File`')) {
+        throw new Error('table LegacyNode does not exist');
+      }
+      fileQueries.push(query);
+      const page = query.match(/SKIP (\d+) LIMIT (\d+)/);
+      expect(page).not.toBeNull();
+      const offset = Number(page![1]);
+      const limit = Number(page![2]);
+      if (offset === 0) {
+        return Array.from({ length: limit }, (_, index) => ({
+          id: `invalid-${index}`,
+          filePath: `invalid/${index}`,
+          content: index % 2 === 0 ? '' : '[Binary file - content not stored]',
+        }));
+      }
+      if (offset === limit) {
+        return [{ id: 'valid-file', filePath: 'src/valid.ts', content: 'export const valid = true;' }];
+      }
+      return [];
+    });
+
+    const response = await fetch(`${baseUrl}/api/embed`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ repo: REPO.name }),
+    });
+    const { jobId } = (await response.json()) as { jobId: string };
+
+    expect((await waitForTerminalJob(baseUrl, jobId)).status).toBe('complete');
+    expect(state.runEmbeddingPipeline).toHaveBeenCalledOnce();
+    expect(fileQueries).toHaveLength(2);
+    expect(fileQueries.every((query) => /ORDER BY n\.id SKIP \d+ LIMIT \d+/.test(query))).toBe(true);
+  });
+
   it('persists completed-window identity before an interrupted finalization', async () => {
     state.currentMeta = makeMeta(LIVE_DIGEST);
     state.runEmbeddingPipeline.mockImplementationOnce(async (...args: unknown[]) => {
