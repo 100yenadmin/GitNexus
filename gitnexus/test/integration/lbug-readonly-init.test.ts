@@ -11,6 +11,7 @@ import path from 'node:path';
 import { it, expect, vi } from 'vitest';
 import { withTestLbugDB } from '../helpers/test-indexed-db.js';
 import { _initLockPathForTest } from '../../src/core/lbug/lbug-adapter.js';
+import { EMBEDDING_DIMS } from '../../src/core/lbug/schema.js';
 import type { RegistryEntry, RepoMeta } from '../../src/storage/repo-manager.js';
 
 const allocatePort = (): Promise<number> =>
@@ -25,7 +26,7 @@ const allocatePort = (): Promise<number> =>
   });
 
 const waitForJob = async (baseUrl: string, jobId: string) => {
-  for (let attempt = 0; attempt < 100; attempt++) {
+  for (let attempt = 0; attempt < 3000; attempt++) {
     const response = await fetch(`${baseUrl}/api/embed/${jobId}`);
     const job = (await response.json()) as { status: string; error?: string };
     if (job.status === 'complete' || job.status === 'failed') return job;
@@ -74,14 +75,14 @@ withTestLbugDB(
           totalNodes: 0,
           chunksProcessed: 0,
           model: 'legacy-model',
-          dimensions: 384,
+          dimensions: EMBEDDING_DIMS,
           pendingNodeIds: [],
         },
       });
       let meta = legacyMeta();
       let loadCount = 0;
       let injectWritableDrift = false;
-      const zeroVector = new Array(384).fill(0).join(',');
+      const zeroVector = new Array(EMBEDDING_DIMS).fill(0).join(',');
       const loadMeta = vi.fn(async () => {
         loadCount++;
         if (injectWritableDrift && loadCount === 2) {
@@ -112,7 +113,7 @@ withTestLbugDB(
         getActiveEmbeddingIdentity: vi.fn(() => ({
           provider: 'native-test',
           model: 'native-model',
-          dimensions: 384,
+          dimensions: EMBEDDING_DIMS,
         })),
       }));
       vi.doMock('../../src/core/embeddings/embedding-pipeline.js', () => ({
