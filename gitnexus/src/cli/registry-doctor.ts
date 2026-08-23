@@ -720,6 +720,7 @@ const inspectEntry = async (
     (counts.embeddings ?? 0) > 0;
   const queryDimensions = getQueryEmbeddingDimensions();
   const queryDimensionMismatch =
+    embeddingBearing &&
     storedEmbeddingDimensions !== undefined &&
     Number.isSafeInteger(queryDimensions) &&
     queryDimensions !== storedEmbeddingDimensions;

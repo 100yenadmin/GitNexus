@@ -50,10 +50,7 @@ const validHttpInteger = (name: string, max: number, allowZero: boolean): boolea
 export const getQueryEmbeddingRuntimeStatus = (): QueryEmbeddingRuntimeStatus => {
   const rawUrl = process.env.GITNEXUS_EMBEDDING_URL;
   const rawModel = process.env.GITNEXUS_EMBEDDING_MODEL;
-  if (rawUrl !== undefined || rawModel !== undefined) {
-    if (!rawUrl || !rawModel) {
-      return { available: false, mode: 'http', reason: 'http-config-incomplete' };
-    }
+  if (rawUrl && rawModel) {
     if (rawUrl !== rawUrl.trim() || rawModel !== rawModel.trim()) {
       return { available: false, mode: 'http', reason: 'http-config-invalid' };
     }
