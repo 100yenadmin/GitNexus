@@ -77,22 +77,22 @@ const API_CHECKPOINT_CONTEXT =
   'Run `gitnexus analyze --force --drop-embeddings --embeddings` or POST /api/analyze with force, ' +
   'dropEmbeddings, and embeddings set to true.';
 const assertEmbeddingCheckpointIdentity = (
-  checkpoint: RepoMeta['embeddingCheckpoint'],
-  identity: EmbeddingIdentity,
+  priorCheckpoint: RepoMeta['embeddingCheckpoint'],
+  embeddingIdentity: EmbeddingIdentity,
 ): void => {
+  if (!priorCheckpoint) return;
   if (
-    !checkpoint ||
-    (checkpoint.provider === identity.provider &&
-      checkpoint.model === identity.model &&
-      checkpoint.dimensions === identity.dimensions)
+    priorCheckpoint.provider === undefined ||
+    priorCheckpoint.provider !== embeddingIdentity.provider ||
+    priorCheckpoint.model !== embeddingIdentity.model ||
+    priorCheckpoint.dimensions !== embeddingIdentity.dimensions
   ) {
-    return;
+    throw new Error(
+      `Cannot resume embedding checkpoint: it uses ${priorCheckpoint.provider ?? 'unknown-provider'} / ` +
+        `${priorCheckpoint.model} at ${priorCheckpoint.dimensions} dimensions, but this run resolves ` +
+        `${embeddingIdentity.provider} / ${embeddingIdentity.model} at ${embeddingIdentity.dimensions}. ${API_CHECKPOINT_CONTEXT}`,
+    );
   }
-  throw new Error(
-    `Cannot resume embedding checkpoint: it uses ${checkpoint.provider ?? 'unknown-provider'} / ` +
-      `${checkpoint.model} at ${checkpoint.dimensions} dimensions, but this run resolves ` +
-      `${identity.provider} / ${identity.model} at ${identity.dimensions}. ${API_CHECKPOINT_CONTEXT}`,
-  );
 };
 
 /**
@@ -1799,15 +1799,11 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
 
     try {
       const rows = await execQuery(
-        `MATCH (n:${quoteNodeTable('File')}) RETURN n.id AS id, n.filePath AS filePath, n.content AS content LIMIT 256`,
+        `MATCH (n:${quoteNodeTable('File')}) WHERE n.id IS NOT NULL AND n.filePath IS NOT NULL ` +
+          `AND n.filePath <> '' AND n.content IS NOT NULL AND n.content <> '' ` +
+          `AND n.content <> '[Binary file - content not stored]' RETURN n.id AS id LIMIT 1`,
       );
-      return rows?.some((row) => {
-        const id = row?.id ?? row?.[0];
-        const filePath = row?.filePath ?? row?.[1];
-        const content = row?.content ?? row?.[2];
-        const text = typeof content === 'string' ? content.trim() : '';
-        return Boolean(id && filePath && text && text !== '[Binary file - content not stored]');
-      }) ?? false;
+      return rows?.some(rowHasId) ?? false;
     } catch (err) {
       if (!isMissingColumnOrTableError(err instanceof Error ? err.message : String(err))) throw err;
       return false;
