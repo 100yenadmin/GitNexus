@@ -59,6 +59,7 @@ import { sweepStaleUploads } from './upload-sweep.js';
 import { isRfc1918PrivateIpv4 } from './private-ip.js';
 import { logger, flushLoggerSync } from '../core/logger.js';
 import { assertCompletedCheckpointIdentity } from '../core/embeddings/checkpoint-identity.js';
+import { EMBEDDABLE_LABELS } from '../core/embeddings/types.js';
 
 const _require = createRequire(import.meta.url);
 const pkg = _require('../../package.json');
@@ -1761,6 +1762,44 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
 
   // ── Embedding endpoints ────────────────────────────────────────────
 
+  const hasEmbeddableNodes = async (
+    execQuery: (cypher: string) => Promise<any[]>,
+  ): Promise<boolean> => {
+    const rowHasId = (row: any): boolean => Boolean(row?.id ?? row?.[0]);
+    for (const label of EMBEDDABLE_LABELS) {
+      try {
+        const rows = await execQuery(
+          `MATCH (n:${quoteNodeTable(label)}) RETURN n.id AS id LIMIT 1`,
+        );
+        if (rows?.some(rowHasId)) return true;
+      } catch (err) {
+        if (!isIgnorableGraphQueryError(err)) throw err;
+      }
+    }
+
+    try {
+      const rows = await execQuery(
+        `MATCH (n:${quoteNodeTable('File')}) RETURN n.id AS id, n.filePath AS filePath, n.content AS content LIMIT 1`,
+      );
+      return (
+        rows?.some((row) => {
+          const id = row?.id ?? row?.[0];
+          const filePath = row?.filePath ?? row?.[1];
+          const content = row?.content ?? row?.[2];
+          return (
+            Boolean(id && filePath) &&
+            typeof content === 'string' &&
+            content.trim().length > 0 &&
+            content !== '[Binary file - content not stored]'
+          );
+        }) ?? false
+      );
+    } catch (err) {
+      if (!isIgnorableGraphQueryError(err)) throw err;
+      return false;
+    }
+  };
+
   const embedJobManager = new JobManager();
 
   // POST /api/embed — trigger server-side embedding generation
@@ -1827,6 +1866,14 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                   embeddingMeta = { ...embeddingMeta, embeddingCheckpoint: undefined };
                   await saveMeta(entry.storagePath, embeddingMeta);
                   priorCheckpoint = undefined;
+                  if (!(await hasEmbeddableNodes(executeQuery))) {
+                    embeddingMeta = {
+                      ...embeddingMeta,
+                      stats: { ...embeddingMeta.stats, embeddings: integrity.validRows },
+                    };
+                    await saveMeta(entry.storagePath, embeddingMeta);
+                    return;
+                  }
                 }
               }
               const { getActiveEmbeddingIdentity } = await import('../core/embeddings/embedder.js');
