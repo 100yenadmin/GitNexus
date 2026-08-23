@@ -511,6 +511,10 @@ const FTS_UNAVAILABLE_MESSAGE =
   'Full-text/BM25 search will be disabled until the LadybugDB FTS extension is ' +
   'installed once with network access (GITNEXUS_LBUG_EXTENSION_INSTALL=auto) or ' +
   'pre-installed for offline use. Run `gitnexus doctor` for details.';
+const CLI_CHECKPOINT_CONTEXT =
+  'Cannot resume embedding checkpoint. Manual recovery required: do not retry ' +
+  '`gitnexus analyze`. ' +
+  'Run `gitnexus analyze --force --drop-embeddings --embeddings`.';
 
 // Re-export the pure flag-derivation helper so external callers (and tests)
 // keep importing from this module's stable surface.
@@ -1657,7 +1661,7 @@ const runFullAnalysisImpl = async (
     assertCompletedCheckpointIdentity(
       legacyCheckpoint,
       integrity,
-      'Cannot resume embedding checkpoint',
+      CLI_CHECKPOINT_CONTEXT,
     );
     existingMeta = { ...existingMeta, embeddingCheckpoint: undefined };
     await saveMeta(metaDir, existingMeta);

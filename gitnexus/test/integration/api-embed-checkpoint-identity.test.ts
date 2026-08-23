@@ -17,10 +17,20 @@ const REPO: RegistryEntry = {
 const identity = { provider: 'api-checkpoint-test-provider', model: MODEL, dimensions: 384 };
 const makeIntegrity = (digest: string, physicalRows = 3): EmbeddingIntegrityReport =>
   ({
+    tablePresent: true,
     physicalRows,
     validRows: physicalRows,
+    recoverableRows: physicalRows,
+    emptyIdRows: 0,
+    emptyNodeIdRows: 0,
+    invalidChunkRows: 0,
+    noncanonicalIdRows: 0,
+    duplicateIdRows: 0,
+    duplicateSemanticRows: 0,
+    orphanRows: 0,
+    wrongDimensionRows: 0,
     recoverableIdentitySha256: digest,
-  }) as EmbeddingIntegrityReport;
+  });
 
 const makeMeta = (digest: string): RepoMeta => ({
   repoPath: REPO.path,
