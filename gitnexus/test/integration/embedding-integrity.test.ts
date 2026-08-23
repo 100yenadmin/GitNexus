@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { withTestLbugDB } from '../helpers/test-indexed-db.js';
 import { EMBEDDING_DIMS } from '../../src/core/lbug/schema.js';
 import { probeRegistryDatabaseCounts } from '../../src/cli/registry-doctor.js';
+import * as d from '../../src/core/embeddings/identity-digest.js';
 
 describe('embedding writer identity preflight', () => {
   it('validates the whole batch before executing and prepares once per row', async () => {
@@ -43,6 +44,7 @@ withTestLbugDB(
         { id: '', nodeId: 'Function:live', chunkIndex: 1 },
         { id: 'blank-owner:0', nodeId: '', chunkIndex: 0 },
         { id: 'Function:missing:0', nodeId: 'Function:missing', chunkIndex: 0 },
+        { id: 'Function:null-chunk:0', nodeId: 'Function:live', chunkIndex: null as any },
       ];
       for (const row of rows) {
         await adapter.executeWithReusedStatement(cypher, [
@@ -52,11 +54,12 @@ withTestLbugDB(
 
       await expect(adapter.inspectEmbeddingIntegrity()).resolves.toMatchObject({
         tablePresent: true,
-        physicalRows: 5,
+        physicalRows: 6,
         validRows: 1,
         recoverableRows: 2,
         emptyIdRows: 1,
         emptyNodeIdRows: 1,
+        invalidChunkRows: 1,
         noncanonicalIdRows: 1,
         duplicateSemanticRows: 1,
         orphanRows: 1,
@@ -69,7 +72,7 @@ withTestLbugDB(
       await expect(adapter.inspectEmbeddingIntegrity(EMBEDDING_DIMS + 1)).resolves.toMatchObject({
         validRows: 0,
         recoverableRows: 0,
-        wrongDimensionRows: 5,
+        wrongDimensionRows: 6,
       });
     });
 
@@ -98,9 +101,13 @@ withTestLbugDB(
           'Class',
         ),
       ).toBe(false);
+      const isMissingContentHash = (suffix: string) =>
+        adapter.isMissingContentHashError(
+          new Error(`Binder exception: Cannot find property ${suffix}`),
+        );
       expect(
-        adapter.isMissingEmbeddingOwnerTableError(new Error('query result not found'), 'Class'),
-      ).toBe(false);
+        ['contentHash', 'contentHash for e.', 'contentHash text'].map(isMissingContentHash),
+      ).toEqual([true, true, false]);
     });
 
     it('preserves counts when a present legacy table lacks chunkIndex', async () => {
@@ -210,6 +217,52 @@ withTestLbugDB(
       expect(embeddingSnapshotMatchesIdentityDigest(info, live.recoverableIdentitySha256)).toBe(
         false,
       );
+    });
+    it('tracks physical values, rejected state, owner state, and multiset order', async () => {
+      const adapter = await import('../../src/core/lbug/lbug-adapter.js');
+      const read = () => adapter.inspectEmbeddingIntegrity(EMBEDDING_DIMS, true);
+      const vi = d.embeddingPhysicalVectorInfo;
+      const nonfinite = new Array(EMBEDDING_DIMS).fill(0.5);
+      nonfinite[0] = Infinity;
+      const base = await read();
+      await adapter.executeWithReusedStatement(
+        'MATCH (e:CodeEmbedding) WHERE e.id = $id SET e.contentHash = $hash',
+        [{ id: 'File:live:0', hash: 'changed' }],
+      );
+      const hashChanged = await read();
+      expect(hashChanged.physicalRowsSha256).not.toBe(base.physicalRowsSha256);
+      await adapter.executeWithReusedStatement(
+        'MATCH (e:CodeEmbedding) WHERE e.id = $id SET e.embedding = $embedding',
+        [{ id: 'File:live:0', embedding: new Array(EMBEDDING_DIMS).fill(0.5) }],
+      );
+      const vectorChanged = await read();
+      expect(vectorChanged.physicalRowsSha256).not.toBe(hashChanged.physicalRowsSha256);
+      await adapter.executeWithReusedStatement(
+        'MATCH (e:CodeEmbedding) WHERE e.id = $id SET e.chunkIndex = $chunkIndex',
+        [{ id: 'File:live:0', chunkIndex: 1 }],
+      );
+      expect((await read()).physicalRowsSha256).not.toBe(vectorChanged.physicalRowsSha256);
+      await adapter.executeWithReusedStatement(
+        'CREATE (e:CodeEmbedding {id: $id, nodeId: $nodeId, chunkIndex: $chunkIndex, ' +
+          'startLine: 1, endLine: 1, embedding: $embedding, contentHash: $hash})',
+        [
+          {
+            id: 'File:bad:0',
+            nodeId: 'File:bad',
+            chunkIndex: 0,
+            embedding: nonfinite,
+            hash: 'bad',
+          },
+        ],
+      );
+      const rejected = await read();
+      expect(rejected.physicalRowsSha256).not.toBe(vectorChanged.physicalRowsSha256);
+      await adapter.executeQuery("CREATE (:File {id: 'File:bad'})");
+      expect((await read()).physicalRowsSha256).not.toBe(rejected.physicalRowsSha256);
+      expect(d.embeddingPhysicalRowsDigest(true, 3, ['a', 'b', 'a'])).toBe(
+        d.embeddingPhysicalRowsDigest(true, 3, ['a', 'a', 'b']),
+      );
+      expect(vi(new Int32Array(EMBEDDING_DIMS)).finite).toBe('malformed');
     });
   },
   {
