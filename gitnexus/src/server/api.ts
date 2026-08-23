@@ -1953,6 +1953,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                       stats: { ...embeddingMeta.stats, embeddings: integrity.validRows },
                       embeddingCheckpoint: undefined,
                     };
+                    embedController.signal.throwIfAborted();
                     await saveMeta(entry.storagePath, embeddingMeta);
                     return;
                   }
@@ -1989,6 +1990,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                 pendingNodeIds: string[],
                 integrity?: Awaited<ReturnType<typeof inspectEmbeddingIntegrity>>,
               ): Promise<void> => {
+                embedController.signal.throwIfAborted();
                 embeddingMeta = {
                   ...embeddingMeta,
                   embeddingCheckpoint: {
@@ -2001,6 +2003,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                     recoverableIdentitySha256: integrity?.recoverableIdentitySha256,
                   },
                 };
+                embedController.signal.throwIfAborted();
                 await saveMeta(entry.storagePath, embeddingMeta);
               };
               // Fetch existing content hashes for incremental embedding.
@@ -2045,7 +2048,9 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                   },
                   onCheckpoint: async (checkpoint) => {
                     await flushWAL();
+                    embedController.signal.throwIfAborted();
                     const integrity = await inspectEmbeddingIntegrity();
+                    embedController.signal.throwIfAborted();
                     if (
                       embeddingIntegrityFailures(integrity) > 0 ||
                       integrity.physicalRows !== integrity.validRows
@@ -2061,8 +2066,11 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
               // embeddings immediately (#1149). In the CLI path closeLbug()
               // handles this during process exit, but the server keeps the
               // connection open for other routes — a CHECKPOINT is enough.
+              embedController.signal.throwIfAborted();
               await flushWAL();
+              embedController.signal.throwIfAborted();
               const terminalIntegrity = await inspectEmbeddingIntegrity();
+              embedController.signal.throwIfAborted();
               if (
                 embeddingIntegrityFailures(terminalIntegrity) > 0 ||
                 terminalIntegrity.physicalRows !== terminalIntegrity.validRows
@@ -2074,6 +2082,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                 stats: { ...embeddingMeta.stats, embeddings: terminalIntegrity.validRows },
                 embeddingCheckpoint: undefined,
               };
+              embedController.signal.throwIfAborted();
               await saveMeta(entry.storagePath, embeddingMeta);
             });
 

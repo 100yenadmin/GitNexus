@@ -748,4 +748,34 @@ describe('POST /api/embed completed-checkpoint identity', () => {
       pendingNodeIds: [],
     });
   });
+
+  it('does not clear terminal metadata after cancellation following the pipeline', async () => {
+    state.currentMeta = makeMeta(LIVE_DIGEST);
+    let releasePipeline!: () => void;
+    let pipelineStartedResolve!: () => void;
+    const pipelineStarted = new Promise<void>((resolve) => {
+      pipelineStartedResolve = resolve;
+    });
+    const pipelineReleased = new Promise<void>((resolve) => {
+      releasePipeline = resolve;
+    });
+    state.runEmbeddingPipeline.mockImplementationOnce(async () => {
+      pipelineStartedResolve();
+      await pipelineReleased;
+    });
+    const checkpointBefore = JSON.stringify(state.currentMeta.embeddingCheckpoint);
+    const response = await fetch(`${baseUrl}/api/embed`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ repo: REPO.name }),
+    });
+    const { jobId } = (await response.json()) as { jobId: string };
+    await pipelineStarted;
+    expect((await fetch(`${baseUrl}/api/embed/${jobId}`, { method: 'DELETE' })).status).toBe(200);
+    releasePipeline();
+
+    expect((await waitForTerminalJob(baseUrl, jobId)).status).toBe('failed');
+    expect(state.saveMeta).not.toHaveBeenCalled();
+    expect(JSON.stringify(state.currentMeta.embeddingCheckpoint)).toBe(checkpointBefore);
+  });
 });
