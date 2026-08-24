@@ -170,6 +170,7 @@ const FILESYSTEM = [
   'test/integration/filesystem-walker.test.ts',
   'test/integration/markdown-processor-crlf.test.ts',
   'test/integration/ignore-and-skip-e2e.test.ts',
+  'test/unit/repo-manager-writer-lock.test.ts',
 ];
 
 const ALL_CROSS_PLATFORM = [
