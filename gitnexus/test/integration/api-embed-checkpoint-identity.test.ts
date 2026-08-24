@@ -436,7 +436,9 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     expect(state.saveMeta).not.toHaveBeenCalled();
   });
 
-  it('clears a legacy zero-node checkpoint only when the table is empty', async () => {
+  it('clears a legacy zero-node checkpoint with registry-enriched remote', async () => {
+    const enrichedRepo = { ...REPO, remoteUrl: 'https://example.invalid/enriched.git' };
+    state.listRegisteredRepos.mockResolvedValue([enrichedRepo]);
     state.currentMeta = makeMeta(LIVE_DIGEST);
     state.currentMeta.stats = { nodes: 17, edges: 19, embeddings: 3 };
     state.currentMeta.embeddingCheckpoint = {
@@ -484,6 +486,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
       { name: REPO.name, allowDuplicateName: true },
     );
     expect(state.currentMeta.stats).toEqual({ nodes: 4, edges: 5, embeddings: 0 });
+    expect(state.currentMeta.remoteUrl).toBeUndefined();
     expect(state.currentMeta.embeddingCheckpoint).toBeUndefined();
   });
 

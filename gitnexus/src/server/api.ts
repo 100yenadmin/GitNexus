@@ -145,10 +145,11 @@ const assertZeroClearRegistryOwner = async (
   }
 
   const owner = owners[0];
+  const clearedRemoteUrl = clearedMeta.remoteUrl?.trim() || undefined;
   if (
     owner.name !== entry.name ||
     owner.remoteUrl !== entry.remoteUrl ||
-    owner.remoteUrl !== clearedMeta.remoteUrl ||
+    (clearedRemoteUrl !== undefined && owner.remoteUrl !== clearedRemoteUrl) ||
     owner.branch !== entry.branch ||
     owner.branch !== clearedMeta.branch
   ) {
