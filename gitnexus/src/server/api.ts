@@ -19,6 +19,7 @@ import {
   cloneDirBelongsToEntry,
   loadMeta,
   saveMeta,
+  registerRepo,
   listRegisteredRepos,
   getStoragePath,
   registryPathEquals,
@@ -2076,9 +2077,13 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                     stats: { ...embeddingMeta.stats, ...graphStats, embeddings: 0 },
                     embeddingCheckpoint: undefined,
                   };
-                  await commitEmbedMetadata(barrier, 'COMMITTING_TERMINAL', () =>
-                    saveMeta(entry.storagePath, clearedMeta),
-                  );
+                  await commitEmbedMetadata(barrier, 'COMMITTING_TERMINAL', async () => {
+                    await registerRepo(entry.path, clearedMeta, {
+                      name: entry.name,
+                      allowDuplicateName: true,
+                    });
+                    await saveMeta(entry.storagePath, clearedMeta);
+                  });
                   embeddingMeta = clearedMeta;
                   return;
                 }
