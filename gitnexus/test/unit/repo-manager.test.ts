@@ -1031,6 +1031,120 @@ describe('registerRepo branch nesting (#2106)', () => {
   });
 });
 
+describe('registerRepo expected owner CAS (#264)', () => {
+  let tmpHome: Awaited<ReturnType<typeof createTempDir>>;
+  let tmpRepo: Awaited<ReturnType<typeof createTempDir>>;
+  let savedGitnexusHome: string | undefined;
+  const casError = 'GitNexus: expected registry owner changed during locked commit';
+
+  const meta = (lastCommit: string): RepoMeta => ({
+    repoPath: tmpRepo.dbPath,
+    lastCommit,
+    indexedAt: '2026-08-24T00:00:00.000Z',
+    branch: 'main',
+  });
+  const owner = (): RegistryEntry => ({
+    name: 'cas-owner',
+    path: tmpRepo.dbPath,
+    storagePath: getStoragePath(tmpRepo.dbPath),
+    indexedAt: '2026-08-23T00:00:00.000Z',
+    lastCommit: 'old',
+    branch: 'main',
+    branches: [{ branch: 'feature/x', indexedAt: 'earlier', lastCommit: 'branch-old' }],
+  });
+
+  beforeEach(async () => {
+    tmpHome = await createTempDir('gitnexus-registry-owner-cas-home-');
+    tmpRepo = await createTempDir('gitnexus-registry-owner-cas-repo-');
+    savedGitnexusHome = process.env.GITNEXUS_HOME;
+    process.env.GITNEXUS_HOME = tmpHome.dbPath;
+  });
+
+  afterEach(async () => {
+    if (savedGitnexusHome === undefined) delete process.env.GITNEXUS_HOME;
+    else process.env.GITNEXUS_HOME = savedGitnexusHome;
+    await tmpHome.cleanup();
+    await tmpRepo.cleanup();
+  });
+
+  it('updates the matched fresh owner while preserving branches and unrelated entries', async () => {
+    const expected = owner();
+    const unrelated = {
+      ...owner(),
+      name: 'other',
+      path: '/virtual/other',
+      storagePath: '/virtual/other/.gitnexus',
+    };
+    await fs.writeFile(
+      path.join(tmpHome.dbPath, 'registry.json'),
+      JSON.stringify([expected, unrelated]),
+    );
+
+    await registerRepo(tmpRepo.dbPath, meta('new'), {
+      name: expected.name,
+      expectedOwner: expected,
+    });
+
+    const entries = await readRegistry();
+    expect(entries[0].lastCommit).toBe('new');
+    expect(entries[0].branches).toEqual(expected.branches);
+    expect(entries[1]).toEqual(unrelated);
+  });
+
+  it.each([
+    ['missing', () => []],
+    ['duplicate', (entry: RegistryEntry) => [entry, { ...entry }]],
+    ['path drift', (entry: RegistryEntry) => [{ ...entry, path: '/virtual/moved' }]],
+    [
+      'storage drift',
+      (entry: RegistryEntry) => [{ ...entry, storagePath: '/virtual/moved/.gitnexus' }],
+    ],
+    ['alias drift', (entry: RegistryEntry) => [{ ...entry, name: 'changed' }]],
+    [
+      'remote drift',
+      (entry: RegistryEntry) => [{ ...entry, remoteUrl: 'https://example.invalid/changed.git' }],
+    ],
+    ['branch drift', (entry: RegistryEntry) => [{ ...entry, branch: 'changed' }]],
+  ])('rejects %s without changing registry bytes', async (_label, mutate) => {
+    const expected = owner();
+    const registryPath = path.join(tmpHome.dbPath, 'registry.json');
+    await fs.writeFile(registryPath, JSON.stringify(mutate(expected), null, 2));
+    const before = await fs.readFile(registryPath, 'utf8');
+
+    await expect(
+      registerRepo(tmpRepo.dbPath, meta('new'), { expectedOwner: expected }),
+    ).rejects.toThrow(casError);
+    expect(await fs.readFile(registryPath, 'utf8')).toBe(before);
+  });
+
+  it('rejects when the owner changes after the outer read but before the locked read', async () => {
+    const expected = owner();
+    const registryPath = path.join(tmpHome.dbPath, 'registry.json');
+    const lockPath = `${registryPath}.lock`;
+    await fs.writeFile(registryPath, JSON.stringify([expected]));
+    await fs.writeFile(
+      lockPath,
+      JSON.stringify({
+        schema: 'gitnexus.registry-lock/v1',
+        pid: process.pid,
+        nonce: 'held',
+        startedAt: new Date().toISOString(),
+      }),
+    );
+    const openSpy = vi.spyOn(fs, 'open');
+    const pending = registerRepo(tmpRepo.dbPath, meta('new'), {
+      expectedOwner: expected,
+    });
+    await vi.waitFor(() => expect(openSpy).toHaveBeenCalledWith(lockPath, 'wx', 0o600));
+    await fs.writeFile(registryPath, '[]');
+    await fs.rm(lockPath);
+
+    await expect(pending).rejects.toThrow(casError);
+    expect(await fs.readFile(registryPath, 'utf8')).toBe('[]');
+    openSpy.mockRestore();
+  });
+});
+
 // ─── parseRepoNameFromUrl + getInferredRepoName (#979) ───────────────
 
 describe('parseRepoNameFromUrl', () => {

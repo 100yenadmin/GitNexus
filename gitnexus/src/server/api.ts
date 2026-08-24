@@ -2154,6 +2154,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                     await registerRepo(owner.path, clearedMeta, {
                       name: owner.name,
                       allowDuplicateName: true,
+                      expectedOwner: owner,
                     });
                     await saveMeta(owner.storagePath, clearedMeta);
                   });

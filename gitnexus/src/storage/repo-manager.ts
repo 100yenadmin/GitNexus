@@ -1058,6 +1058,10 @@ const withRegistryMutationLock = async <T>(operation: () => Promise<T>): Promise
  * disambiguation requirement can keep calling `registerRepo(path, meta)`
  * unchanged.
  */
+type ExpectedRegistryOwner = Readonly<
+  Pick<RegistryEntry, 'name' | 'path' | 'storagePath' | 'remoteUrl' | 'branch'>
+>;
+
 export interface RegisterRepoOptions {
   /**
    * User-provided alias from `analyze --name <alias>` (#829). Overrides
@@ -1091,6 +1095,8 @@ export interface RegisterRepoOptions {
    * existing branch summaries).
    */
   branch?: string;
+  /** Internal compare-and-swap guard for a caller that just validated ownership. */
+  expectedOwner?: ExpectedRegistryOwner;
 }
 
 /**
@@ -1375,10 +1381,62 @@ export const registerRepo = async (
     // Close the analyze/index TOCTOU window: another process may have registered
     // this remote after the initial read but before our atomic registry write.
     assertRemoteIdentityAvailable(fresh, resolved, remoteUrl);
-    const freshIdx = fresh.findIndex((e) => {
-      const a = canonicalizePath(e.path);
-      return registryPathEquals(a, canonicalInput);
-    });
+    let freshIdx: number;
+    if (opts?.expectedOwner) {
+      const expected = opts.expectedOwner;
+      const expectedPath = path.isAbsolute(expected.path)
+        ? canonicalizePath(expected.path)
+        : undefined;
+      const expectedStorage = path.isAbsolute(expected.storagePath)
+        ? canonicalizePath(expected.storagePath)
+        : undefined;
+      const related = fresh
+        .map((owner, index) => ({ owner, index }))
+        .filter(({ owner }) => {
+          const ownerPath = path.isAbsolute(owner.path) ? canonicalizePath(owner.path) : undefined;
+          const ownerStorage = path.isAbsolute(owner.storagePath)
+            ? canonicalizePath(owner.storagePath)
+            : undefined;
+          return (
+            (ownerPath !== undefined &&
+              expectedPath !== undefined &&
+              registryPathEquals(ownerPath, expectedPath)) ||
+            (ownerStorage !== undefined &&
+              expectedStorage !== undefined &&
+              registryPathEquals(ownerStorage, expectedStorage))
+          );
+        });
+      const matches = related.filter(
+        ({ owner }) =>
+          path.isAbsolute(owner.path) &&
+          path.isAbsolute(owner.storagePath) &&
+          expectedPath !== undefined &&
+          expectedStorage !== undefined &&
+          registryPathEquals(canonicalizePath(owner.path), expectedPath) &&
+          registryPathEquals(canonicalizePath(owner.storagePath), expectedStorage),
+      );
+      const match = matches[0];
+      if (
+        !expectedPath ||
+        !expectedStorage ||
+        !registryPathEquals(expectedPath, canonicalInput) ||
+        !registryPathEquals(expectedStorage, canonicalizePath(getStoragePath(expected.path))) ||
+        !registryPathEquals(expectedStorage, canonicalizePath(storagePath)) ||
+        related.length !== 1 ||
+        matches.length !== 1 ||
+        match.owner.name !== expected.name ||
+        normalizeRepositoryRemote(match.owner.remoteUrl) !==
+          normalizeRepositoryRemote(expected.remoteUrl) ||
+        match.owner.branch !== expected.branch
+      ) {
+        throw new Error('GitNexus: expected registry owner changed during locked commit');
+      }
+      freshIdx = match.index;
+    } else {
+      freshIdx = fresh.findIndex((e) =>
+        registryPathEquals(canonicalizePath(e.path), canonicalInput),
+      );
+    }
     const freshExisting = freshIdx >= 0 ? fresh[freshIdx] : null;
     let merged: RegistryEntry;
     if (summary) {

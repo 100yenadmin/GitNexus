@@ -483,7 +483,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
         stats: { nodes: 4, edges: 5, embeddings: 0 },
         embeddingCheckpoint: undefined,
       }),
-      { name: REPO.name, allowDuplicateName: true },
+      { name: REPO.name, allowDuplicateName: true, expectedOwner: enrichedRepo },
     );
     expect(state.currentMeta.stats).toEqual({ nodes: 4, edges: 5, embeddings: 0 });
     expect(state.currentMeta.remoteUrl).toBeUndefined();
@@ -577,7 +577,9 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     };
     state.liveIntegrity = makeIntegrity(LIVE_DIGEST, 0);
     state.executeQuery.mockResolvedValue([]);
-    state.registerRepo.mockRejectedValueOnce(new Error('registry persistence failed'));
+    state.registerRepo.mockRejectedValueOnce(
+      new Error('GitNexus: expected registry owner changed during locked commit'),
+    );
     const checkpointBefore = JSON.stringify(state.currentMeta.embeddingCheckpoint);
 
     const response = await fetch(`${baseUrl}/api/embed`, {
@@ -588,7 +590,10 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     const { jobId } = (await response.json()) as { jobId: string };
     const job = await waitForTerminalJob(baseUrl, jobId);
 
-    expect(job).toMatchObject({ status: 'failed', error: 'registry persistence failed' });
+    expect(job).toMatchObject({
+      status: 'failed',
+      error: 'GitNexus: expected registry owner changed during locked commit',
+    });
     expect(state.registerRepo).toHaveBeenCalledOnce();
     expect(state.saveMeta).not.toHaveBeenCalled();
     expect(JSON.stringify(state.currentMeta.embeddingCheckpoint)).toBe(checkpointBefore);
