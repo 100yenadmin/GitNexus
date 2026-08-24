@@ -47,6 +47,7 @@ import {
   getStoragePath,
   readRegistry,
   registerRepo,
+  removeBranchIndex,
   unregisterRepo,
   type RegistryEntry,
   type RepoMeta,
@@ -139,5 +140,26 @@ describe('simple registry writers share the mutation lock (#266)', () => {
     );
     expect(await readRegistry()).toEqual([other]);
     expect(await fs.readFile(registryPath, 'utf8')).toBe(JSON.stringify([other], null, 2));
+  });
+
+  it('preserves branch removal and unrelated entries when registration commits second', async () => {
+    const expected = owner();
+    const other = unrelated();
+    await fs.writeFile(registryPath, JSON.stringify([expected, other]));
+    const gate = pauseNextRegistryRead();
+    const removing = removeBranchIndex(repo.dbPath, 'feature/x');
+    await gate.entered;
+    const registering = registerRepo(repo.dbPath, meta(), {
+      name: expected.name,
+      expectedOwner: expected,
+    });
+    await waitForContentionOrCommit();
+    gate.release();
+
+    await expect(removing).resolves.toBe(true);
+    await expect(registering).resolves.toBe('owner');
+    const entries = await readRegistry();
+    expect(entries[0]).toMatchObject({ lastCommit: 'new', branches: [expected.branches![1]] });
+    expect(entries[1]).toEqual(other);
   });
 });
