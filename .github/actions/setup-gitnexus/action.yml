@@ -27,7 +27,7 @@ runs:
       working-directory: gitnexus
 
     - name: Verify optional transformer dependency
-      run: node -e "console.log(require.resolve('@huggingface/transformers'))"
+      run: node -e "for (const packageName of ['@huggingface/transformers', 'onnxruntime-node']) console.log(require.resolve(packageName))"
       shell: bash
       working-directory: gitnexus
 
