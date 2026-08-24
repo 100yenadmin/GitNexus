@@ -31,7 +31,7 @@ import {
   executeWithReusedStatement,
   streamQuery,
   flushWAL,
-  getLbugStats,
+  getStrictLbugStats,
   closeLbug,
   withLbugReadOnlyNonRecovering,
   withLbugDb,
@@ -2069,7 +2069,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                 );
                 if (!graphHasNodes) {
                   embedController.signal.throwIfAborted();
-                  const graphStats = await getLbugStats();
+                  const graphStats = await getStrictLbugStats();
                   embedController.signal.throwIfAborted();
                   const clearedMeta = {
                     ...embeddingMeta,

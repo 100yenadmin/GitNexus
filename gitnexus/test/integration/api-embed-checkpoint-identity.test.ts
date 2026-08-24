@@ -75,7 +75,7 @@ const state = {
   runEmbeddingPipeline: vi.fn(async (..._args: unknown[]) => undefined),
   getActiveEmbeddingIdentity: vi.fn(() => identity),
   inspectEmbeddingIntegrity: vi.fn(async () => state.liveIntegrity),
-  getLbugStats: vi.fn(async () => ({ nodes: 4, edges: 5 })),
+  getStrictLbugStats: vi.fn(async () => ({ nodes: 4, edges: 5 })),
   saveMeta: vi.fn(async (_storagePath: string, next: RepoMeta) => {
     state.currentMeta = next;
   }),
@@ -116,7 +116,7 @@ vi.doMock('../../src/core/lbug/lbug-adapter.js', async () => ({
   isReadOnlyDbError: vi.fn(() => false),
   queryFTS: vi.fn(async () => []),
   inspectEmbeddingIntegrity: state.inspectEmbeddingIntegrity,
-  getLbugStats: state.getLbugStats,
+  getStrictLbugStats: state.getStrictLbugStats,
   embeddingIntegrityFailures: vi.fn(() => 0),
   fetchExistingEmbeddingHashes: vi.fn(async () => undefined),
 }));
@@ -229,7 +229,8 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     state.getActiveEmbeddingIdentity.mockClear();
     state.inspectEmbeddingIntegrity.mockReset();
     state.inspectEmbeddingIntegrity.mockImplementation(async () => state.liveIntegrity);
-    state.getLbugStats.mockClear();
+    state.getStrictLbugStats.mockReset();
+    state.getStrictLbugStats.mockResolvedValue({ nodes: 4, edges: 5 });
     state.runEmbeddingPipeline.mockReset();
     state.runEmbeddingPipeline.mockResolvedValue(undefined);
     state.saveMeta.mockClear();
@@ -457,13 +458,45 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     expect(state.openModes).toEqual([true, undefined]);
     expect(state.closeLbug).toHaveBeenCalledOnce();
     expect(state.runEmbeddingPipeline).not.toHaveBeenCalled();
-    expect(state.getLbugStats).toHaveBeenCalledOnce();
-    expect(state.getLbugStats.mock.invocationCallOrder[0]).toBeLessThan(
+    expect(state.getStrictLbugStats).toHaveBeenCalledOnce();
+    expect(state.getStrictLbugStats.mock.invocationCallOrder[0]).toBeLessThan(
       state.saveMeta.mock.invocationCallOrder[0],
     );
     expect(state.currentMeta.stats).toEqual({ nodes: 4, edges: 5, embeddings: 0 });
     expect(state.currentMeta.embeddingCheckpoint).toBeUndefined();
   });
+
+  it.each(['node count failed', 'edge count failed'])(
+    'retains the checkpoint when strict stats rejects: %s',
+    async (message) => {
+      state.currentMeta = makeMeta(LIVE_DIGEST);
+      state.currentMeta.embeddingCheckpoint = {
+        ...state.currentMeta.embeddingCheckpoint!,
+        nodesProcessed: 0,
+        totalNodes: 0,
+        provider: undefined,
+        physicalRows: undefined,
+        validRows: undefined,
+        recoverableIdentitySha256: undefined,
+      };
+      state.liveIntegrity = makeIntegrity(LIVE_DIGEST, 0);
+      state.executeQuery.mockResolvedValue([]);
+      state.getStrictLbugStats.mockRejectedValueOnce(new Error(message));
+      const checkpointBefore = JSON.stringify(state.currentMeta.embeddingCheckpoint);
+
+      const response = await fetch(`${baseUrl}/api/embed`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ repo: REPO.name }),
+      });
+      const { jobId } = (await response.json()) as { jobId: string };
+      const job = await waitForTerminalJob(baseUrl, jobId);
+
+      expect(job).toMatchObject({ status: 'failed', error: message });
+      expect(state.saveMeta).not.toHaveBeenCalled();
+      expect(JSON.stringify(state.currentMeta.embeddingCheckpoint)).toBe(checkpointBefore);
+    },
+  );
 
   it('runs the pipeline after read-only proof finds current graph nodes', async () => {
     state.currentMeta = makeMeta(LIVE_DIGEST);
