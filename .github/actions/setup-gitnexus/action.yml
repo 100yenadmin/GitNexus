@@ -22,7 +22,12 @@ runs:
       working-directory: gitnexus-shared
 
     - name: Install dependencies
-      run: npm ci
+      run: npm ci --include=optional
+      shell: bash
+      working-directory: gitnexus
+
+    - name: Verify optional transformer dependency
+      run: node -e "console.log(require.resolve('@huggingface/transformers'))"
       shell: bash
       working-directory: gitnexus
 
