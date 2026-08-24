@@ -475,7 +475,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
         stats: { nodes: 4, edges: 5, embeddings: 0 },
         embeddingCheckpoint: undefined,
       }),
-      { name: REPO.name },
+      { name: REPO.name, allowDuplicateName: true },
     );
     expect(state.currentMeta.stats).toEqual({ nodes: 4, edges: 5, embeddings: 0 });
     expect(state.currentMeta.embeddingCheckpoint).toBeUndefined();
