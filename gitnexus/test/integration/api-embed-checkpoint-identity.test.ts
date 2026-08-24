@@ -240,6 +240,8 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     state.saveMeta.mockClear();
     state.loadMeta.mockReset();
     state.loadMeta.mockImplementation(async () => state.currentMeta);
+    state.listRegisteredRepos.mockReset();
+    state.listRegisteredRepos.mockResolvedValue([REPO]);
     state.deleteHandlerStarted = undefined;
   });
 
@@ -464,6 +466,10 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     expect(state.runEmbeddingPipeline).not.toHaveBeenCalled();
     expect(state.getStrictLbugStats).toHaveBeenCalledOnce();
     expect(state.getStrictLbugStats.mock.invocationCallOrder[0]).toBeLessThan(
+      state.listRegisteredRepos.mock.invocationCallOrder[1],
+    );
+    expect(state.listRegisteredRepos).toHaveBeenCalledTimes(2);
+    expect(state.listRegisteredRepos.mock.invocationCallOrder[1]).toBeLessThan(
       state.registerRepo.mock.invocationCallOrder[0],
     );
     expect(state.registerRepo.mock.invocationCallOrder[0]).toBeLessThan(
@@ -479,6 +485,80 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     );
     expect(state.currentMeta.stats).toEqual({ nodes: 4, edges: 5, embeddings: 0 });
     expect(state.currentMeta.embeddingCheckpoint).toBeUndefined();
+  });
+
+  it.each<{ label: string; entries: RegistryEntry[]; error: RegExp }>([
+    { label: 'missing owner', entries: [], error: /canonical registry entry is missing/ },
+    {
+      label: 'duplicate owners',
+      entries: [REPO, { ...REPO }],
+      error: /canonical registry has duplicate entries/,
+    },
+    {
+      label: 'nonabsolute path',
+      entries: [{ ...REPO, path: 'relative/checkpoint-fixture' }],
+      error: /path\/storage identity is non-absolute or mismatched/,
+    },
+    {
+      label: 'nonabsolute storage',
+      entries: [{ ...REPO, storagePath: 'relative/.gitnexus' }],
+      error: /path\/storage identity is non-absolute or mismatched/,
+    },
+    {
+      label: 'mismatched path',
+      entries: [{ ...REPO, path: '/virtual/other-checkpoint-fixture' }],
+      error: /path\/storage identity is non-absolute or mismatched/,
+    },
+    {
+      label: 'mismatched storage',
+      entries: [{ ...REPO, storagePath: '/virtual/other-checkpoint-fixture/.gitnexus' }],
+      error: /path\/storage identity is non-absolute or mismatched/,
+    },
+    {
+      label: 'alias drift',
+      entries: [{ ...REPO, name: 'changed-alias' }],
+      error: /registry owner identity changed/,
+    },
+    {
+      label: 'remote drift',
+      entries: [{ ...REPO, remoteUrl: 'https://example.invalid/changed.git' }],
+      error: /registry owner identity changed/,
+    },
+    {
+      label: 'branch drift',
+      entries: [{ ...REPO, branch: 'changed-branch' }],
+      error: /registry owner identity changed/,
+    },
+  ])('rejects $label before either zero-checkpoint write', async ({ entries, error }) => {
+    state.currentMeta = makeMeta(LIVE_DIGEST);
+    state.currentMeta.embeddingCheckpoint = {
+      ...state.currentMeta.embeddingCheckpoint!,
+      nodesProcessed: 0,
+      totalNodes: 0,
+      provider: undefined,
+      physicalRows: undefined,
+      validRows: undefined,
+      recoverableIdentitySha256: undefined,
+    };
+    state.liveIntegrity = makeIntegrity(LIVE_DIGEST, 0);
+    state.executeQuery.mockResolvedValue([]);
+    state.listRegisteredRepos.mockResolvedValueOnce([REPO]).mockResolvedValueOnce(entries);
+    const checkpointBefore = JSON.stringify(state.currentMeta.embeddingCheckpoint);
+
+    const response = await fetch(`${baseUrl}/api/embed`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ repo: REPO.name }),
+    });
+    const { jobId } = (await response.json()) as { jobId: string };
+    const job = await waitForTerminalJob(baseUrl, jobId);
+
+    expect(job.status).toBe('failed');
+    expect(job.error).toMatch(error);
+    expect(state.listRegisteredRepos).toHaveBeenCalledTimes(2);
+    expect(state.registerRepo).not.toHaveBeenCalled();
+    expect(state.saveMeta).not.toHaveBeenCalled();
+    expect(JSON.stringify(state.currentMeta.embeddingCheckpoint)).toBe(checkpointBefore);
   });
 
   it('fails before primary metadata when zero-checkpoint registry persistence rejects', async () => {

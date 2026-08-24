@@ -86,6 +86,77 @@ const embeddingMetaFingerprint = (meta: RepoMeta): string =>
   createHash('sha256').update(JSON.stringify(meta)).digest('hex');
 const FILE_PREFLIGHT_PAGE_SIZE = 256;
 
+const assertZeroClearRegistryOwner = async (
+  entry: RegistryEntry,
+  clearedMeta: RepoMeta,
+): Promise<RegistryEntry> => {
+  if (
+    !path.isAbsolute(entry.path) ||
+    !path.isAbsolute(entry.storagePath) ||
+    !path.isAbsolute(clearedMeta.repoPath)
+  ) {
+    throw new Error(
+      'Cannot finalize zero-checkpoint embedding: path/storage identity is non-absolute or mismatched',
+    );
+  }
+  const expectedPath = canonicalizePath(entry.path);
+  const expectedStoragePath = canonicalizePath(getStoragePath(entry.path));
+  if (
+    !registryPathEquals(canonicalizePath(entry.storagePath), expectedStoragePath) ||
+    !registryPathEquals(canonicalizePath(clearedMeta.repoPath), expectedPath)
+  ) {
+    throw new Error(
+      'Cannot finalize zero-checkpoint embedding: path/storage identity is non-absolute or mismatched',
+    );
+  }
+
+  const relatedOwners = (await listRegisteredRepos()).filter((owner) => {
+    const ownerPath = path.isAbsolute(owner.path) ? canonicalizePath(owner.path) : undefined;
+    const ownerStoragePath = path.isAbsolute(owner.storagePath)
+      ? canonicalizePath(owner.storagePath)
+      : undefined;
+    return (
+      (ownerPath !== undefined && registryPathEquals(ownerPath, expectedPath)) ||
+      (ownerStoragePath !== undefined && registryPathEquals(ownerStoragePath, expectedStoragePath))
+    );
+  });
+  if (relatedOwners.length === 0) {
+    throw new Error(
+      'Cannot finalize zero-checkpoint embedding: canonical registry entry is missing',
+    );
+  }
+
+  const owners = relatedOwners.filter(
+    (owner) =>
+      path.isAbsolute(owner.path) &&
+      path.isAbsolute(owner.storagePath) &&
+      registryPathEquals(canonicalizePath(owner.path), expectedPath) &&
+      registryPathEquals(canonicalizePath(owner.storagePath), expectedStoragePath),
+  );
+  if (owners.length > 1) {
+    throw new Error(
+      'Cannot finalize zero-checkpoint embedding: canonical registry has duplicate entries',
+    );
+  }
+  if (owners.length !== 1 || relatedOwners.length !== 1) {
+    throw new Error(
+      'Cannot finalize zero-checkpoint embedding: path/storage identity is non-absolute or mismatched',
+    );
+  }
+
+  const owner = owners[0];
+  if (
+    owner.name !== entry.name ||
+    owner.remoteUrl !== entry.remoteUrl ||
+    owner.remoteUrl !== clearedMeta.remoteUrl ||
+    owner.branch !== entry.branch ||
+    owner.branch !== clearedMeta.branch
+  ) {
+    throw new Error('Cannot finalize zero-checkpoint embedding: registry owner identity changed');
+  }
+  return owner;
+};
+
 export type EmbedCommitPhase =
   | 'RUNNING'
   | 'COMMITTING_CHECKPOINT'
@@ -2078,11 +2149,12 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                     embeddingCheckpoint: undefined,
                   };
                   await commitEmbedMetadata(barrier, 'COMMITTING_TERMINAL', async () => {
-                    await registerRepo(entry.path, clearedMeta, {
-                      name: entry.name,
+                    const owner = await assertZeroClearRegistryOwner(entry, clearedMeta);
+                    await registerRepo(owner.path, clearedMeta, {
+                      name: owner.name,
                       allowDuplicateName: true,
                     });
-                    await saveMeta(entry.storagePath, clearedMeta);
+                    await saveMeta(owner.storagePath, clearedMeta);
                   });
                   embeddingMeta = clearedMeta;
                   return;
