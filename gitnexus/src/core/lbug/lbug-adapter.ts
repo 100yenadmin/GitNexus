@@ -7,7 +7,7 @@ import path from 'path';
 import lbug from '@ladybugdb/core';
 import { closeQueryResults } from './query-result-utils.js';
 import { escapeCypherString } from './cypher-escape.js';
-import { isMissingColumnOrTableError } from './schema-errors.js';
+import { isExpectedMissingTableError, isMissingColumnOrTableError } from './schema-errors.js';
 import { withConnLock } from './conn-lock.js';
 import { isWalDriverActive } from './wal-driver-state.js';
 import { KnowledgeGraph } from '../graph/types.js';
@@ -1816,6 +1816,61 @@ export const getLbugStats = async (): Promise<{ nodes: number; edges: number }> 
   }
 
   return { nodes: totalNodes, edges: totalEdges };
+};
+
+type StrictCountRow = { cnt?: unknown; 0?: unknown };
+type StrictCountQuery = (cypher: string) => Promise<StrictCountRow[]>;
+
+const queryStrictCount = async (
+  tableName: string,
+  cypher: string,
+  runQuery: StrictCountQuery,
+): Promise<number> => {
+  try {
+    const rows = await runQuery(cypher);
+    const row = rows.length === 1 ? rows[0] : undefined;
+    const rawCount = row?.cnt ?? row?.[0];
+    if (typeof rawCount !== 'number' && typeof rawCount !== 'bigint') {
+      throw new Error(`Invalid graph count returned for ${tableName}`);
+    }
+    const count = Number(rawCount);
+    if (!Number.isSafeInteger(count) || count < 0) {
+      throw new Error(`Invalid graph count returned for ${tableName}`);
+    }
+    return count;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (isExpectedMissingTableError(message, tableName)) return 0;
+    throw error;
+  }
+};
+
+/** Fail-closed graph counts for the /api/embed zero-checkpoint commit path. */
+export const getStrictLbugStats = async (
+  queryOverride?: StrictCountQuery,
+): Promise<{ nodes: number; edges: number }> => {
+  let runQuery = queryOverride;
+  if (!runQuery) {
+    const c = conn;
+    if (!c) throw new Error('LadybugDB not initialized. Call initLbug first.');
+    runQuery = (cypher: string) => withConnLock(async () => readQueryRows(await c.query(cypher)));
+  }
+
+  let nodes = 0;
+  for (const tableName of NODE_TABLES) {
+    nodes += await queryStrictCount(
+      tableName,
+      `MATCH (n:${escapeTableName(tableName)}) RETURN count(n) AS cnt`,
+      runQuery,
+    );
+    if (!Number.isSafeInteger(nodes)) throw new Error('Invalid total graph node count');
+  }
+  const edges = await queryStrictCount(
+    REL_TABLE_NAME,
+    `MATCH ()-[r:${REL_TABLE_NAME}]->() RETURN count(r) AS cnt`,
+    runQuery,
+  );
+  return { nodes, edges };
 };
 
 /**
