@@ -1830,7 +1830,10 @@ const queryStrictCount = async (
     const rows = await runQuery(cypher);
     const row = rows.length === 1 ? rows[0] : undefined;
     const rawCount = row?.cnt ?? row?.[0];
-    const count = typeof rawCount === 'bigint' ? Number(rawCount) : rawCount;
+    if (typeof rawCount !== 'number' && typeof rawCount !== 'bigint') {
+      throw new Error(`Invalid graph count returned for ${tableName}`);
+    }
+    const count = Number(rawCount);
     if (!Number.isSafeInteger(count) || count < 0) {
       throw new Error(`Invalid graph count returned for ${tableName}`);
     }

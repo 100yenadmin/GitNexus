@@ -466,37 +466,35 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     expect(state.currentMeta.embeddingCheckpoint).toBeUndefined();
   });
 
-  it.each(['node count failed', 'edge count failed'])(
-    'retains the checkpoint when strict stats rejects: %s',
-    async (message) => {
-      state.currentMeta = makeMeta(LIVE_DIGEST);
-      state.currentMeta.embeddingCheckpoint = {
-        ...state.currentMeta.embeddingCheckpoint!,
-        nodesProcessed: 0,
-        totalNodes: 0,
-        provider: undefined,
-        physicalRows: undefined,
-        validRows: undefined,
-        recoverableIdentitySha256: undefined,
-      };
-      state.liveIntegrity = makeIntegrity(LIVE_DIGEST, 0);
-      state.executeQuery.mockResolvedValue([]);
-      state.getStrictLbugStats.mockRejectedValueOnce(new Error(message));
-      const checkpointBefore = JSON.stringify(state.currentMeta.embeddingCheckpoint);
+  it('retains the checkpoint when strict stats rejects', async () => {
+    const message = 'strict graph count failed';
+    state.currentMeta = makeMeta(LIVE_DIGEST);
+    state.currentMeta.embeddingCheckpoint = {
+      ...state.currentMeta.embeddingCheckpoint!,
+      nodesProcessed: 0,
+      totalNodes: 0,
+      provider: undefined,
+      physicalRows: undefined,
+      validRows: undefined,
+      recoverableIdentitySha256: undefined,
+    };
+    state.liveIntegrity = makeIntegrity(LIVE_DIGEST, 0);
+    state.executeQuery.mockResolvedValue([]);
+    state.getStrictLbugStats.mockRejectedValueOnce(new Error(message));
+    const checkpointBefore = JSON.stringify(state.currentMeta.embeddingCheckpoint);
 
-      const response = await fetch(`${baseUrl}/api/embed`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ repo: REPO.name }),
-      });
-      const { jobId } = (await response.json()) as { jobId: string };
-      const job = await waitForTerminalJob(baseUrl, jobId);
+    const response = await fetch(`${baseUrl}/api/embed`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ repo: REPO.name }),
+    });
+    const { jobId } = (await response.json()) as { jobId: string };
+    const job = await waitForTerminalJob(baseUrl, jobId);
 
-      expect(job).toMatchObject({ status: 'failed', error: message });
-      expect(state.saveMeta).not.toHaveBeenCalled();
-      expect(JSON.stringify(state.currentMeta.embeddingCheckpoint)).toBe(checkpointBefore);
-    },
-  );
+    expect(job).toMatchObject({ status: 'failed', error: message });
+    expect(state.saveMeta).not.toHaveBeenCalled();
+    expect(JSON.stringify(state.currentMeta.embeddingCheckpoint)).toBe(checkpointBefore);
+  });
 
   it('runs the pipeline after read-only proof finds current graph nodes', async () => {
     state.currentMeta = makeMeta(LIVE_DIGEST);

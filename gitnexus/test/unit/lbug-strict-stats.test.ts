@@ -2,6 +2,9 @@ import { describe, expect, it, vi } from 'vitest';
 import { getStrictLbugStats } from '../../src/core/lbug/lbug-adapter.js';
 import { NODE_TABLES, REL_TABLE_NAME } from '../../src/core/lbug/schema.js';
 
+const BACKTICK_TABLE_NAMES =
+  /^(Struct|Enum|Macro|Typedef|Union|Namespace|Trait|Impl|TypeAlias|Const|Static|Property|Record|Delegate|Annotation|Constructor|Template|Module)$/;
+
 describe('getStrictLbugStats', () => {
   it('fails without an active connection', async () => {
     await expect(getStrictLbugStats()).rejects.toThrow('LadybugDB not initialized');
@@ -20,7 +23,8 @@ describe('getStrictLbugStats', () => {
     });
     expect(queries).toHaveLength(NODE_TABLES.length + 1);
     for (const tableName of NODE_TABLES) {
-      expect(queries).toContain(`MATCH (n:\`${tableName}\`) RETURN count(n) AS cnt`);
+      const label = BACKTICK_TABLE_NAMES.test(tableName) ? `\`${tableName}\`` : tableName;
+      expect(queries).toContain(`MATCH (n:${label}) RETURN count(n) AS cnt`);
     }
     expect(queries.at(-1)).toBe(`MATCH ()-[r:${REL_TABLE_NAME}]->() RETURN count(r) AS cnt`);
   });
@@ -71,5 +75,15 @@ describe('getStrictLbugStats', () => {
     await expect(
       getStrictLbugStats(async () => [{ cnt: Number.MAX_SAFE_INTEGER }]),
     ).rejects.toThrow('Invalid total graph node count');
+  });
+
+  it('propagates an edge-query failure after every node count succeeds', async () => {
+    const runQuery = vi.fn(async (query: string) => {
+      if (query.includes(`:${REL_TABLE_NAME}`)) throw new Error('edge query failed');
+      return [{ cnt: 1 }];
+    });
+
+    await expect(getStrictLbugStats(runQuery)).rejects.toThrow('edge query failed');
+    expect(runQuery).toHaveBeenCalledTimes(NODE_TABLES.length + 1);
   });
 });
