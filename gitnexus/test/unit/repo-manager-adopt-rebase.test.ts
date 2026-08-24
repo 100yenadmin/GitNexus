@@ -33,6 +33,7 @@ import fs from 'fs/promises';
 import {
   adoptFlatBranchLabel,
   canonicalizePath,
+  getGlobalRegistryPath,
   getStoragePaths,
   listRegisteredRepos,
   registerRepo,
@@ -54,6 +55,19 @@ describe('adoptFlatBranchLabel registry rebase (#267)', () => {
     stats: { files: lastCommit.length, nodes: 1 },
   });
 
+  const holdNextRemoval = () => {
+    let release = () => undefined;
+    let announce = () => undefined;
+    const held = new Promise<void>((resolve) => (release = resolve));
+    const started = new Promise<void>((resolve) => (announce = resolve));
+    fsCtx.rmMock.mockImplementationOnce(async (...args) => {
+      announce();
+      await held;
+      return callRealRm(...args);
+    });
+    return { started, release };
+  };
+
   beforeEach(async () => {
     home = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-adopt-rebase-home-'));
     repo = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-adopt-rebase-repo-'));
@@ -71,39 +85,48 @@ describe('adoptFlatBranchLabel registry rebase (#267)', () => {
     await Promise.all([home, repo, otherRepo].map((dir) => callRealRm(dir, { recursive: true })));
   });
 
-  it('rebases under lock while recursive deletion is held outside it', async () => {
+  it('rejects primary drift without changing the concurrent registry bytes', async () => {
     await registerRepo(repo, metaFor('main', 'old-primary'), {
       name: 'old-alias',
     });
     await registerRepo(repo, metaFor('feature/x', 'old-branch'), {
       branch: 'feature/x',
     });
-    await registerRepo(repo, metaFor('feature/y', 'old-sibling'), {
-      branch: 'feature/y',
-    });
     await registerRepo(otherRepo, metaFor('main', 'other'));
     const { metaPath } = getStoragePaths(repo, 'feature/x');
     await saveMeta(path.dirname(metaPath), metaFor('feature/x', 'old-branch'));
 
+    const removal = holdNextRemoval();
+    const adoption = adoptFlatBranchLabel(repo, 'feature/x');
+    await removal.started;
+    await registerRepo(repo, metaFor('main', 'fresh-primary'), { name: 'fresh-alias' });
+    const concurrentBytes = await fs.readFile(getGlobalRegistryPath(), 'utf8');
+    const concurrentEntries = JSON.parse(concurrentBytes);
+    removal.release();
+
+    await expect(adoption).rejects.toThrow(
+      'registry owner changed during branch adoption; retry after concurrent indexing completes',
+    );
+    expect(await fs.readFile(getGlobalRegistryPath(), 'utf8')).toBe(concurrentBytes);
+    expect(await listRegisteredRepos()).toEqual(concurrentEntries);
+    await expect(fs.access(path.dirname(metaPath))).rejects.toThrow();
+  });
+
+  it('rebases branch-summary-only drift while recursive deletion is outside the lock', async () => {
+    await registerRepo(repo, metaFor('main', 'old-primary'), { name: 'old-alias' });
+    await registerRepo(repo, metaFor('feature/x', 'old-branch'), { branch: 'feature/x' });
+    await registerRepo(repo, metaFor('feature/y', 'old-sibling'), { branch: 'feature/y' });
+    await registerRepo(otherRepo, metaFor('main', 'other'));
+    const { metaPath } = getStoragePaths(repo, 'feature/x');
+    await saveMeta(path.dirname(metaPath), metaFor('feature/x', 'old-branch'));
     const beforeOther = (await listRegisteredRepos()).find(
       (entry) => canonicalizePath(entry.path) === canonicalizePath(otherRepo),
     );
-    let releaseRm = () => undefined;
-    let announceRm = () => undefined;
-    const rmHeld = new Promise<void>((resolve) => (releaseRm = resolve));
-    const rmStarted = new Promise<void>((resolve) => (announceRm = resolve));
-    fsCtx.rmMock.mockImplementationOnce(async (...args) => {
-      announceRm();
-      await rmHeld;
-      return callRealRm(...args);
-    });
 
+    const removal = holdNextRemoval();
     const adoption = adoptFlatBranchLabel(repo, 'feature/x');
-    await rmStarted;
+    await removal.started;
     const concurrent = (async () => {
-      await registerRepo(repo, metaFor('main', 'fresh-primary'), {
-        name: 'fresh-alias',
-      });
       await registerRepo(repo, metaFor('feature/x', 'fresh-branch'), {
         branch: 'feature/x',
       });
@@ -112,7 +135,7 @@ describe('adoptFlatBranchLabel registry rebase (#267)', () => {
       });
     })();
     await concurrent; // would deadlock/time out if recursive deletion held the registry lock
-    releaseRm();
+    removal.release();
     await adoption;
 
     const entries = await listRegisteredRepos();
@@ -120,9 +143,9 @@ describe('adoptFlatBranchLabel registry rebase (#267)', () => {
       (entry) => canonicalizePath(entry.path) === canonicalizePath(repo),
     );
     expect(adopted).toMatchObject({
-      name: 'fresh-alias',
+      name: 'old-alias',
       branch: 'feature/x',
-      lastCommit: 'fresh-primary',
+      lastCommit: 'old-primary',
     });
     expect(adopted?.branches).toEqual([
       expect.objectContaining({
