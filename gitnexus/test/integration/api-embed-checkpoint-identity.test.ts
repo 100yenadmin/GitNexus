@@ -76,6 +76,7 @@ const state = {
   getActiveEmbeddingIdentity: vi.fn(() => identity),
   inspectEmbeddingIntegrity: vi.fn(async () => state.liveIntegrity),
   getStrictLbugStats: vi.fn(async () => ({ nodes: 4, edges: 5 })),
+  registerRepo: vi.fn(async () => REPO.name),
   saveMeta: vi.fn(async (_storagePath: string, next: RepoMeta) => {
     state.currentMeta = next;
   }),
@@ -98,6 +99,7 @@ vi.doMock('../../src/storage/repo-manager.js', async () => ({
   )),
   listRegisteredRepos: state.listRegisteredRepos,
   loadMeta: state.loadMeta,
+  registerRepo: state.registerRepo,
   saveMeta: state.saveMeta,
 }));
 
@@ -233,6 +235,8 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     state.getStrictLbugStats.mockResolvedValue({ nodes: 4, edges: 5 });
     state.runEmbeddingPipeline.mockReset();
     state.runEmbeddingPipeline.mockResolvedValue(undefined);
+    state.registerRepo.mockReset();
+    state.registerRepo.mockResolvedValue(REPO.name);
     state.saveMeta.mockClear();
     state.loadMeta.mockReset();
     state.loadMeta.mockImplementation(async () => state.currentMeta);
@@ -460,8 +464,92 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     expect(state.runEmbeddingPipeline).not.toHaveBeenCalled();
     expect(state.getStrictLbugStats).toHaveBeenCalledOnce();
     expect(state.getStrictLbugStats.mock.invocationCallOrder[0]).toBeLessThan(
+      state.registerRepo.mock.invocationCallOrder[0],
+    );
+    expect(state.registerRepo.mock.invocationCallOrder[0]).toBeLessThan(
       state.saveMeta.mock.invocationCallOrder[0],
     );
+    expect(state.registerRepo).toHaveBeenCalledWith(
+      REPO.path,
+      expect.objectContaining({
+        stats: { nodes: 4, edges: 5, embeddings: 0 },
+        embeddingCheckpoint: undefined,
+      }),
+      { name: REPO.name },
+    );
+    expect(state.currentMeta.stats).toEqual({ nodes: 4, edges: 5, embeddings: 0 });
+    expect(state.currentMeta.embeddingCheckpoint).toBeUndefined();
+  });
+
+  it('fails before primary metadata when zero-checkpoint registry persistence rejects', async () => {
+    state.currentMeta = makeMeta(LIVE_DIGEST);
+    state.currentMeta.embeddingCheckpoint = {
+      ...state.currentMeta.embeddingCheckpoint!,
+      nodesProcessed: 0,
+      totalNodes: 0,
+      provider: undefined,
+      physicalRows: undefined,
+      validRows: undefined,
+      recoverableIdentitySha256: undefined,
+    };
+    state.liveIntegrity = makeIntegrity(LIVE_DIGEST, 0);
+    state.executeQuery.mockResolvedValue([]);
+    state.registerRepo.mockRejectedValueOnce(new Error('registry persistence failed'));
+    const checkpointBefore = JSON.stringify(state.currentMeta.embeddingCheckpoint);
+
+    const response = await fetch(`${baseUrl}/api/embed`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ repo: REPO.name }),
+    });
+    const { jobId } = (await response.json()) as { jobId: string };
+    const job = await waitForTerminalJob(baseUrl, jobId);
+
+    expect(job).toMatchObject({ status: 'failed', error: 'registry persistence failed' });
+    expect(state.registerRepo).toHaveBeenCalledOnce();
+    expect(state.saveMeta).not.toHaveBeenCalled();
+    expect(JSON.stringify(state.currentMeta.embeddingCheckpoint)).toBe(checkpointBefore);
+  });
+
+  it('fails after registry success when primary save rejects and retry converges', async () => {
+    state.currentMeta = makeMeta(LIVE_DIGEST);
+    state.currentMeta.embeddingCheckpoint = {
+      ...state.currentMeta.embeddingCheckpoint!,
+      nodesProcessed: 0,
+      totalNodes: 0,
+      provider: undefined,
+      physicalRows: undefined,
+      validRows: undefined,
+      recoverableIdentitySha256: undefined,
+    };
+    state.liveIntegrity = makeIntegrity(LIVE_DIGEST, 0);
+    state.executeQuery.mockResolvedValue([]);
+    state.saveMeta.mockRejectedValueOnce(new Error('primary persistence failed'));
+    const checkpointBefore = JSON.stringify(state.currentMeta.embeddingCheckpoint);
+
+    const firstResponse = await fetch(`${baseUrl}/api/embed`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ repo: REPO.name }),
+    });
+    const { jobId: firstJobId } = (await firstResponse.json()) as { jobId: string };
+    const failedJob = await waitForTerminalJob(baseUrl, firstJobId);
+
+    expect(failedJob).toMatchObject({ status: 'failed', error: 'primary persistence failed' });
+    expect(state.registerRepo).toHaveBeenCalledOnce();
+    expect(state.saveMeta).toHaveBeenCalledOnce();
+    expect(JSON.stringify(state.currentMeta.embeddingCheckpoint)).toBe(checkpointBefore);
+
+    const retryResponse = await fetch(`${baseUrl}/api/embed`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ repo: REPO.name }),
+    });
+    const { jobId: retryJobId } = (await retryResponse.json()) as { jobId: string };
+
+    expect((await waitForTerminalJob(baseUrl, retryJobId)).status).toBe('complete');
+    expect(state.registerRepo).toHaveBeenCalledTimes(2);
+    expect(state.saveMeta).toHaveBeenCalledTimes(2);
     expect(state.currentMeta.stats).toEqual({ nodes: 4, edges: 5, embeddings: 0 });
     expect(state.currentMeta.embeddingCheckpoint).toBeUndefined();
   });
