@@ -941,7 +941,7 @@ export const readRegistry = async (): Promise<RegistryEntry[]> => {
 };
 
 /**
- * Write the global registry to disk
+ * Write the global registry to disk. Call only while holding the registry mutation lock.
  */
 const writeRegistry = async (entries: RegistryEntry[]): Promise<void> => {
   const dir = getGlobalDir();
@@ -1474,9 +1474,11 @@ export const unregisterRepo = async (repoPath: string): Promise<void> => {
   // and vice versa. Matches the semantics of `registerRepo` and
   // `resolveRegistryEntry` post-#1003 review.
   const resolved = canonicalizePath(repoPath);
-  const entries = await readRegistry();
-  const filtered = entries.filter((e) => !registryPathEquals(canonicalizePath(e.path), resolved));
-  await writeRegistry(filtered);
+  await withRegistryMutationLock(async () => {
+    const entries = await readRegistry();
+    const filtered = entries.filter((e) => !registryPathEquals(canonicalizePath(e.path), resolved));
+    await writeRegistry(filtered);
+  });
 };
 
 /**
@@ -1489,19 +1491,21 @@ export const unregisterRepo = async (repoPath: string): Promise<void> => {
  */
 export const removeBranchIndex = async (repoPath: string, branch: string): Promise<boolean> => {
   const resolved = canonicalizePath(repoPath);
-  const entries = await readRegistry();
-  const idx = entries.findIndex((e) => registryPathEquals(canonicalizePath(e.path), resolved));
-  if (idx < 0) return false;
-  const entry = entries[idx];
-  const before = entry.branches?.length ?? 0;
-  if (!entry.branches || before === 0) return false;
-  const remaining = entry.branches.filter((b) => b.branch !== branch);
-  if (remaining.length === before) return false; // branch not recorded
-  if (remaining.length > 0) entry.branches = remaining;
-  else delete entry.branches;
-  entries[idx] = entry;
-  await writeRegistry(entries);
-  return true;
+  return withRegistryMutationLock(async () => {
+    const entries = await readRegistry();
+    const idx = entries.findIndex((e) => registryPathEquals(canonicalizePath(e.path), resolved));
+    if (idx < 0) return false;
+    const entry = entries[idx];
+    const before = entry.branches?.length ?? 0;
+    if (!entry.branches || before === 0) return false;
+    const remaining = entry.branches.filter((b) => b.branch !== branch);
+    if (remaining.length === before) return false; // branch not recorded
+    if (remaining.length > 0) entry.branches = remaining;
+    else delete entry.branches;
+    entries[idx] = entry;
+    await writeRegistry(entries);
+    return true;
+  });
 };
 
 /**
