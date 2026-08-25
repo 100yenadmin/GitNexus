@@ -833,9 +833,94 @@ const runFullAnalysisImpl = async (
   const promotionPaths = getStagedAnalyzePaths(canonicalPaths.lbugPath, canonicalMetaDir);
   const stagedPaths: StagedAnalyzePaths | undefined = options.staged ? promotionPaths : undefined;
 
-  const commitStagedMetadataAndRegistry = async (meta: RepoMeta): Promise<string> => {
-    await saveMeta(canonicalMetaDir, meta);
-    return registerRepo(repoPath, meta, {
+  // A plain analyze of the flat slot may be switching its informational
+  // branch label. Until registry adoption commits, every durable metadata
+  // projection retains exactly the branch property that existed at entry
+  // (including property absence). This keeps checkpoints and ordinary or
+  // recovered staged promotions retryable after any partial failure.
+  const implicitFlatBranch =
+    !options.branch && !placement.branch && branchLabel ? branchLabel : null;
+  const canonicalMetaBeforeAdoption = implicitFlatBranch ? await loadMeta(canonicalMetaDir) : null;
+  const canonicalBranchExistedBeforeAdoption =
+    canonicalMetaBeforeAdoption !== null &&
+    Object.prototype.hasOwnProperty.call(canonicalMetaBeforeAdoption, 'branch');
+  const canonicalBranchBeforeAdoption = canonicalMetaBeforeAdoption?.branch;
+  const implicitFlatBranchAdoptionPending =
+    implicitFlatBranch !== null &&
+    (!canonicalBranchExistedBeforeAdoption || canonicalBranchBeforeAdoption !== implicitFlatBranch);
+  const preservePreAdoptionBranch = (meta: RepoMeta): RepoMeta => {
+    if (!implicitFlatBranch) return meta;
+    const protectedMeta = { ...meta };
+    if (canonicalBranchExistedBeforeAdoption) protectedMeta.branch = canonicalBranchBeforeAdoption;
+    else delete protectedMeta.branch;
+    return protectedMeta;
+  };
+  const markPendingImplicitFlatAdoption = (meta: RepoMeta): RepoMeta => {
+    const protectedMeta = preservePreAdoptionBranch(meta);
+    if (!implicitFlatBranchAdoptionPending || protectedMeta.incrementalInProgress) {
+      return protectedMeta;
+    }
+    const now = Date.now();
+    return {
+      ...protectedMeta,
+      incrementalInProgress: {
+        startedAt: now,
+        updatedAt: now,
+        targetCommit: meta.lastCommit,
+        phase: 'branch-adoption',
+        toWriteCount: 0,
+      },
+    };
+  };
+  const savePreAdoptionMeta = (metaDir: string, meta: RepoMeta): Promise<void> =>
+    saveMeta(metaDir, markPendingImplicitFlatAdoption(meta));
+  const adoptAndRestampImplicitFlatBranch = async (meta: RepoMeta): Promise<RepoMeta> => {
+    if (!implicitFlatBranch) return meta;
+    const outcome = await adoptFlatBranchLabel(repoPath, implicitFlatBranch);
+    if (outcome !== 'ADOPTED') {
+      log(
+        `Warning: workspace branch adoption returned ${outcome}; ` +
+          'retaining the prior branch label and retry protection.',
+      );
+      return preservePreAdoptionBranch(meta);
+    }
+    // The staged commit callback may have persisted a protected copy that is
+    // not the same object as `meta`. Inspect the canonical file itself before
+    // taking the coherent-state shortcut, so a staged adoption marker cannot
+    // survive just because the caller's copy was unmarked.
+    const persistedMeta = await loadMeta(canonicalMetaDir);
+    if (
+      persistedMeta &&
+      Object.prototype.hasOwnProperty.call(persistedMeta, 'branch') &&
+      persistedMeta.branch === implicitFlatBranch &&
+      persistedMeta.incrementalInProgress?.phase !== 'branch-adoption'
+    ) {
+      return meta;
+    }
+    const canonicalMeta = persistedMeta ?? meta;
+    const dirtyPhase = canonicalMeta.incrementalInProgress;
+    const adoptedMeta: RepoMeta = {
+      ...canonicalMeta,
+      ...meta,
+      branch: implicitFlatBranch,
+      incrementalInProgress:
+        dirtyPhase?.phase === 'branch-adoption'
+          ? undefined
+          : (meta.incrementalInProgress ?? dirtyPhase),
+    };
+    await saveMeta(canonicalMetaDir, adoptedMeta);
+    return adoptedMeta;
+  };
+
+  const commitStagedMetadataAndRegistry = async (
+    meta: RepoMeta,
+    pendingFlatAdoption = false,
+  ): Promise<string> => {
+    const protectedMeta = pendingFlatAdoption
+      ? markPendingImplicitFlatAdoption(meta)
+      : preservePreAdoptionBranch(meta);
+    await saveMeta(canonicalMetaDir, protectedMeta);
+    return registerRepo(repoPath, protectedMeta, {
       name: options.registryName,
       allowDuplicateName: options.allowDuplicateName,
       branch: placement.branch,
@@ -962,7 +1047,7 @@ const runFullAnalysisImpl = async (
         if (await isRepoRegistered(repoPath)) {
           projectName = await commitStagedMetadataAndRegistry(clearedMeta);
         } else {
-          await saveMeta(canonicalMetaDir, clearedMeta);
+          await savePreAdoptionMeta(canonicalMetaDir, clearedMeta);
         }
         resultStats = {
           ...clearedMeta.stats,
@@ -1107,6 +1192,7 @@ const runFullAnalysisImpl = async (
           },
         },
       };
+      repairedMeta = preservePreAdoptionBranch(repairedMeta);
       await saveMeta(canonicalMetaDir, repairedMeta);
       projectName = await registerRepo(repoPath, repairedMeta, {
         name: options.registryName,
@@ -1158,7 +1244,7 @@ const runFullAnalysisImpl = async (
       stagedMeta.stats?.embeddings,
     );
     return (
-      await promoteStagedGeneration(paths, commitStagedMetadataAndRegistry, {
+      await promoteStagedGeneration(paths, (meta) => commitStagedMetadataAndRegistry(meta, true), {
         readRepositoryIdentity,
       })
     ).projectName;
@@ -1210,15 +1296,25 @@ const runFullAnalysisImpl = async (
     await validatePendingPromotionEmbeddingCandidate(promotionPaths);
     const recoveredPromotion = await promoteStagedGeneration(
       promotionPaths,
-      commitStagedMetadataAndRegistry,
+      (meta) => commitStagedMetadataAndRegistry(meta, true),
       {
         readRepositoryIdentity,
       },
     );
     log('Recovered and completed the previous staged promotion.');
-    const recoveredMeta = await loadMeta(canonicalMetaDir);
+    let recoveredMeta = await loadMeta(canonicalMetaDir);
     if (!recoveredMeta) {
       throw new Error('Recovered staged promotion is missing canonical metadata.');
+    }
+    if (implicitFlatBranch) {
+      try {
+        recoveredMeta = await adoptAndRestampImplicitFlatBranch(recoveredMeta);
+      } catch (error) {
+        log(
+          `Warning: could not sync the recovered workspace branch label ` +
+            `(${(error as Error).message}); will retry on the next run.`,
+        );
+      }
     }
     const recoveredRepoName =
       recoveredPromotion.projectName ??
@@ -1684,7 +1780,7 @@ const runFullAnalysisImpl = async (
       embeddingCheckpoint: undefined,
     };
     if (stagedPaths || !(await isRepoRegistered(repoPath))) {
-      await saveMeta(metaDir, existingMeta);
+      await savePreAdoptionMeta(metaDir, existingMeta);
     } else {
       await commitStagedMetadataAndRegistry(existingMeta);
     }
@@ -1885,7 +1981,7 @@ const runFullAnalysisImpl = async (
             stats: { ...existingMeta.stats, embeddings: fastPathIntegrity.validRows },
           };
           try {
-            await saveMeta(metaDir, fastPathMeta);
+            await savePreAdoptionMeta(metaDir, fastPathMeta);
           } catch (err) {
             if (!isReadOnlyFilesystemError(err)) throw err;
             log(
@@ -1904,9 +2000,8 @@ const runFullAnalysisImpl = async (
         // stamp, mirroring the end-of-run meta write.
         if (
           !stagedPaths &&
-          !placement.branch &&
-          branchLabel &&
-          existingMeta.branch !== branchLabel
+          implicitFlatBranch &&
+          (!options.incrementalOnly || existingMeta.branch !== implicitFlatBranch)
         ) {
           if (options.incrementalOnly) {
             incrementalOnlyStop('the flat index branch label requires a metadata restamp');
@@ -1922,9 +2017,7 @@ const runFullAnalysisImpl = async (
           // date" run must not fail over it; read-only storage — the
           // documented Docker :ro workflow (#1549) — degrades to a warning.
           try {
-            await adoptFlatBranchLabel(repoPath, branchLabel);
-            fastPathMeta = { ...fastPathMeta, branch: branchLabel };
-            await saveMeta(metaDir, fastPathMeta);
+            fastPathMeta = await adoptAndRestampImplicitFlatBranch(fastPathMeta);
           } catch (err) {
             // EACCES/EPERM also arise from ownership problems and transient
             // Windows locks, so keep the real error visible alongside the
@@ -2254,7 +2347,7 @@ const runFullAnalysisImpl = async (
     // success at the meta-save step. Scoped to this branch's meta.json.
     if (!options.incrementalOnly) {
       const now = Date.now();
-      await saveMeta(metaDir, {
+      await savePreAdoptionMeta(metaDir, {
         ...existingMeta!,
         incrementalInProgress: {
           startedAt: now,
@@ -2277,7 +2370,7 @@ const runFullAnalysisImpl = async (
     // toWriteCount: 0 is the full-path sentinel (no incremental write set).
     if (existingMeta) {
       const now = Date.now();
-      await saveMeta(metaDir, {
+      await savePreAdoptionMeta(metaDir, {
         ...existingMeta,
         incrementalInProgress: {
           startedAt: now,
@@ -2405,7 +2498,7 @@ const runFullAnalysisImpl = async (
         extra: Partial<NonNullable<RepoMeta['incrementalInProgress']>> = {},
       ): Promise<void> => {
         if (!incrementalMutationAuthorized) return;
-        await saveMeta(metaDir, {
+        await savePreAdoptionMeta(metaDir, {
           ...existingMeta!,
           incrementalInProgress: {
             startedAt: dirtyStartedAt,
@@ -3045,7 +3138,7 @@ const runFullAnalysisImpl = async (
       ): Promise<void> => {
         const fileHashes: Record<string, string> = {};
         for (const [key, value] of newFileHashes) fileHashes[key] = value;
-        await saveMeta(metaDir, {
+        await savePreAdoptionMeta(metaDir, {
           ...(existingMeta ?? {}),
           repoPath,
           lastCommit: currentCommit,
@@ -3180,7 +3273,7 @@ const runFullAnalysisImpl = async (
     // RepoMeta's status unions (tri-review 4669518496 P1/U3) — an unannotated
     // literal widens the vectorSearch.status ternary to `string` and the
     // honesty contract silently decays to "whatever interpolates".
-    const meta: RepoMeta = {
+    const meta: RepoMeta = preservePreAdoptionBranch({
       repoPath,
       lastCommit: currentCommit,
       indexedAt: new Date().toISOString(),
@@ -3246,14 +3339,15 @@ const runFullAnalysisImpl = async (
       // stamp after an on→off flip; the next pdgModeMismatch then compares
       // off==off and incremental eligibility is restored.
       pdg: resolvePdgConfig(options),
-    };
+    });
     if (isIncremental && hashDiff) {
       callbacks.onRecoveryBoundary?.('before-finalize', {
         phase: escalatedFullWrite ? 'escalated-load-graph' : 'load-graph',
         targetCommit: currentCommit,
       });
     }
-    await saveMeta(metaDir, meta);
+    const metadataToCommit = stagedPaths ? meta : markPendingImplicitFlatAdoption(meta);
+    await saveMeta(metaDir, metadataToCommit);
 
     // Persist the incremental parse cache for the next run. Wraps in
     // try/catch so a cache-write failure never breaks an otherwise
@@ -3345,7 +3439,7 @@ const runFullAnalysisImpl = async (
     } else {
       // Forward the --name alias and registry-collision bypass only after the
       // canonical DB is finalized. In staged mode this same commit is journaled.
-      projectName = await registerRepo(repoPath, meta, {
+      projectName = await registerRepo(repoPath, metadataToCommit, {
         name: options.registryName,
         allowDuplicateName: options.allowDuplicateName,
         branch: placement.branch,
@@ -3353,9 +3447,9 @@ const runFullAnalysisImpl = async (
     }
 
     // ── #2354: the flat workspace slot has adopted this run's branch ──────
-    if (!placement.branch && branchLabel) {
+    if (implicitFlatBranch) {
       try {
-        await adoptFlatBranchLabel(repoPath, branchLabel);
+        await adoptAndRestampImplicitFlatBranch(metadataToCommit);
       } catch (e) {
         log(
           `Warning: could not sync the workspace branch label (${(e as Error).message}); continuing.`,

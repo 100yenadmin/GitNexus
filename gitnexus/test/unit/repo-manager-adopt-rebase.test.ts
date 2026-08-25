@@ -85,7 +85,7 @@ describe('adoptFlatBranchLabel registry rebase (#267)', () => {
     await Promise.all([home, repo, otherRepo].map((dir) => callRealRm(dir, { recursive: true })));
   });
 
-  it('rejects primary drift without changing the concurrent registry bytes', async () => {
+  it('reconciles exact stale-summary cleanup while preserving every fresh primary field', async () => {
     await registerRepo(repo, metaFor('main', 'old-primary'), {
       name: 'old-alias',
     });
@@ -101,14 +101,21 @@ describe('adoptFlatBranchLabel registry rebase (#267)', () => {
     await removal.started;
     await registerRepo(repo, metaFor('main', 'fresh-primary'), { name: 'fresh-alias' });
     const concurrentBytes = await fs.readFile(getGlobalRegistryPath(), 'utf8');
-    const concurrentEntries = JSON.parse(concurrentBytes);
     removal.release();
 
-    await expect(adoption).rejects.toThrow(
-      'registry owner changed during branch adoption; retry after concurrent indexing completes',
+    await expect(adoption).resolves.toBe('PRIMARY_DRIFT_RECONCILED');
+    expect(await fs.readFile(getGlobalRegistryPath(), 'utf8')).not.toBe(concurrentBytes);
+    const adopted = (await listRegisteredRepos()).find(
+      (entry) => canonicalizePath(entry.path) === canonicalizePath(repo),
     );
-    expect(await fs.readFile(getGlobalRegistryPath(), 'utf8')).toBe(concurrentBytes);
-    expect(await listRegisteredRepos()).toEqual(concurrentEntries);
+    expect(adopted).toMatchObject({
+      name: 'fresh-alias',
+      branch: 'main',
+      lastCommit: 'fresh-primary',
+      indexedAt: metaFor('main', 'fresh-primary').indexedAt,
+      stats: metaFor('main', 'fresh-primary').stats,
+    });
+    expect(adopted?.branches).toBeUndefined();
     await expect(fs.access(path.dirname(metaPath))).rejects.toThrow();
   });
 
@@ -136,7 +143,7 @@ describe('adoptFlatBranchLabel registry rebase (#267)', () => {
     })();
     await concurrent; // would deadlock/time out if recursive deletion held the registry lock
     removal.release();
-    await adoption;
+    await expect(adoption).resolves.toBe('ADOPTED');
 
     const entries = await listRegisteredRepos();
     const adopted = entries.find(
@@ -160,6 +167,39 @@ describe('adoptFlatBranchLabel registry rebase (#267)', () => {
     expect(
       entries.find((entry) => canonicalizePath(entry.path) === canonicalizePath(otherRepo)),
     ).toEqual(beforeOther);
+    await expect(fs.access(path.dirname(metaPath))).rejects.toThrow();
+  });
+
+  it('returns NOT_ADOPTED without disk I/O when the owner is missing', async () => {
+    fsCtx.rmMock.mockClear();
+
+    await expect(adoptFlatBranchLabel(repo, 'feature/x')).resolves.toBe('NOT_ADOPTED');
+
+    expect(fsCtx.rmMock).not.toHaveBeenCalled();
+  });
+
+  it('returns ADOPTED without disk I/O for an already-coherent owner', async () => {
+    await registerRepo(repo, metaFor('feature/x', 'primary'), { name: 'alias' });
+    fsCtx.rmMock.mockClear();
+
+    await expect(adoptFlatBranchLabel(repo, 'feature/x')).resolves.toBe('ADOPTED');
+
+    expect(fsCtx.rmMock).not.toHaveBeenCalled();
+  });
+
+  it('adopts an unchanged primary after deleting only the exact observed summary', async () => {
+    await registerRepo(repo, metaFor('main', 'primary'), { name: 'alias' });
+    await registerRepo(repo, metaFor('feature/x', 'branch'), { branch: 'feature/x' });
+    const { metaPath } = getStoragePaths(repo, 'feature/x');
+    await saveMeta(path.dirname(metaPath), metaFor('feature/x', 'branch'));
+
+    await expect(adoptFlatBranchLabel(repo, 'feature/x')).resolves.toBe('ADOPTED');
+
+    const adopted = (await listRegisteredRepos()).find(
+      (entry) => canonicalizePath(entry.path) === canonicalizePath(repo),
+    );
+    expect(adopted).toMatchObject({ branch: 'feature/x', lastCommit: 'primary' });
+    expect(adopted?.branches).toBeUndefined();
     await expect(fs.access(path.dirname(metaPath))).rejects.toThrow();
   });
 });
