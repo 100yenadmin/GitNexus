@@ -941,6 +941,18 @@ export const readRegistry = async (): Promise<RegistryEntry[]> => {
   }
 };
 
+const readRegistryForValidation = async (): Promise<RegistryEntry[]> => {
+  try {
+    const raw = await fs.readFile(getGlobalRegistryPath(), 'utf-8');
+    const data = JSON.parse(raw);
+    if (!Array.isArray(data)) throw new Error('Registry payload must be an array');
+    return data;
+  } catch (error) {
+    if (isMissingFilesystemError(error)) return [];
+    throw error;
+  }
+};
+
 /**
  * Write the global registry to disk. Call only while holding the registry mutation lock.
  */
@@ -1909,14 +1921,45 @@ export const resolveRegistryEntry = (entries: RegistryEntry[], target: string): 
  * therefore "not confirmed present," not "confirmed present"; downstream DB
  * opens are independently and lazily guarded.
  */
+const isRegistryEntryProvablyMissing = async (entry: RegistryEntry): Promise<boolean> => {
+  let indexFound = false;
+  let firstNonMissingError: NodeJS.ErrnoException | null = null;
+  let lastMissingError: NodeJS.ErrnoException | null = null;
+
+  try {
+    await fs.access(path.join(entry.storagePath, INDEX_METADATA_FILE));
+    indexFound = true;
+  } catch (err: any) {
+    if (isMissingFilesystemError(err)) lastMissingError = err;
+    else firstNonMissingError = err;
+  }
+
+  if (!indexFound) {
+    try {
+      await fs.access(path.join(entry.storagePath, LEGACY_METADATA_FILE));
+      indexFound = true;
+    } catch (err: any) {
+      if (isMissingFilesystemError(err)) lastMissingError = err;
+      else if (!firstNonMissingError) firstNonMissingError = err;
+    }
+  }
+
+  if (indexFound) return false;
+  if (!firstNonMissingError && lastMissingError) return true;
+  logger.warn(
+    { name: entry.name, storagePath: entry.storagePath, code: firstNonMissingError?.code },
+    'Keeping registry entry despite fs.access failure (not provably absent); not pruning to avoid mass registry wipe.',
+  );
+  return false;
+};
+
 export const listRegisteredRepos = async (opts?: {
   validate?: boolean;
 }): Promise<RegistryEntry[]> => {
-  const entries = await readRegistry();
-  if (!opts?.validate) return entries;
+  if (!opts?.validate) return readRegistry();
+  const entries = await readRegistryForValidation();
 
-  // Validate each entry still has a .gitnexus/ directory with metadata
-  const valid: RegistryEntry[] = [];
+  const prunable: RegistryEntry[] = [];
   for (const entry of entries) {
     // Named to avoid shadowing the exported `hasIndex` function above.
     let indexFound = false;
@@ -1943,28 +1986,29 @@ export const listRegisteredRepos = async (opts?: {
       }
     }
 
-    if (indexFound) {
-      valid.push(entry);
-    } else if (!firstNonMissingError && lastMissingError) {
-      // Index genuinely removed — safe to prune
-    } else {
-      // Not provably absent — keep entry to prevent mass registry wipe.
-      // Warn so an I/O storm becomes observable instead of silently
-      // keeping (or, pre-fix, silently wiping) entries.
+    if (!indexFound && !firstNonMissingError && lastMissingError) {
+      prunable.push(entry);
+    } else if (!indexFound) {
       logger.warn(
         { name: entry.name, storagePath: entry.storagePath, code: firstNonMissingError?.code },
         'Keeping registry entry despite fs.access failure (not provably absent); not pruning to avoid mass registry wipe.',
       );
-      valid.push(entry);
     }
   }
 
-  // If we pruned any entries, save the cleaned registry
-  if (valid.length !== entries.length) {
-    await writeRegistry(valid);
-  }
+  if (prunable.length === 0) return entries;
 
-  return valid;
+  // Final lock-held revalidation closes the identical re-registration race.
+  return withRegistryMutationLock(async () => {
+    const fresh = await readRegistryForValidation();
+    const rebased: RegistryEntry[] = [];
+    for (const entry of fresh) {
+      const exactCandidate = prunable.some((candidate) => isDeepStrictEqual(entry, candidate));
+      if (!exactCandidate || !(await isRegistryEntryProvablyMissing(entry))) rebased.push(entry);
+    }
+    if (rebased.length !== fresh.length) await writeRegistry(rebased);
+    return rebased;
+  });
 };
 
 // ─── Global CLI Config (~/.gitnexus/config.json) ─────────────────────────
