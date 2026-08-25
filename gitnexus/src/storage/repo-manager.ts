@@ -1916,7 +1916,7 @@ export const listRegisteredRepos = async (opts?: {
   if (!opts?.validate) return entries;
 
   // Validate each entry still has a .gitnexus/ directory with metadata
-  const valid: RegistryEntry[] = [];
+  const prunable: RegistryEntry[] = [];
   for (const entry of entries) {
     // Named to avoid shadowing the exported `hasIndex` function above.
     let indexFound = false;
@@ -1943,11 +1943,10 @@ export const listRegisteredRepos = async (opts?: {
       }
     }
 
-    if (indexFound) {
-      valid.push(entry);
-    } else if (!firstNonMissingError && lastMissingError) {
+    if (!indexFound && !firstNonMissingError && lastMissingError) {
       // Index genuinely removed — safe to prune
-    } else {
+      prunable.push(entry);
+    } else if (!indexFound) {
       // Not provably absent — keep entry to prevent mass registry wipe.
       // Warn so an I/O storm becomes observable instead of silently
       // keeping (or, pre-fix, silently wiping) entries.
@@ -1955,16 +1954,22 @@ export const listRegisteredRepos = async (opts?: {
         { name: entry.name, storagePath: entry.storagePath, code: firstNonMissingError?.code },
         'Keeping registry entry despite fs.access failure (not provably absent); not pruning to avoid mass registry wipe.',
       );
-      valid.push(entry);
     }
   }
 
-  // If we pruned any entries, save the cleaned registry
-  if (valid.length !== entries.length) {
-    await writeRegistry(valid);
-  }
+  if (prunable.length === 0) return entries;
 
-  return valid;
+  // Metadata probes stay outside the registry lock. Rebase their exact
+  // snapshot identities against one fresh registry read so validation cannot
+  // erase a concurrent update or re-registration.
+  return withRegistryMutationLock(async () => {
+    const fresh = await readRegistry();
+    const rebased = fresh.filter(
+      (entry) => !prunable.some((candidate) => isDeepStrictEqual(entry, candidate)),
+    );
+    if (rebased.length !== fresh.length) await writeRegistry(rebased);
+    return rebased;
+  });
 };
 
 // ─── Global CLI Config (~/.gitnexus/config.json) ─────────────────────────

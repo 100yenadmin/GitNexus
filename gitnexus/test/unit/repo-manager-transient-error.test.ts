@@ -309,4 +309,60 @@ describe('listRegisteredRepos({ validate: true }) — transient error safety (PR
       await tmpRepoB.cleanup();
     }
   });
+
+  it('rebases pruning so a concurrent refresh survives while unchanged missing entries are removed', async () => {
+    const missingRepo = await createTempDir('gitnexus-prune-missing-');
+    const presentRepo = await createTempDir('gitnexus-prune-present-');
+    try {
+      const refreshedName = await registerRepo(tmpRepo.dbPath, mockMeta);
+      const missingName = await registerRepo(missingRepo.dbPath, mockMeta);
+      const presentName = await registerRepo(presentRepo.dbPath, mockMeta);
+      const presentMetaPath = path.join(presentRepo.dbPath, '.gitnexus', 'meta.json');
+      await fs.mkdir(path.dirname(presentMetaPath), { recursive: true });
+      await fs.writeFile(presentMetaPath, JSON.stringify(mockMeta));
+
+      let releaseProbe: (() => void) | undefined;
+      const probeHeld = new Promise<void>((resolveHeld) => {
+        releaseProbe = resolveHeld;
+      });
+      let signalProbeHeld: (() => void) | undefined;
+      const probeStarted = new Promise<void>((resolveStarted) => {
+        signalProbeHeld = resolveStarted;
+      });
+      const refreshedMetadataPath = path.join(tmpRepo.dbPath, '.gitnexus', 'gitnexus.json');
+      const originalAccess = fs.access;
+      vi.spyOn(fs, 'access').mockImplementation(async (p, mode) => {
+        const pStr = typeof p === 'string' ? p : p.toString();
+        if (pStr === refreshedMetadataPath) {
+          signalProbeHeld?.();
+          await probeHeld;
+        }
+        return (originalAccess as any).call(fs, p, mode);
+      });
+
+      const validation = listRegisteredRepos({ validate: true });
+      await probeStarted;
+      await registerRepo(tmpRepo.dbPath, {
+        ...mockMeta,
+        lastCommit: 'fresh-owner',
+        indexedAt: '2026-08-25T16:30:00.000Z',
+      });
+      releaseProbe?.();
+
+      const returned = await validation;
+      const persisted = await readRegistryFromDisk();
+      expect(returned).toEqual(persisted);
+      expect(returned.map((entry) => entry.name).sort()).toEqual(
+        [presentName, refreshedName].sort(),
+      );
+      expect(returned.some((entry) => entry.name === missingName)).toBe(false);
+      expect(returned.find((entry) => entry.name === refreshedName)).toMatchObject({
+        lastCommit: 'fresh-owner',
+        indexedAt: '2026-08-25T16:30:00.000Z',
+      });
+    } finally {
+      await presentRepo.cleanup();
+      await missingRepo.cleanup();
+    }
+  });
 });
