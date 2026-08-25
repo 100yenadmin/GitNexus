@@ -765,11 +765,13 @@ describe('runFullAnalysis --staged', () => {
 
     expect(result.recoveredPromotionOnly).toBe(true);
     expect(result.alreadyUpToDate).not.toBe(true);
+    expect((await loadMeta(canonical.storagePath))?.branch).toBe('main');
+    expect((await loadMeta(canonical.storagePath))?.incrementalInProgress).toBeUndefined();
     await expect(fs.access(canonical.lbugPath)).resolves.toBeUndefined();
     await expect(fs.access(staged.journalPath)).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
-  it('uses the same ownership lock for ordinary and staged analyze', async () => {
+  it('serializes supported ordinary and staged analyzers under branch-summary ownership', async () => {
     const repo = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-common-lock-'));
     tempDirs.push(repo);
     const storage = getStoragePaths(repo).storagePath;
@@ -785,6 +787,10 @@ describe('runFullAnalysis --staged', () => {
       await expect(fs.access(path.join(storage, 'analyze-staged.lock'))).resolves.toBeUndefined();
     });
 
+    // Production branch summaries are emitted only from runFullAnalysisImpl,
+    // and every supported ordinary/staged entry reaches it through this same
+    // primary-slot ownership lock. A second analyzer cannot enter the summary
+    // delete/register window while the first owns it.
     await expect(runFullAnalysis(repo, {}, { onProgress: () => {} })).rejects.toThrow(
       'Another analyze is active',
     );

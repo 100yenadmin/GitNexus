@@ -171,6 +171,7 @@ const FILESYSTEM = [
   'test/integration/markdown-processor-crlf.test.ts',
   'test/integration/ignore-and-skip-e2e.test.ts',
   'test/unit/repo-manager-writer-lock.test.ts',
+  'test/unit/repo-manager-adopt-rebase.test.ts',
 ];
 
 const ALL_CROSS_PLATFORM = [
