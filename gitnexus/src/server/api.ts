@@ -86,10 +86,17 @@ const embeddingMetaFingerprint = (meta: RepoMeta): string =>
   createHash('sha256').update(JSON.stringify(meta)).digest('hex');
 const FILE_PREFLIGHT_PAGE_SIZE = 256;
 
+type FrozenRegistryOwner = RegistryEntry & {
+  /** Captured synchronously before the registry read; never persisted. */
+  canonicalPath: string;
+  /** Captured synchronously before the registry read; never persisted. */
+  canonicalStoragePath: string;
+};
+
 const assertZeroClearRegistryOwner = async (
   entry: RegistryEntry,
   clearedMeta: RepoMeta,
-): Promise<RegistryEntry> => {
+): Promise<FrozenRegistryOwner> => {
   if (
     !path.isAbsolute(entry.path) ||
     !path.isAbsolute(entry.storagePath) ||
@@ -99,27 +106,43 @@ const assertZeroClearRegistryOwner = async (
       'Cannot finalize zero-checkpoint embedding: path/storage identity is non-absolute or mismatched',
     );
   }
-  const expectedPath = canonicalizePath(entry.path);
+  // Freeze both identities before the registry read. The raw path forms stay
+  // on the owner for display/backward compatibility; the canonical forms are
+  // internal compare-and-save fingerprints only.
+  const canonicalPath = canonicalizePath(entry.path);
+  const canonicalStoragePath = canonicalizePath(entry.storagePath);
   const expectedStoragePath = canonicalizePath(getStoragePath(entry.path));
   if (
-    !registryPathEquals(canonicalizePath(entry.storagePath), expectedStoragePath) ||
-    !registryPathEquals(canonicalizePath(clearedMeta.repoPath), expectedPath)
+    !registryPathEquals(canonicalStoragePath, expectedStoragePath) ||
+    !registryPathEquals(canonicalizePath(clearedMeta.repoPath), canonicalPath)
   ) {
     throw new Error(
       'Cannot finalize zero-checkpoint embedding: path/storage identity is non-absolute or mismatched',
     );
   }
 
+  // listRegisteredRepos() yields the current raw display fields. Recheck the
+  // path and storage identities after that await so a retarget during the
+  // preflight cannot reuse the original entry.
   const relatedOwners = (await listRegisteredRepos()).filter((owner) => {
     const ownerPath = path.isAbsolute(owner.path) ? canonicalizePath(owner.path) : undefined;
     const ownerStoragePath = path.isAbsolute(owner.storagePath)
       ? canonicalizePath(owner.storagePath)
       : undefined;
     return (
-      (ownerPath !== undefined && registryPathEquals(ownerPath, expectedPath)) ||
-      (ownerStoragePath !== undefined && registryPathEquals(ownerStoragePath, expectedStoragePath))
+      (ownerPath !== undefined && registryPathEquals(ownerPath, canonicalPath)) ||
+      (ownerStoragePath !== undefined && registryPathEquals(ownerStoragePath, canonicalStoragePath))
     );
   });
+  if (
+    !registryPathEquals(canonicalizePath(entry.path), canonicalPath) ||
+    !registryPathEquals(canonicalizePath(entry.storagePath), canonicalStoragePath) ||
+    !registryPathEquals(canonicalizePath(getStoragePath(entry.path)), canonicalStoragePath)
+  ) {
+    throw new Error(
+      'Cannot finalize zero-checkpoint embedding: path/storage identity is non-absolute or mismatched',
+    );
+  }
   if (relatedOwners.length === 0) {
     throw new Error(
       'Cannot finalize zero-checkpoint embedding: canonical registry entry is missing',
@@ -130,8 +153,8 @@ const assertZeroClearRegistryOwner = async (
     (owner) =>
       path.isAbsolute(owner.path) &&
       path.isAbsolute(owner.storagePath) &&
-      registryPathEquals(canonicalizePath(owner.path), expectedPath) &&
-      registryPathEquals(canonicalizePath(owner.storagePath), expectedStoragePath),
+      registryPathEquals(canonicalizePath(owner.path), canonicalPath) &&
+      registryPathEquals(canonicalizePath(owner.storagePath), canonicalStoragePath),
   );
   if (owners.length > 1) {
     throw new Error(
@@ -148,6 +171,8 @@ const assertZeroClearRegistryOwner = async (
   const clearedRemoteUrl = clearedMeta.remoteUrl?.trim() || undefined;
   if (
     owner.name !== entry.name ||
+    owner.path !== entry.path ||
+    owner.storagePath !== entry.storagePath ||
     owner.remoteUrl !== entry.remoteUrl ||
     (clearedRemoteUrl !== undefined && owner.remoteUrl !== clearedRemoteUrl) ||
     owner.branch !== entry.branch ||
@@ -155,7 +180,29 @@ const assertZeroClearRegistryOwner = async (
   ) {
     throw new Error('Cannot finalize zero-checkpoint embedding: registry owner identity changed');
   }
-  return owner;
+  return { ...owner, canonicalPath, canonicalStoragePath };
+};
+
+const assertFrozenZeroClearRegistryOwner = (
+  owner: FrozenRegistryOwner,
+  clearedMeta: RepoMeta,
+): string => {
+  if (
+    !path.isAbsolute(owner.path) ||
+    !path.isAbsolute(owner.storagePath) ||
+    !path.isAbsolute(clearedMeta.repoPath) ||
+    !path.isAbsolute(owner.canonicalPath) ||
+    !path.isAbsolute(owner.canonicalStoragePath) ||
+    !registryPathEquals(canonicalizePath(owner.path), owner.canonicalPath) ||
+    !registryPathEquals(canonicalizePath(owner.storagePath), owner.canonicalStoragePath) ||
+    !registryPathEquals(canonicalizePath(getStoragePath(owner.path)), owner.canonicalStoragePath) ||
+    !registryPathEquals(canonicalizePath(clearedMeta.repoPath), owner.canonicalPath)
+  ) {
+    throw new Error(
+      'Cannot finalize zero-checkpoint embedding: path/storage identity is non-absolute or mismatched',
+    );
+  }
+  return owner.canonicalStoragePath;
 };
 
 export type EmbedCommitPhase =
@@ -2156,7 +2203,11 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                       allowDuplicateName: true,
                       expectedOwner: owner,
                     });
-                    await saveMeta(owner.storagePath, clearedMeta);
+                    const provenStoragePath = assertFrozenZeroClearRegistryOwner(
+                      owner,
+                      clearedMeta,
+                    );
+                    await saveMeta(provenStoragePath, clearedMeta);
                   });
                   embeddingMeta = clearedMeta;
                   return;

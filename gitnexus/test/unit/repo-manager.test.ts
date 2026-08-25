@@ -1052,6 +1052,11 @@ describe('registerRepo expected owner CAS (#264)', () => {
     branch: 'main',
     branches: [{ branch: 'feature/x', indexedAt: 'earlier', lastCommit: 'branch-old' }],
   });
+  const frozenOwner = (entry: RegistryEntry) => ({
+    ...entry,
+    canonicalPath: canonicalizePath(entry.path),
+    canonicalStoragePath: canonicalizePath(entry.storagePath),
+  });
 
   beforeEach(async () => {
     tmpHome = await createTempDir('gitnexus-registry-owner-cas-home-');
@@ -1082,7 +1087,7 @@ describe('registerRepo expected owner CAS (#264)', () => {
 
     await registerRepo(tmpRepo.dbPath, meta('new'), {
       name: expected.name,
-      expectedOwner: expected,
+      expectedOwner: frozenOwner(expected),
     });
 
     const entries = await readRegistry();
@@ -1112,7 +1117,7 @@ describe('registerRepo expected owner CAS (#264)', () => {
     const before = await fs.readFile(registryPath, 'utf8');
 
     await expect(
-      registerRepo(tmpRepo.dbPath, meta('new'), { expectedOwner: expected }),
+      registerRepo(tmpRepo.dbPath, meta('new'), { expectedOwner: frozenOwner(expected) }),
     ).rejects.toThrow(casError);
     expect(await fs.readFile(registryPath, 'utf8')).toBe(before);
   });
@@ -1133,7 +1138,7 @@ describe('registerRepo expected owner CAS (#264)', () => {
     );
     const openSpy = vi.spyOn(fs, 'open');
     const pending = registerRepo(tmpRepo.dbPath, meta('new'), {
-      expectedOwner: expected,
+      expectedOwner: frozenOwner(expected),
     });
     await vi.waitFor(() => expect(openSpy).toHaveBeenCalledWith(lockPath, 'wx', 0o600));
     await fs.writeFile(registryPath, '[]');
@@ -1142,6 +1147,108 @@ describe('registerRepo expected owner CAS (#264)', () => {
     await expect(pending).rejects.toThrow(casError);
     expect(await fs.readFile(registryPath, 'utf8')).toBe('[]');
     openSpy.mockRestore();
+  });
+
+  it('rejects a symlink retarget before the locked commit without changing registry bytes', async () => {
+    const targetA = path.join(tmpHome.dbPath, 'canonical-a');
+    const targetB = path.join(tmpHome.dbPath, 'canonical-b');
+    const alias = path.join(tmpHome.dbPath, 'repo-alias');
+    await fs.mkdir(path.join(targetA, '.gitnexus'), { recursive: true });
+    await fs.mkdir(path.join(targetB, '.gitnexus'), { recursive: true });
+    await fs.symlink(targetA, alias, 'dir');
+
+    const expected: RegistryEntry = {
+      ...owner(),
+      path: alias,
+      storagePath: path.join(alias, '.gitnexus'),
+    };
+    const registryPath = path.join(tmpHome.dbPath, 'registry.json');
+    const lockPath = `${registryPath}.lock`;
+    const before = JSON.stringify([expected], null, 2);
+    await fs.writeFile(registryPath, before);
+    await fs.writeFile(
+      lockPath,
+      JSON.stringify({
+        schema: 'gitnexus.registry-lock/v1',
+        pid: process.pid,
+        nonce: 'held',
+        startedAt: new Date().toISOString(),
+      }),
+    );
+    const openSpy = vi.spyOn(fs, 'open');
+    const pending = registerRepo(
+      alias,
+      { ...meta('new'), repoPath: alias },
+      { expectedOwner: frozenOwner(expected) },
+    );
+    try {
+      await vi.waitFor(() => expect(openSpy).toHaveBeenCalledWith(lockPath, 'wx', 0o600));
+      await fs.unlink(alias);
+      await fs.symlink(targetB, alias, 'dir');
+      await fs.rm(lockPath);
+
+      await expect(pending).rejects.toThrow(casError);
+      expect(await fs.readFile(registryPath, 'utf8')).toBe(before);
+    } finally {
+      openSpy.mockRestore();
+    }
+  });
+
+  it('rejects a symlink retarget that occurs before registerRepo without changing registry bytes', async () => {
+    const targetA = path.join(tmpHome.dbPath, 'canonical-before-a');
+    const targetB = path.join(tmpHome.dbPath, 'canonical-before-b');
+    const alias = path.join(tmpHome.dbPath, 'repo-before-alias');
+    await fs.mkdir(path.join(targetA, '.gitnexus'), { recursive: true });
+    await fs.mkdir(path.join(targetB, '.gitnexus'), { recursive: true });
+    await fs.symlink(targetA, alias, 'dir');
+
+    const expected: RegistryEntry = {
+      ...owner(),
+      path: alias,
+      storagePath: path.join(alias, '.gitnexus'),
+    };
+    const frozen = frozenOwner(expected);
+    const registryPath = path.join(tmpHome.dbPath, 'registry.json');
+    const before = JSON.stringify([expected], null, 2);
+    await fs.writeFile(registryPath, before);
+    await fs.unlink(alias);
+    await fs.symlink(targetB, alias, 'dir');
+
+    await expect(
+      registerRepo(alias, { ...meta('new'), repoPath: alias }, { expectedOwner: frozen }),
+    ).rejects.toThrow(casError);
+    expect(await fs.readFile(registryPath, 'utf8')).toBe(before);
+  });
+
+  it('accepts a stable symlink while retaining the raw registry display path', async () => {
+    const target = path.join(tmpHome.dbPath, 'canonical-stable');
+    const alias = path.join(tmpHome.dbPath, 'stable-alias');
+    await fs.mkdir(path.join(target, '.gitnexus'), { recursive: true });
+    await fs.symlink(target, alias, 'dir');
+
+    const expected: RegistryEntry = {
+      ...owner(),
+      path: alias,
+      storagePath: path.join(alias, '.gitnexus'),
+    };
+    await fs.writeFile(path.join(tmpHome.dbPath, 'registry.json'), JSON.stringify([expected]));
+
+    await expect(
+      registerRepo(
+        alias,
+        { ...meta('new'), repoPath: alias },
+        {
+          expectedOwner: frozenOwner(expected),
+        },
+      ),
+    ).resolves.toBe(expected.name);
+
+    const [saved] = await readRegistry();
+    expect(saved.path).toBe(path.resolve(alias));
+    expect(saved.storagePath).toBe(path.join(path.resolve(alias), '.gitnexus'));
+    expect(canonicalizePath(saved.path)).toBe(canonicalizePath(target));
+    expect(saved).not.toHaveProperty('canonicalPath');
+    expect(saved).not.toHaveProperty('canonicalStoragePath');
   });
 });
 

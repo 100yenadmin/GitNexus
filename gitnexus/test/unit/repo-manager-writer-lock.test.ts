@@ -44,6 +44,7 @@ vi.mock('fs/promises', async (importOriginal) => {
 
 import fs from 'fs/promises';
 import {
+  canonicalizePath,
   getStoragePath,
   readRegistry,
   registerRepo,
@@ -91,6 +92,11 @@ describe('simple registry writers share the mutation lock (#266)', () => {
     lastCommit: 'new',
     branch: 'main',
   });
+  const frozenOwner = (entry: RegistryEntry) => ({
+    ...entry,
+    canonicalPath: canonicalizePath(entry.path),
+    canonicalStoragePath: canonicalizePath(entry.storagePath),
+  });
 
   beforeEach(async () => {
     home = await createTempDir('gitnexus-writer-lock-home-');
@@ -130,7 +136,9 @@ describe('simple registry writers share the mutation lock (#266)', () => {
     const gate = pauseNextRegistryRead();
     const removing = unregisterRepo(repo.dbPath);
     await gate.entered;
-    const registering = registerRepo(repo.dbPath, meta(), { expectedOwner: expected });
+    const registering = registerRepo(repo.dbPath, meta(), {
+      expectedOwner: frozenOwner(expected),
+    });
     await waitForContentionOrCommit();
     gate.release();
 
@@ -151,7 +159,7 @@ describe('simple registry writers share the mutation lock (#266)', () => {
     await gate.entered;
     const registering = registerRepo(repo.dbPath, meta(), {
       name: expected.name,
-      expectedOwner: expected,
+      expectedOwner: frozenOwner(expected),
     });
     await waitForContentionOrCommit();
     gate.release();

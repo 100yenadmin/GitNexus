@@ -1072,7 +1072,12 @@ const withRegistryMutationLock = async <T>(operation: () => Promise<T>): Promise
  * unchanged.
  */
 type ExpectedRegistryOwner = Readonly<
-  Pick<RegistryEntry, 'name' | 'path' | 'storagePath' | 'remoteUrl' | 'branch'>
+  Pick<RegistryEntry, 'name' | 'path' | 'storagePath' | 'remoteUrl' | 'branch'> & {
+    /** Captured before an identity-sensitive read; never persisted. */
+    canonicalPath: string;
+    /** Captured before an identity-sensitive read; never persisted. */
+    canonicalStoragePath: string;
+  }
 >;
 
 export interface RegisterRepoOptions {
@@ -1268,6 +1273,12 @@ export const registerRepo = async (
   // falling back to `path.resolve` when the path doesn't exist.
   const canonicalInput = canonicalizePath(repoPath);
 
+  // Capture the caller-frozen fingerprints before the first registry read.
+  // Never recanonicalize the expected raw display fields as their substitute:
+  // a retarget between the caller's preflight and this commit must reject.
+  const expectedOwnerCanonicalPath = opts?.expectedOwner?.canonicalPath;
+  const expectedOwnerCanonicalStorage = opts?.expectedOwner?.canonicalStoragePath;
+
   // Capture a current origin when callers provide older metadata without the
   // remote fingerprint (`gitnexus index` and direct API callers). No origin
   // leaves the repository path-scoped and local-only.
@@ -1397,12 +1408,10 @@ export const registerRepo = async (
     let freshIdx: number;
     if (opts?.expectedOwner) {
       const expected = opts.expectedOwner;
-      const expectedPath = path.isAbsolute(expected.path)
-        ? canonicalizePath(expected.path)
-        : undefined;
-      const expectedStorage = path.isAbsolute(expected.storagePath)
-        ? canonicalizePath(expected.storagePath)
-        : undefined;
+      const expectedPath = expectedOwnerCanonicalPath!;
+      const expectedStorage = expectedOwnerCanonicalStorage!;
+      const currentCanonicalInput = canonicalizePath(repoPath);
+      const currentCanonicalStorage = canonicalizePath(storagePath);
       const related = fresh
         .map((owner, index) => ({ owner, index }))
         .filter(({ owner }) => {
@@ -1423,20 +1432,18 @@ export const registerRepo = async (
         ({ owner }) =>
           path.isAbsolute(owner.path) &&
           path.isAbsolute(owner.storagePath) &&
-          expectedPath !== undefined &&
-          expectedStorage !== undefined &&
           registryPathEquals(canonicalizePath(owner.path), expectedPath) &&
           registryPathEquals(canonicalizePath(owner.storagePath), expectedStorage),
       );
       const match = matches[0];
       if (
-        !expectedPath ||
-        !expectedStorage ||
-        !registryPathEquals(expectedPath, canonicalInput) ||
-        !registryPathEquals(expectedStorage, canonicalizePath(getStoragePath(expected.path))) ||
-        !registryPathEquals(expectedStorage, canonicalizePath(storagePath)) ||
+        !path.isAbsolute(expectedPath) ||
+        !path.isAbsolute(expectedStorage) ||
+        !registryPathEquals(expectedPath, currentCanonicalInput) ||
+        !registryPathEquals(expectedStorage, currentCanonicalStorage) ||
         related.length !== 1 ||
         matches.length !== 1 ||
+        !match ||
         match.owner.name !== expected.name ||
         normalizeRepositoryRemote(match.owner.remoteUrl) !==
           normalizeRepositoryRemote(expected.remoteUrl) ||
