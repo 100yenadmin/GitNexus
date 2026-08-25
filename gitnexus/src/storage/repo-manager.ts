@@ -1526,17 +1526,29 @@ export const removeBranchIndex = async (repoPath: string, branch: string): Promi
  * repos (never self-heals an unregistered repo, per #2264/#1169; the registry
  * check precedes the rm per #2364 review F2) — and no subprocess is spawned.
  */
-export const adoptFlatBranchLabel = async (repoPath: string, branch: string): Promise<void> => {
+export type FlatBranchAdoptionOutcome = 'ADOPTED' | 'PRIMARY_DRIFT_RECONCILED' | 'NOT_ADOPTED';
+
+export const adoptFlatBranchLabel = async (
+  repoPath: string,
+  branch: string,
+): Promise<FlatBranchAdoptionOutcome> => {
   const canonicalInput = canonicalizePath(repoPath);
   const isRegistered = (list: RegistryEntry[]): number =>
     list.findIndex((e) => registryPathEquals(canonicalizePath(e.path), canonicalInput));
+  const primaryProjection = (entry: RegistryEntry): Omit<RegistryEntry, 'branches'> => {
+    const primary = { ...entry };
+    delete primary.branches;
+    return primary;
+  };
   // Cheap membership gate only (#2364 review F2): never touch the disk for an
   // unregistered repo. Capture only the summary whose deletion this pass may
   // authorize; the locked mutate below re-reads its own fresh snapshot.
   const initialEntries = await readRegistry();
   const initialIdx = isRegistered(initialEntries);
-  if (initialIdx < 0) return; // no-op, disk included (no self-heal)
+  if (initialIdx < 0) return 'NOT_ADOPTED'; // no-op, disk included (no self-heal)
+  const observedPrimary = primaryProjection(initialEntries[initialIdx]);
   const observedSummary = initialEntries[initialIdx].branches?.find((b) => b.branch === branch);
+  if (initialEntries[initialIdx].branch === branch && !observedSummary) return 'ADOPTED';
 
   const resolved = path.resolve(repoPath);
   const { storagePath } = getStoragePaths(resolved);
@@ -1583,10 +1595,10 @@ export const adoptFlatBranchLabel = async (repoPath: string, branch: string): Pr
   // Drop only the exact summary observed before deletion: a concurrent refresh
   // or re-registration describes new work and must survive even though its old
   // directory was removed by this pass.
-  await withRegistryMutationLock(async () => {
+  return withRegistryMutationLock(async () => {
     const entries = await readRegistry();
     const idx = isRegistered(entries);
-    if (idx < 0) return; // unregistered concurrently → still a no-op
+    if (idx < 0) return 'NOT_ADOPTED'; // unregistered concurrently → still a no-op
     const entry = entries[idx];
     const remaining =
       dirGone && observedSummary
@@ -1595,12 +1607,24 @@ export const adoptFlatBranchLabel = async (repoPath: string, branch: string): Pr
           )
         : entry.branches;
     const droppedSummary = (entry.branches?.length ?? 0) !== (remaining?.length ?? 0);
-    if (entry.branch === branch && !droppedSummary) return; // already coherent
+
+    if (!isDeepStrictEqual(primaryProjection(entry), observedPrimary)) {
+      if (!droppedSummary) return 'NOT_ADOPTED';
+      const reconciled = { ...entry };
+      if (remaining && remaining.length > 0) reconciled.branches = remaining;
+      else delete reconciled.branches;
+      entries[idx] = reconciled;
+      await writeRegistry(entries);
+      return 'PRIMARY_DRIFT_RECONCILED';
+    }
+
+    if (entry.branch === branch && !droppedSummary) return 'ADOPTED';
     const updated = { ...entry, branch };
     if (remaining && remaining.length > 0) updated.branches = remaining;
     else delete updated.branches;
     entries[idx] = updated;
     await writeRegistry(entries);
+    return 'ADOPTED';
   });
 };
 
