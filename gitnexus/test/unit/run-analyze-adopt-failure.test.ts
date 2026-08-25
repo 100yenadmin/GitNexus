@@ -148,6 +148,29 @@ describe('fast-path restamp failure modes (#2364 F3)', () => {
     expect(meta?.branch).toBe('feature/x');
   });
 
+  it.each(['PRIMARY_DRIFT_RECONCILED', 'NOT_ADOPTED'] as const)(
+    '%s retains the prior branch and retry protection',
+    async (outcome) => {
+      const { flatStorage, branchMetaDir } = await seedFlippedWorkspace();
+      const logs: string[] = [];
+      rmCtx.adoptMock.mockResolvedValueOnce(outcome);
+      rmCtx.saveMetaMock.mockClear();
+
+      const first = await runFullAnalysis(tmpRepo.dbPath, {}, { onLog: (m) => logs.push(m) });
+
+      expect(first.alreadyUpToDate).toBe(true);
+      expect(rmCtx.saveMetaMock).not.toHaveBeenCalled();
+      expect((await loadMeta(flatStorage))?.branch).toBe('main');
+      expect(logs.some((m) => m.includes(outcome) && m.includes('retry protection'))).toBe(true);
+      await expect(fs.access(branchMetaDir)).resolves.toBeUndefined();
+
+      const retry = await runFullAnalysis(tmpRepo.dbPath, {}, {});
+      expect(retry.alreadyUpToDate).toBe(true);
+      expect((await loadMeta(flatStorage))?.branch).toBe('feature/x');
+      await expect(fs.access(branchMetaDir)).rejects.toThrow();
+    },
+  );
+
   it.each(['EROFS', 'EACCES', 'EPERM'] as const)(
     '"Already up to date" still succeeds when the restamp hits %s (#1549, gap 7)',
     async (code) => {
