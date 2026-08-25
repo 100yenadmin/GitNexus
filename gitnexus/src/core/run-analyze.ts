@@ -864,6 +864,12 @@ const runFullAnalysisImpl = async (
       );
       return preservePreAdoptionBranch(meta);
     }
+    if (
+      Object.prototype.hasOwnProperty.call(meta, 'branch') &&
+      meta.branch === implicitFlatBranch
+    ) {
+      return meta;
+    }
     const adoptedMeta = { ...meta, branch: implicitFlatBranch };
     await saveMeta(canonicalMetaDir, adoptedMeta);
     return adoptedMeta;
@@ -1952,9 +1958,8 @@ const runFullAnalysisImpl = async (
         // stamp, mirroring the end-of-run meta write.
         if (
           !stagedPaths &&
-          !placement.branch &&
-          branchLabel &&
-          existingMeta.branch !== branchLabel
+          implicitFlatBranch &&
+          (!options.incrementalOnly || existingMeta.branch !== implicitFlatBranch)
         ) {
           if (options.incrementalOnly) {
             incrementalOnlyStop('the flat index branch label requires a metadata restamp');

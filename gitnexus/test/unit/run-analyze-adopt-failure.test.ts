@@ -38,6 +38,7 @@ vi.mock('../../src/storage/repo-manager.js', async (importOriginal) => {
 
 import {
   getStoragePaths,
+  listRegisteredRepos,
   registerRepo,
   loadMeta,
   INCREMENTAL_SCHEMA_VERSION,
@@ -187,6 +188,33 @@ describe('fast-path restamp failure modes (#2364 F3)', () => {
       expect(meta?.branch).toBe('main');
     },
   );
+
+  it('reconciles the registry when checkout returns to the prior branch after restamp failure', async () => {
+    const { flatStorage } = await seedFlippedWorkspace();
+    rmCtx.saveMetaMock.mockRejectedValueOnce(Object.assign(new Error('mock ro'), { code: 'EIO' }));
+
+    const first = await runFullAnalysis(tmpRepo.dbPath, {}, {});
+
+    expect(first.alreadyUpToDate).toBe(true);
+    expect((await loadMeta(flatStorage))?.branch).toBe('main');
+    expect(
+      (await listRegisteredRepos()).find((entry) => entry.path === tmpRepo.dbPath)?.branch,
+    ).toBe('feature/x');
+
+    execSync('git checkout main', { cwd: tmpRepo.dbPath, stdio: 'pipe' });
+    rmCtx.adoptMock.mockClear();
+    rmCtx.saveMetaMock.mockClear();
+
+    const retry = await runFullAnalysis(tmpRepo.dbPath, {}, {});
+
+    expect(retry.alreadyUpToDate).toBe(true);
+    expect(rmCtx.adoptMock).toHaveBeenCalledWith(tmpRepo.dbPath, 'main');
+    expect(rmCtx.saveMetaMock).not.toHaveBeenCalled();
+    expect((await loadMeta(flatStorage))?.branch).toBe('main');
+    expect(
+      (await listRegisteredRepos()).find((entry) => entry.path === tmpRepo.dbPath)?.branch,
+    ).toBe('main');
+  });
 
   it.each(['EROFS', 'EACCES', 'EPERM'] as const)(
     'verified count remains usable when its metadata restamp hits %s',
