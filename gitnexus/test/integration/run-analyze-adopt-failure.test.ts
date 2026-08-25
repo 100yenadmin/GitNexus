@@ -217,4 +217,91 @@ describe('end-of-run adopt is best-effort (#2364 F5)', () => {
       await tmp.cleanup();
     }
   }, 180_000);
+
+  it('same-branch staged promotion leaves no branch-adoption marker', async () => {
+    const tmp = await createTempDir('gitnexus-adopt-same-branch-staged-');
+    const repo = tmp.dbPath;
+    try {
+      execSync('git init', { cwd: repo, stdio: 'pipe' });
+      await fs.writeFile(path.join(repo, 'a.ts'), 'export const a = 1;\n');
+      execSync('git add -A', { cwd: repo, stdio: 'pipe' });
+      execSync('git -c user.name=t -c user.email=t@t commit -m a', {
+        cwd: repo,
+        stdio: 'pipe',
+      });
+      execSync('git branch -M main', { cwd: repo, stdio: 'pipe' });
+      await runFullAnalysis(
+        repo,
+        { skipAgentsMd: true, skipSkills: true },
+        { onProgress: () => {} },
+      );
+
+      await fs.writeFile(path.join(repo, 'a.ts'), 'export const a = 2;\n');
+      execSync('git add -A', { cwd: repo, stdio: 'pipe' });
+      execSync('git -c user.name=t -c user.email=t@t commit -m b', {
+        cwd: repo,
+        stdio: 'pipe',
+      });
+      await runFullAnalysis(
+        repo,
+        { staged: true, dropEmbeddings: true, skipAgentsMd: true, skipSkills: true },
+        { onProgress: () => {} },
+      );
+
+      const meta = await loadMeta(getStoragePaths(repo).storagePath);
+      expect(meta?.branch).toBe('main');
+      expect(meta?.incrementalInProgress).toBeUndefined();
+      const entry = (await listRegisteredRepos()).find(
+        (candidate) => path.resolve(candidate.path) === path.resolve(repo),
+      );
+      expect(entry?.branch).toBe('main');
+      expect(entry?.incrementalInProgress).toBeUndefined();
+    } finally {
+      await tmp.cleanup();
+    }
+  }, 180_000);
+
+  it('differing-branch staged promotion restamps only after adoption', async () => {
+    const tmp = await createTempDir('gitnexus-adopt-different-branch-staged-');
+    const repo = tmp.dbPath;
+    try {
+      execSync('git init', { cwd: repo, stdio: 'pipe' });
+      await fs.writeFile(path.join(repo, 'a.ts'), 'export const a = 1;\n');
+      execSync('git add -A', { cwd: repo, stdio: 'pipe' });
+      execSync('git -c user.name=t -c user.email=t@t commit -m a', {
+        cwd: repo,
+        stdio: 'pipe',
+      });
+      execSync('git branch -M main', { cwd: repo, stdio: 'pipe' });
+      await runFullAnalysis(
+        repo,
+        { skipAgentsMd: true, skipSkills: true },
+        { onProgress: () => {} },
+      );
+
+      execSync('git checkout -b feature/x', { cwd: repo, stdio: 'pipe' });
+      await fs.writeFile(path.join(repo, 'a.ts'), 'export const a = 2;\n');
+      execSync('git add -A', { cwd: repo, stdio: 'pipe' });
+      execSync('git -c user.name=t -c user.email=t@t commit -m b', {
+        cwd: repo,
+        stdio: 'pipe',
+      });
+      await runFullAnalysis(
+        repo,
+        { staged: true, dropEmbeddings: true, skipAgentsMd: true, skipSkills: true },
+        { onProgress: () => {} },
+      );
+
+      const meta = await loadMeta(getStoragePaths(repo).storagePath);
+      expect(meta?.branch).toBe('feature/x');
+      expect(meta?.incrementalInProgress).toBeUndefined();
+      const entry = (await listRegisteredRepos()).find(
+        (candidate) => path.resolve(candidate.path) === path.resolve(repo),
+      );
+      expect(entry?.branch).toBe('feature/x');
+      expect(entry?.incrementalInProgress).toBeUndefined();
+    } finally {
+      await tmp.cleanup();
+    }
+  }, 180_000);
 });

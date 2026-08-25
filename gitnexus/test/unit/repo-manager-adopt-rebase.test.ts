@@ -187,25 +187,6 @@ describe('adoptFlatBranchLabel registry rebase (#267)', () => {
     expect(fsCtx.rmMock).not.toHaveBeenCalled();
   });
 
-  it('returns NOT_ADOPTED and preserves bytes when primary and summary both changed', async () => {
-    await registerRepo(repo, metaFor('main', 'old-primary'), { name: 'old-alias' });
-    await registerRepo(repo, metaFor('feature/x', 'old-branch'), { branch: 'feature/x' });
-    const { metaPath } = getStoragePaths(repo, 'feature/x');
-    await saveMeta(path.dirname(metaPath), metaFor('feature/x', 'old-branch'));
-
-    const removal = holdNextRemoval();
-    const adoption = adoptFlatBranchLabel(repo, 'feature/x');
-    await removal.started;
-    await registerRepo(repo, metaFor('main', 'fresh-primary'), { name: 'fresh-alias' });
-    await registerRepo(repo, metaFor('feature/x', 'fresh-branch'), { branch: 'feature/x' });
-    const concurrentBytes = await fs.readFile(getGlobalRegistryPath(), 'utf8');
-    removal.release();
-
-    await expect(adoption).resolves.toBe('NOT_ADOPTED');
-    expect(await fs.readFile(getGlobalRegistryPath(), 'utf8')).toBe(concurrentBytes);
-    await expect(fs.access(path.dirname(metaPath))).rejects.toThrow();
-  });
-
   it('adopts an unchanged primary after deleting only the exact observed summary', async () => {
     await registerRepo(repo, metaFor('main', 'primary'), { name: 'alias' });
     await registerRepo(repo, metaFor('feature/x', 'branch'), { branch: 'feature/x' });

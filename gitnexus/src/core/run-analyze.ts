@@ -845,6 +845,9 @@ const runFullAnalysisImpl = async (
     canonicalMetaBeforeAdoption !== null &&
     Object.prototype.hasOwnProperty.call(canonicalMetaBeforeAdoption, 'branch');
   const canonicalBranchBeforeAdoption = canonicalMetaBeforeAdoption?.branch;
+  const implicitFlatBranchAdoptionPending =
+    implicitFlatBranch !== null &&
+    (!canonicalBranchExistedBeforeAdoption || canonicalBranchBeforeAdoption !== implicitFlatBranch);
   const preservePreAdoptionBranch = (meta: RepoMeta): RepoMeta => {
     if (!implicitFlatBranch) return meta;
     const protectedMeta = { ...meta };
@@ -854,7 +857,9 @@ const runFullAnalysisImpl = async (
   };
   const markPendingImplicitFlatAdoption = (meta: RepoMeta): RepoMeta => {
     const protectedMeta = preservePreAdoptionBranch(meta);
-    if (!implicitFlatBranch) return protectedMeta;
+    if (!implicitFlatBranchAdoptionPending || protectedMeta.incrementalInProgress) {
+      return protectedMeta;
+    }
     const now = Date.now();
     return {
       ...protectedMeta,
@@ -868,7 +873,7 @@ const runFullAnalysisImpl = async (
     };
   };
   const savePreAdoptionMeta = (metaDir: string, meta: RepoMeta): Promise<void> =>
-    saveMeta(metaDir, preservePreAdoptionBranch(meta));
+    saveMeta(metaDir, markPendingImplicitFlatAdoption(meta));
   const adoptAndRestampImplicitFlatBranch = async (meta: RepoMeta): Promise<RepoMeta> => {
     if (!implicitFlatBranch) return meta;
     const outcome = await adoptFlatBranchLabel(repoPath, implicitFlatBranch);
@@ -879,17 +884,29 @@ const runFullAnalysisImpl = async (
       );
       return preservePreAdoptionBranch(meta);
     }
+    // The staged commit callback may have persisted a protected copy that is
+    // not the same object as `meta`. Inspect the canonical file itself before
+    // taking the coherent-state shortcut, so a staged adoption marker cannot
+    // survive just because the caller's copy was unmarked.
+    const persistedMeta = await loadMeta(canonicalMetaDir);
     if (
-      Object.prototype.hasOwnProperty.call(meta, 'branch') &&
-      meta.branch === implicitFlatBranch &&
-      !meta.incrementalInProgress
+      persistedMeta &&
+      Object.prototype.hasOwnProperty.call(persistedMeta, 'branch') &&
+      persistedMeta.branch === implicitFlatBranch &&
+      persistedMeta.incrementalInProgress?.phase !== 'branch-adoption'
     ) {
       return meta;
     }
-    const adoptedMeta = {
+    const canonicalMeta = persistedMeta ?? meta;
+    const dirtyPhase = canonicalMeta.incrementalInProgress;
+    const adoptedMeta: RepoMeta = {
+      ...canonicalMeta,
       ...meta,
       branch: implicitFlatBranch,
-      incrementalInProgress: undefined,
+      incrementalInProgress:
+        dirtyPhase?.phase === 'branch-adoption'
+          ? undefined
+          : (meta.incrementalInProgress ?? dirtyPhase),
     };
     await saveMeta(canonicalMetaDir, adoptedMeta);
     return adoptedMeta;
