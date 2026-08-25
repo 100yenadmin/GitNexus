@@ -852,6 +852,21 @@ const runFullAnalysisImpl = async (
     else delete protectedMeta.branch;
     return protectedMeta;
   };
+  const markPendingImplicitFlatAdoption = (meta: RepoMeta): RepoMeta => {
+    const protectedMeta = preservePreAdoptionBranch(meta);
+    if (!implicitFlatBranch) return protectedMeta;
+    const now = Date.now();
+    return {
+      ...protectedMeta,
+      incrementalInProgress: {
+        startedAt: now,
+        updatedAt: now,
+        targetCommit: meta.lastCommit,
+        phase: 'branch-adoption',
+        toWriteCount: 0,
+      },
+    };
+  };
   const savePreAdoptionMeta = (metaDir: string, meta: RepoMeta): Promise<void> =>
     saveMeta(metaDir, preservePreAdoptionBranch(meta));
   const adoptAndRestampImplicitFlatBranch = async (meta: RepoMeta): Promise<RepoMeta> => {
@@ -866,17 +881,27 @@ const runFullAnalysisImpl = async (
     }
     if (
       Object.prototype.hasOwnProperty.call(meta, 'branch') &&
-      meta.branch === implicitFlatBranch
+      meta.branch === implicitFlatBranch &&
+      !meta.incrementalInProgress
     ) {
       return meta;
     }
-    const adoptedMeta = { ...meta, branch: implicitFlatBranch };
+    const adoptedMeta = {
+      ...meta,
+      branch: implicitFlatBranch,
+      incrementalInProgress: undefined,
+    };
     await saveMeta(canonicalMetaDir, adoptedMeta);
     return adoptedMeta;
   };
 
-  const commitStagedMetadataAndRegistry = async (meta: RepoMeta): Promise<string> => {
-    const protectedMeta = preservePreAdoptionBranch(meta);
+  const commitStagedMetadataAndRegistry = async (
+    meta: RepoMeta,
+    pendingFlatAdoption = false,
+  ): Promise<string> => {
+    const protectedMeta = pendingFlatAdoption
+      ? markPendingImplicitFlatAdoption(meta)
+      : preservePreAdoptionBranch(meta);
     await saveMeta(canonicalMetaDir, protectedMeta);
     return registerRepo(repoPath, protectedMeta, {
       name: options.registryName,
@@ -1202,7 +1227,7 @@ const runFullAnalysisImpl = async (
       stagedMeta.stats?.embeddings,
     );
     return (
-      await promoteStagedGeneration(paths, commitStagedMetadataAndRegistry, {
+      await promoteStagedGeneration(paths, (meta) => commitStagedMetadataAndRegistry(meta, true), {
         readRepositoryIdentity,
       })
     ).projectName;
@@ -1254,7 +1279,7 @@ const runFullAnalysisImpl = async (
     await validatePendingPromotionEmbeddingCandidate(promotionPaths);
     const recoveredPromotion = await promoteStagedGeneration(
       promotionPaths,
-      commitStagedMetadataAndRegistry,
+      (meta) => commitStagedMetadataAndRegistry(meta, true),
       {
         readRepositoryIdentity,
       },
@@ -3304,7 +3329,8 @@ const runFullAnalysisImpl = async (
         targetCommit: currentCommit,
       });
     }
-    await savePreAdoptionMeta(metaDir, meta);
+    const metadataToCommit = stagedPaths ? meta : markPendingImplicitFlatAdoption(meta);
+    await saveMeta(metaDir, metadataToCommit);
 
     // Persist the incremental parse cache for the next run. Wraps in
     // try/catch so a cache-write failure never breaks an otherwise
@@ -3396,7 +3422,7 @@ const runFullAnalysisImpl = async (
     } else {
       // Forward the --name alias and registry-collision bypass only after the
       // canonical DB is finalized. In staged mode this same commit is journaled.
-      projectName = await registerRepo(repoPath, meta, {
+      projectName = await registerRepo(repoPath, metadataToCommit, {
         name: options.registryName,
         allowDuplicateName: options.allowDuplicateName,
         branch: placement.branch,
@@ -3406,7 +3432,7 @@ const runFullAnalysisImpl = async (
     // ── #2354: the flat workspace slot has adopted this run's branch ──────
     if (implicitFlatBranch) {
       try {
-        await adoptAndRestampImplicitFlatBranch(meta);
+        await adoptAndRestampImplicitFlatBranch(metadataToCommit);
       } catch (e) {
         log(
           `Warning: could not sync the workspace branch label (${(e as Error).message}); continuing.`,

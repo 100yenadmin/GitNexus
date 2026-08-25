@@ -1293,7 +1293,17 @@ export class LocalBackend {
     // old label until the end-of-run atomic stamp (run-analyze dirty stamps
     // spread the existing meta), so this read never runs ahead of the DB.
     const flatMeta = await loadMeta(path.dirname(handle.lbugPath));
-    if (flatMeta?.branch && flatMeta.branch === branch) {
+    // A pre-adoption checkpoint or final metadata projection deliberately
+    // retains the prior branch label while the canonical DB may already hold
+    // the requested branch's generation. Never route that incomplete label:
+    // only the post-ADOPTED restamp clears both markers and makes the flat slot
+    // branch-addressable again.
+    if (
+      flatMeta?.branch &&
+      !flatMeta.incrementalInProgress &&
+      !flatMeta.embeddingCheckpoint &&
+      flatMeta.branch === branch
+    ) {
       // The disk meta decides routing, so it also supplies the metadata —
       // the cached handle's label/commit/stats can predate the restamp.
       return {

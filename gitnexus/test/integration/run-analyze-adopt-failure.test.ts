@@ -98,6 +98,7 @@ describe('end-of-run adopt is best-effort (#2364 F5)', () => {
       const meta = await loadMeta(getStoragePaths(repo).storagePath);
       expect(meta).not.toBeNull();
       expect(Object.prototype.hasOwnProperty.call(meta, 'branch')).toBe(false);
+      expect(meta?.incrementalInProgress?.phase).toBe('branch-adoption');
     } finally {
       await tmp.cleanup();
     }
@@ -133,6 +134,7 @@ describe('end-of-run adopt is best-effort (#2364 F5)', () => {
           execSync('git rev-parse HEAD', { cwd: repo, encoding: 'utf8' }).trim(),
         );
         expect(Object.prototype.hasOwnProperty.call(meta, 'branch')).toBe(false);
+        expect(meta?.incrementalInProgress?.phase).toBe('branch-adoption');
         const entry = (await listRegisteredRepos()).find(
           (candidate) => path.resolve(candidate.path) === path.resolve(repo),
         );
@@ -140,8 +142,11 @@ describe('end-of-run adopt is best-effort (#2364 F5)', () => {
         expect(Object.prototype.hasOwnProperty.call(entry, 'branch')).toBe(false);
 
         const retry = await runFullAnalysis(repo, {}, { onProgress: () => {} });
-        expect(retry.alreadyUpToDate).toBe(true);
+        expect(retry.alreadyUpToDate).toBeFalsy();
         expect((await loadMeta(getStoragePaths(repo).storagePath))?.branch).toBe('main');
+        expect(
+          (await loadMeta(getStoragePaths(repo).storagePath))?.incrementalInProgress,
+        ).toBeUndefined();
       } finally {
         await tmp.cleanup();
       }
@@ -200,6 +205,9 @@ describe('end-of-run adopt is best-effort (#2364 F5)', () => {
 
       expect(result.recoveredPromotionOnly).toBe(true);
       expect((await loadMeta(canonical.storagePath))?.branch).toBe('main');
+      expect((await loadMeta(canonical.storagePath))?.incrementalInProgress?.phase).toBe(
+        'branch-adoption',
+      );
       const entry = (await listRegisteredRepos()).find(
         (candidate) => path.resolve(candidate.path) === path.resolve(repo),
       );
