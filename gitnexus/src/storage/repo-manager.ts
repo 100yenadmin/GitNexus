@@ -941,6 +941,18 @@ export const readRegistry = async (): Promise<RegistryEntry[]> => {
   }
 };
 
+const readRegistryForValidation = async (): Promise<RegistryEntry[]> => {
+  try {
+    const raw = await fs.readFile(getGlobalRegistryPath(), 'utf-8');
+    const data = JSON.parse(raw);
+    if (!Array.isArray(data)) throw new Error('Registry payload must be an array');
+    return data;
+  } catch (error) {
+    if (isMissingFilesystemError(error)) return [];
+    throw error;
+  }
+};
+
 /**
  * Write the global registry to disk. Call only while holding the registry mutation lock.
  */
@@ -1909,13 +1921,44 @@ export const resolveRegistryEntry = (entries: RegistryEntry[], target: string): 
  * therefore "not confirmed present," not "confirmed present"; downstream DB
  * opens are independently and lazily guarded.
  */
+const isRegistryEntryProvablyMissing = async (entry: RegistryEntry): Promise<boolean> => {
+  let indexFound = false;
+  let firstNonMissingError: NodeJS.ErrnoException | null = null;
+  let lastMissingError: NodeJS.ErrnoException | null = null;
+
+  try {
+    await fs.access(path.join(entry.storagePath, INDEX_METADATA_FILE));
+    indexFound = true;
+  } catch (err: any) {
+    if (isMissingFilesystemError(err)) lastMissingError = err;
+    else firstNonMissingError = err;
+  }
+
+  if (!indexFound) {
+    try {
+      await fs.access(path.join(entry.storagePath, LEGACY_METADATA_FILE));
+      indexFound = true;
+    } catch (err: any) {
+      if (isMissingFilesystemError(err)) lastMissingError = err;
+      else if (!firstNonMissingError) firstNonMissingError = err;
+    }
+  }
+
+  if (indexFound) return false;
+  if (!firstNonMissingError && lastMissingError) return true;
+  logger.warn(
+    { name: entry.name, storagePath: entry.storagePath, code: firstNonMissingError?.code },
+    'Keeping registry entry despite fs.access failure (not provably absent); not pruning to avoid mass registry wipe.',
+  );
+  return false;
+};
+
 export const listRegisteredRepos = async (opts?: {
   validate?: boolean;
 }): Promise<RegistryEntry[]> => {
-  const entries = await readRegistry();
-  if (!opts?.validate) return entries;
+  if (!opts?.validate) return readRegistry();
+  const entries = await readRegistryForValidation();
 
-  // Validate each entry still has a .gitnexus/ directory with metadata
   const prunable: RegistryEntry[] = [];
   for (const entry of entries) {
     // Named to avoid shadowing the exported `hasIndex` function above.
@@ -1944,12 +1987,8 @@ export const listRegisteredRepos = async (opts?: {
     }
 
     if (!indexFound && !firstNonMissingError && lastMissingError) {
-      // Index genuinely removed — safe to prune
       prunable.push(entry);
     } else if (!indexFound) {
-      // Not provably absent — keep entry to prevent mass registry wipe.
-      // Warn so an I/O storm becomes observable instead of silently
-      // keeping (or, pre-fix, silently wiping) entries.
       logger.warn(
         { name: entry.name, storagePath: entry.storagePath, code: firstNonMissingError?.code },
         'Keeping registry entry despite fs.access failure (not provably absent); not pruning to avoid mass registry wipe.',
@@ -1959,14 +1998,14 @@ export const listRegisteredRepos = async (opts?: {
 
   if (prunable.length === 0) return entries;
 
-  // Metadata probes stay outside the registry lock. Rebase their exact
-  // snapshot identities against one fresh registry read so validation cannot
-  // erase a concurrent update or re-registration.
+  // Final lock-held revalidation closes the identical re-registration race.
   return withRegistryMutationLock(async () => {
-    const fresh = await readRegistry();
-    const rebased = fresh.filter(
-      (entry) => !prunable.some((candidate) => isDeepStrictEqual(entry, candidate)),
-    );
+    const fresh = await readRegistryForValidation();
+    const rebased: RegistryEntry[] = [];
+    for (const entry of fresh) {
+      const exactCandidate = prunable.some((candidate) => isDeepStrictEqual(entry, candidate));
+      if (!exactCandidate || !(await isRegistryEntryProvablyMissing(entry))) rebased.push(entry);
+    }
     if (rebased.length !== fresh.length) await writeRegistry(rebased);
     return rebased;
   });

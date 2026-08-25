@@ -38,6 +38,14 @@ const readRegistryFromDisk = async (): Promise<any[]> => {
   return JSON.parse(raw);
 };
 
+const deferred = () => {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+};
+
 describe('listRegisteredRepos({ validate: true }) — transient error safety (PR #2124)', () => {
   let tmpHome: { dbPath: string; cleanup: () => Promise<void> };
   let tmpRepo: { dbPath: string; cleanup: () => Promise<void> };
@@ -321,33 +329,27 @@ describe('listRegisteredRepos({ validate: true }) — transient error safety (PR
       await fs.mkdir(path.dirname(presentMetaPath), { recursive: true });
       await fs.writeFile(presentMetaPath, JSON.stringify(mockMeta));
 
-      let releaseProbe: (() => void) | undefined;
-      const probeHeld = new Promise<void>((resolveHeld) => {
-        releaseProbe = resolveHeld;
-      });
-      let signalProbeHeld: (() => void) | undefined;
-      const probeStarted = new Promise<void>((resolveStarted) => {
-        signalProbeHeld = resolveStarted;
-      });
+      const releaseProbe = deferred();
+      const probeStarted = deferred();
       const refreshedMetadataPath = path.join(tmpRepo.dbPath, '.gitnexus', 'gitnexus.json');
       const originalAccess = fs.access;
       vi.spyOn(fs, 'access').mockImplementation(async (p, mode) => {
         const pStr = typeof p === 'string' ? p : p.toString();
         if (pStr === refreshedMetadataPath) {
-          signalProbeHeld?.();
-          await probeHeld;
+          probeStarted.resolve();
+          await releaseProbe.promise;
         }
         return (originalAccess as any).call(fs, p, mode);
       });
 
       const validation = listRegisteredRepos({ validate: true });
-      await probeStarted;
+      await probeStarted.promise;
       await registerRepo(tmpRepo.dbPath, {
         ...mockMeta,
         lastCommit: 'fresh-owner',
         indexedAt: '2026-08-25T16:30:00.000Z',
       });
-      releaseProbe?.();
+      releaseProbe.resolve();
 
       const returned = await validation;
       const persisted = await readRegistryFromDisk();
@@ -362,6 +364,66 @@ describe('listRegisteredRepos({ validate: true }) — transient error safety (PR
       });
     } finally {
       await presentRepo.cleanup();
+      await missingRepo.cleanup();
+    }
+  });
+
+  it('throws on a transient locked registry reread without returning a false empty list', async () => {
+    await registerRepo(tmpRepo.dbPath, mockMeta);
+    const before = await readRegistryFromDisk();
+    const registryPath = path.join(process.env.GITNEXUS_HOME as string, 'registry.json');
+    const originalReadFile = fs.readFile;
+    let registryReads = 0;
+    const readSpy = vi.spyOn(fs, 'readFile').mockImplementation(async (p, options) => {
+      const pStr = typeof p === 'string' ? p : p.toString();
+      if (pStr === registryPath && ++registryReads === 2) {
+        const err = new Error('input/output error') as NodeJS.ErrnoException;
+        err.code = 'EIO';
+        throw err;
+      }
+      return (originalReadFile as any).call(fs, p, options);
+    });
+
+    await expect(listRegisteredRepos({ validate: true })).rejects.toMatchObject({ code: 'EIO' });
+    readSpy.mockRestore();
+    expect(await readRegistryFromDisk()).toEqual(before);
+  });
+
+  it('preserves a structurally identical re-registration completed after the initial probe', async () => {
+    const missingRepo = await createTempDir('gitnexus-prune-identical-missing-');
+    try {
+      const refreshedName = await registerRepo(tmpRepo.dbPath, mockMeta);
+      const missingName = await registerRepo(missingRepo.dbPath, mockMeta);
+      const refreshedMetadataPath = path.join(tmpRepo.dbPath, '.gitnexus', 'gitnexus.json');
+      const releaseProbe = deferred();
+      const probeStarted = deferred();
+      const originalAccess = fs.access;
+      let heldInitialProbe = false;
+      vi.spyOn(fs, 'access').mockImplementation(async (p, mode) => {
+        const pStr = typeof p === 'string' ? p : p.toString();
+        if (pStr === refreshedMetadataPath && !heldInitialProbe) {
+          heldInitialProbe = true;
+          probeStarted.resolve();
+          await releaseProbe.promise;
+          const err = new Error('no such file') as NodeJS.ErrnoException;
+          err.code = 'ENOENT';
+          throw err;
+        }
+        return (originalAccess as any).call(fs, p, mode);
+      });
+
+      const validation = listRegisteredRepos({ validate: true });
+      await probeStarted.promise;
+      await fs.mkdir(path.dirname(refreshedMetadataPath), { recursive: true });
+      await fs.writeFile(refreshedMetadataPath, JSON.stringify(mockMeta));
+      await registerRepo(tmpRepo.dbPath, mockMeta);
+      releaseProbe.resolve();
+
+      const returned = await validation;
+      expect(returned).toEqual(await readRegistryFromDisk());
+      expect(returned.some((entry) => entry.name === refreshedName)).toBe(true);
+      expect(returned.some((entry) => entry.name === missingName)).toBe(false);
+    } finally {
       await missingRepo.cleanup();
     }
   });
