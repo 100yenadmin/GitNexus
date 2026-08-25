@@ -93,34 +93,30 @@ type FrozenRegistryOwner = RegistryEntry & {
   canonicalStoragePath: string;
 };
 
-const assertZeroClearRegistryOwner = async (
-  entry: RegistryEntry,
-  clearedMeta: RepoMeta,
-): Promise<FrozenRegistryOwner> => {
-  if (
-    !path.isAbsolute(entry.path) ||
-    !path.isAbsolute(entry.storagePath) ||
-    !path.isAbsolute(clearedMeta.repoPath)
-  ) {
+const freezeZeroClearRegistryOwner = (entry: RegistryEntry): FrozenRegistryOwner => {
+  if (!path.isAbsolute(entry.path) || !path.isAbsolute(entry.storagePath)) {
     throw new Error(
       'Cannot finalize zero-checkpoint embedding: path/storage identity is non-absolute or mismatched',
     );
   }
-  // Freeze both identities before the registry read. The raw path forms stay
-  // on the owner for display/backward compatibility; the canonical forms are
-  // internal compare-and-save fingerprints only.
   const canonicalPath = canonicalizePath(entry.path);
   const canonicalStoragePath = canonicalizePath(entry.storagePath);
-  const expectedStoragePath = canonicalizePath(getStoragePath(entry.path));
   if (
-    !registryPathEquals(canonicalStoragePath, expectedStoragePath) ||
-    !registryPathEquals(canonicalizePath(clearedMeta.repoPath), canonicalPath)
+    !path.isAbsolute(canonicalPath) ||
+    !path.isAbsolute(canonicalStoragePath) ||
+    !registryPathEquals(canonicalStoragePath, canonicalizePath(getStoragePath(entry.path)))
   ) {
     throw new Error(
       'Cannot finalize zero-checkpoint embedding: path/storage identity is non-absolute or mismatched',
     );
   }
+  return { ...entry, canonicalPath, canonicalStoragePath };
+};
 
+const assertZeroClearRegistryOwner = async (
+  entry: FrozenRegistryOwner,
+  clearedMeta: RepoMeta,
+): Promise<FrozenRegistryOwner> => {
   // listRegisteredRepos() yields the current raw display fields. Recheck the
   // path and storage identities after that await so a retarget during the
   // preflight cannot reuse the original entry.
@@ -130,14 +126,17 @@ const assertZeroClearRegistryOwner = async (
       ? canonicalizePath(owner.storagePath)
       : undefined;
     return (
-      (ownerPath !== undefined && registryPathEquals(ownerPath, canonicalPath)) ||
-      (ownerStoragePath !== undefined && registryPathEquals(ownerStoragePath, canonicalStoragePath))
+      (ownerPath !== undefined && registryPathEquals(ownerPath, entry.canonicalPath)) ||
+      (ownerStoragePath !== undefined &&
+        registryPathEquals(ownerStoragePath, entry.canonicalStoragePath))
     );
   });
   if (
-    !registryPathEquals(canonicalizePath(entry.path), canonicalPath) ||
-    !registryPathEquals(canonicalizePath(entry.storagePath), canonicalStoragePath) ||
-    !registryPathEquals(canonicalizePath(getStoragePath(entry.path)), canonicalStoragePath)
+    !registryPathEquals(canonicalizePath(entry.path), entry.canonicalPath) ||
+    !registryPathEquals(canonicalizePath(entry.storagePath), entry.canonicalStoragePath) ||
+    !registryPathEquals(canonicalizePath(getStoragePath(entry.path)), entry.canonicalStoragePath) ||
+    !path.isAbsolute(clearedMeta.repoPath) ||
+    !registryPathEquals(canonicalizePath(clearedMeta.repoPath), entry.canonicalPath)
   ) {
     throw new Error(
       'Cannot finalize zero-checkpoint embedding: path/storage identity is non-absolute or mismatched',
@@ -153,8 +152,8 @@ const assertZeroClearRegistryOwner = async (
     (owner) =>
       path.isAbsolute(owner.path) &&
       path.isAbsolute(owner.storagePath) &&
-      registryPathEquals(canonicalizePath(owner.path), canonicalPath) &&
-      registryPathEquals(canonicalizePath(owner.storagePath), canonicalStoragePath),
+      registryPathEquals(canonicalizePath(owner.path), entry.canonicalPath) &&
+      registryPathEquals(canonicalizePath(owner.storagePath), entry.canonicalStoragePath),
   );
   if (owners.length > 1) {
     throw new Error(
@@ -180,7 +179,7 @@ const assertZeroClearRegistryOwner = async (
   ) {
     throw new Error('Cannot finalize zero-checkpoint embedding: registry owner identity changed');
   }
-  return { ...owner, canonicalPath, canonicalStoragePath };
+  return entry;
 };
 
 const assertFrozenZeroClearRegistryOwner = (
@@ -2061,18 +2060,19 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
           res.status(404).json({ error: 'Repository not found' });
           return;
         }
+        const frozenOwner = freezeZeroClearRegistryOwner(entry);
 
         // Check shared repo lock — prevent concurrent analyze + embed on same repo
-        const repoLockPath = entry.storagePath;
+        const repoLockPath = frozenOwner.canonicalStoragePath;
         const lockErr = acquireRepoLock(repoLockPath);
         if (lockErr) {
           res.status(409).json({ error: lockErr });
           return;
         }
 
-        const job = embedJobManager.createJob({ repoPath: entry.storagePath });
+        const job = embedJobManager.createJob({ repoPath: frozenOwner.canonicalStoragePath });
         embedJobManager.updateJob(job.id, {
-          repoName: entry.name,
+          repoName: frozenOwner.name,
           status: 'analyzing' as any,
           progress: { phase: 'analyzing', percent: 0, message: 'Starting embedding generation...' },
         });
@@ -2105,9 +2105,9 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         // Run embedding pipeline asynchronously
         (async () => {
           try {
-            const lbugPath = path.join(entry.storagePath, 'lbug');
+            const lbugPath = path.join(frozenOwner.canonicalStoragePath, 'lbug');
             const { inspectEmbeddingIntegrity } = await import('../core/lbug/lbug-adapter.js');
-            const tentativeMeta = await loadMeta(entry.storagePath);
+            const tentativeMeta = await loadMeta(frozenOwner.canonicalStoragePath);
             if (!tentativeMeta) {
               throw new Error('Repository metadata is missing; run gitnexus analyze first');
             }
@@ -2134,7 +2134,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
             }
             if (tentativeLegacy) {
               await withLbugReadOnlyNonRecovering(lbugPath, async () => {
-                const embeddingMeta = await loadMeta(entry.storagePath);
+                const embeddingMeta = await loadMeta(frozenOwner.canonicalStoragePath);
                 if (
                   !embeddingMeta ||
                   embeddingMetaFingerprint(embeddingMeta) !== tentativeFingerprint ||
@@ -2159,7 +2159,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
               });
             }
             await withLbugDb(lbugPath, async () => {
-              let embeddingMeta = await loadMeta(entry.storagePath);
+              let embeddingMeta = await loadMeta(frozenOwner.canonicalStoragePath);
               const authoritativeLegacy = isEmptyLegacyCheckpoint(
                 embeddingMeta?.embeddingCheckpoint,
               );
@@ -2197,7 +2197,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                     embeddingCheckpoint: undefined,
                   };
                   await commitEmbedMetadata(barrier, 'COMMITTING_TERMINAL', async () => {
-                    const owner = await assertZeroClearRegistryOwner(entry, clearedMeta);
+                    const owner = await assertZeroClearRegistryOwner(frozenOwner, clearedMeta);
                     await registerRepo(owner.path, clearedMeta, {
                       name: owner.name,
                       allowDuplicateName: true,
@@ -2273,7 +2273,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                   },
                 };
                 await commitEmbedMetadata(barrier, 'COMMITTING_CHECKPOINT', () =>
-                  saveMeta(entry.storagePath, checkpointMeta),
+                  saveMeta(frozenOwner.canonicalStoragePath, checkpointMeta),
                 );
                 embeddingMeta = checkpointMeta;
               };
@@ -2349,7 +2349,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                 embeddingCheckpoint: undefined,
               };
               await commitEmbedMetadata(barrier, 'COMMITTING_TERMINAL', () =>
-                saveMeta(entry.storagePath, terminalMeta),
+                saveMeta(frozenOwner.canonicalStoragePath, terminalMeta),
               );
               embeddingMeta = terminalMeta;
             });

@@ -36,20 +36,21 @@ const makeIntegrity = (digest: string, physicalRows = 3): EmbeddingIntegrityRepo
   recoverableIdentitySha256: digest,
 });
 
-const makeMeta = (digest: string): RepoMeta => ({
-  repoPath: REPO.path,
+const makeMeta = (digest: string, repoPath = REPO.path, zeroCheckpoint = false): RepoMeta => ({
+  repoPath,
   lastCommit: REPO.lastCommit,
   indexedAt: REPO.indexedAt,
   stats: { embeddings: 3 },
   embeddingCheckpoint: {
     at: REPO.indexedAt,
-    nodesProcessed: 1,
-    totalNodes: 2,
+    nodesProcessed: zeroCheckpoint ? 0 : 1,
+    totalNodes: zeroCheckpoint ? 0 : 2,
     chunksProcessed: 3,
     ...identity,
-    physicalRows: 3,
-    validRows: 3,
-    recoverableIdentitySha256: digest,
+    provider: zeroCheckpoint ? undefined : identity.provider,
+    physicalRows: zeroCheckpoint ? undefined : 3,
+    validRows: zeroCheckpoint ? undefined : 3,
+    recoverableIdentitySha256: zeroCheckpoint ? undefined : digest,
     pendingNodeIds: [],
   },
 });
@@ -95,6 +96,30 @@ const armDeleteHandlerSignal = (): Promise<void> =>
       resolve();
     };
   });
+
+const prepareSymlinkRace = async (prefix: string) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
+  const targetA = path.join(root, 'canonical-a');
+  const targetB = path.join(root, 'canonical-b');
+  const alias = path.join(root, 'repo-alias');
+  await Promise.all([
+    fs.mkdir(path.join(targetA, '.gitnexus'), { recursive: true }),
+    fs.mkdir(path.join(targetB, '.gitnexus'), { recursive: true }),
+  ]);
+  await fs.symlink(targetA, alias, 'dir');
+  const raceRepo = { ...REPO, path: alias, storagePath: path.join(alias, '.gitnexus') };
+  state.currentMeta = makeMeta(LIVE_DIGEST, alias, true);
+  Object.assign(state, { liveIntegrity: makeIntegrity(LIVE_DIGEST, 0), graphNodes: [] });
+  return {
+    root,
+    alias,
+    raceRepo,
+    retarget: async () => {
+      await fs.unlink(alias);
+      await fs.symlink(targetB, alias, 'dir');
+    },
+  };
+};
 
 vi.doMock('../../src/storage/repo-manager.js', async () => ({
   ...(await vi.importActual<typeof import('../../src/storage/repo-manager.js')>(
@@ -186,6 +211,35 @@ const waitForTerminalJob = async (baseUrl: string, jobId: string) => {
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   throw new Error(`embedding job ${jobId} did not reach a terminal state`);
+};
+
+const runEmbedJob = async (baseUrl: string, repo: string) => {
+  const response = await fetch(`${baseUrl}/api/embed`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ repo }),
+  });
+  const { jobId } = (await response.json()) as { jobId: string };
+  return waitForTerminalJob(baseUrl, jobId);
+};
+
+const runSymlinkRace = async (
+  fixture: Awaited<ReturnType<typeof prepareSymlinkRace>>,
+  error: RegExp,
+  assertSpecific: () => void,
+): Promise<void> => {
+  try {
+    const checkpointBefore = JSON.stringify(state.currentMeta.embeddingCheckpoint);
+    const job = await runEmbedJob(baseUrl, fixture.raceRepo.name);
+    expect(job.status).toBe('failed');
+    expect(job.error).toMatch(error);
+    assertSpecific();
+    expect(state.saveMeta).not.toHaveBeenCalled();
+    expect(JSON.stringify(state.currentMeta.embeddingCheckpoint)).toBe(checkpointBefore);
+    expect(state.currentMeta.repoPath).toBe(fixture.alias);
+  } finally {
+    await fs.rm(fixture.root, { recursive: true, force: true });
+  }
 };
 
 describe('POST /api/embed completed-checkpoint identity', () => {
@@ -503,116 +557,46 @@ describe('POST /api/embed completed-checkpoint identity', () => {
   });
 
   it('retains the checkpoint when the owner symlink retargets after registry commit', async () => {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-issue269-'));
-    const targetA = path.join(root, 'canonical-a');
-    const targetB = path.join(root, 'canonical-b');
-    const alias = path.join(root, 'repo-alias');
-    await fs.mkdir(path.join(targetA, '.gitnexus'), { recursive: true });
-    await fs.mkdir(path.join(targetB, '.gitnexus'), { recursive: true });
-    await fs.symlink(targetA, alias, 'dir');
-
-    const raceRepo: RegistryEntry = {
-      ...REPO,
-      path: alias,
-      storagePath: path.join(alias, '.gitnexus'),
-    };
-    const raceMeta = { ...makeMeta(LIVE_DIGEST), repoPath: alias };
-    state.currentMeta = raceMeta;
-    state.currentMeta.embeddingCheckpoint = {
-      ...state.currentMeta.embeddingCheckpoint!,
-      nodesProcessed: 0,
-      totalNodes: 0,
-      provider: undefined,
-      physicalRows: undefined,
-      validRows: undefined,
-      recoverableIdentitySha256: undefined,
-    };
-    state.liveIntegrity = makeIntegrity(LIVE_DIGEST, 0);
-    state.graphNodes = [];
-    state.listRegisteredRepos.mockResolvedValue([raceRepo]);
+    const fixture = await prepareSymlinkRace('gitnexus-issue269-');
+    state.listRegisteredRepos.mockResolvedValue([fixture.raceRepo]);
     state.registerRepo.mockImplementation(async () => {
-      await fs.unlink(alias);
-      await fs.symlink(targetB, alias, 'dir');
-      return raceRepo.name;
+      await fixture.retarget();
+      return fixture.raceRepo.name;
     });
-    const checkpointBefore = JSON.stringify(state.currentMeta.embeddingCheckpoint);
 
-    try {
-      const response = await fetch(`${baseUrl}/api/embed`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ repo: raceRepo.name }),
-      });
-      const { jobId } = (await response.json()) as { jobId: string };
-      const job = await waitForTerminalJob(baseUrl, jobId);
-
-      expect(job.status).toBe('failed');
-      expect(job.error).toMatch(/path\/storage identity is non-absolute or mismatched/i);
+    await runSymlinkRace(fixture, /path\/storage identity is non-absolute or mismatched/i, () => {
       expect(state.registerRepo).toHaveBeenCalledOnce();
-      expect(state.saveMeta).not.toHaveBeenCalled();
-      expect(JSON.stringify(state.currentMeta.embeddingCheckpoint)).toBe(checkpointBefore);
-      expect(state.currentMeta.repoPath).toBe(alias);
-    } finally {
-      await fs.rm(root, { recursive: true, force: true });
-    }
+    });
   });
 
   it('rejects a symlink retarget during zero-checkpoint preflight before registerRepo', async () => {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-issue269-preflight-'));
-    const targetA = path.join(root, 'canonical-a');
-    const targetB = path.join(root, 'canonical-b');
-    const alias = path.join(root, 'repo-alias');
-    await fs.mkdir(path.join(targetA, '.gitnexus'), { recursive: true });
-    await fs.mkdir(path.join(targetB, '.gitnexus'), { recursive: true });
-    await fs.symlink(targetA, alias, 'dir');
-
-    const raceRepo: RegistryEntry = {
-      ...REPO,
-      path: alias,
-      storagePath: path.join(alias, '.gitnexus'),
-    };
-    const raceMeta = { ...makeMeta(LIVE_DIGEST), repoPath: alias };
-    state.currentMeta = raceMeta;
-    state.currentMeta.embeddingCheckpoint = {
-      ...state.currentMeta.embeddingCheckpoint!,
-      nodesProcessed: 0,
-      totalNodes: 0,
-      provider: undefined,
-      physicalRows: undefined,
-      validRows: undefined,
-      recoverableIdentitySha256: undefined,
-    };
-    state.liveIntegrity = makeIntegrity(LIVE_DIGEST, 0);
-    state.graphNodes = [];
+    const fixture = await prepareSymlinkRace('gitnexus-issue269-preflight-');
     let registryReads = 0;
     state.listRegisteredRepos.mockImplementation(async () => {
       registryReads += 1;
       if (registryReads === 2) {
-        await fs.unlink(alias);
-        await fs.symlink(targetB, alias, 'dir');
+        await fixture.retarget();
       }
-      return [raceRepo];
+      return [fixture.raceRepo];
     });
-    const checkpointBefore = JSON.stringify(state.currentMeta.embeddingCheckpoint);
 
-    try {
-      const response = await fetch(`${baseUrl}/api/embed`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ repo: raceRepo.name }),
-      });
-      const { jobId } = (await response.json()) as { jobId: string };
-      const job = await waitForTerminalJob(baseUrl, jobId);
-
-      expect(job.status).toBe('failed');
-      expect(job.error).toMatch(/canonical registry entry is missing/i);
+    await runSymlinkRace(fixture, /canonical registry entry is missing/i, () => {
       expect(state.registerRepo).not.toHaveBeenCalled();
-      expect(state.saveMeta).not.toHaveBeenCalled();
-      expect(JSON.stringify(state.currentMeta.embeddingCheckpoint)).toBe(checkpointBefore);
-      expect(state.currentMeta.repoPath).toBe(alias);
-    } finally {
-      await fs.rm(root, { recursive: true, force: true });
-    }
+    });
+  });
+
+  it('rejects a symlink retarget after DB work before the terminal owner helper', async () => {
+    const fixture = await prepareSymlinkRace('gitnexus-issue269-pre-helper-');
+    state.listRegisteredRepos.mockResolvedValue([fixture.raceRepo]);
+    state.getStrictLbugStats.mockImplementationOnce(async () => {
+      await fixture.retarget();
+      return { nodes: 4, edges: 5 };
+    });
+
+    await runSymlinkRace(fixture, /canonical registry entry is missing/i, () => {
+      expect(state.getStrictLbugStats).toHaveBeenCalledOnce();
+      expect(state.registerRepo).not.toHaveBeenCalled();
+    });
   });
 
   it.each<{ label: string; entries: RegistryEntry[]; error: RegExp }>([
