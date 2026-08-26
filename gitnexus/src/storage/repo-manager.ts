@@ -424,6 +424,17 @@ export const getStoragePath = (repoPath: string): string => {
 };
 
 /**
+ * Return the canonical storage key shared by server-side repository jobs.
+ *
+ * Callers must capture this before an operation can remove or retarget the
+ * repository root, then carry the returned value through lock release. A
+ * later canonicalization of a missing root falls back to its unresolved form
+ * and would no longer identify the storage that was locked.
+ */
+export const canonicalRepoLockKey = (repoRoot: string): string =>
+  getStoragePath(canonicalizePath(repoRoot));
+
+/**
  * Get paths to key storage files.
  *
  * `storagePath` is ALWAYS the flat `<repo>/.gitnexus` — content-addressed

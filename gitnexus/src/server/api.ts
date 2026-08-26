@@ -16,6 +16,7 @@ import { createRequire } from 'node:module';
 import { createHash } from 'node:crypto';
 import {
   canonicalizePath,
+  canonicalRepoLockKey,
   cloneDirBelongsToEntry,
   loadMeta,
   saveMeta,
@@ -1303,7 +1304,11 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
       }
 
       // Acquire repo lock — prevents deleting while analyze/embed is in flight
-      const lockKey = getStoragePath(entry.path);
+      // Capture the canonical storage target before acquisition and carry it
+      // through deletion. Once the repo is removed, canonicalization falls
+      // back to the unresolved path and cannot recover this lock key.
+      const lockKey = canonicalRepoLockKey(entry.path);
+      const storagePath = lockKey;
       const lockErr = acquireRepoLock(lockKey);
       if (lockErr) {
         res.status(409).json({ error: lockErr });
@@ -1317,7 +1322,6 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         } catch {}
 
         // 1. Delete the .gitnexus index/storage directory
-        const storagePath = getStoragePath(entry.path);
         await fs.rm(storagePath, { recursive: true, force: true }).catch(() => {});
 
         // 2. Delete the cloned repo dir if it lives under ~/.gitnexus/repos/.
@@ -1894,7 +1898,6 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
 
             launchAnalysisWorker(job, targetPath, { force, embeddings, dropEmbeddings });
           } catch (err: any) {
-            if (targetPath) releaseRepoLock(getStoragePath(targetPath));
             jobManager.updateJob(job.id, {
               status: 'failed',
               error: err.message || 'Analysis failed',
@@ -2060,17 +2063,20 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
           res.status(404).json({ error: 'Repository not found' });
           return;
         }
+        // Capture the canonical storage target before any asynchronous
+        // repository work. This exact key is shared with analyze/delete and
+        // remains valid even if the repository disappears while the job runs.
+        const repoLockPath = canonicalRepoLockKey(entry.path);
         const frozenOwner = freezeZeroClearRegistryOwner(entry);
 
         // Check shared repo lock — prevent concurrent analyze + embed on same repo
-        const repoLockPath = frozenOwner.canonicalStoragePath;
         const lockErr = acquireRepoLock(repoLockPath);
         if (lockErr) {
           res.status(409).json({ error: lockErr });
           return;
         }
 
-        const job = embedJobManager.createJob({ repoPath: frozenOwner.canonicalStoragePath });
+        const job = embedJobManager.createJob({ repoPath: repoLockPath });
         embedJobManager.updateJob(job.id, {
           repoName: frozenOwner.name,
           status: 'analyzing' as any,

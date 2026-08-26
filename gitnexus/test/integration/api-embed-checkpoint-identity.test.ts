@@ -4,7 +4,11 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { EmbeddingIntegrityReport } from '../../src/core/lbug/lbug-adapter.js';
-import type { RegistryEntry, RepoMeta } from '../../src/storage/repo-manager.js';
+import {
+  canonicalRepoLockKey,
+  type RegistryEntry,
+  type RepoMeta,
+} from '../../src/storage/repo-manager.js';
 import { escapeCypherString } from '../../src/core/lbug/cypher-escape.js';
 import { JobManager } from '../../src/server/analyze-job.js';
 
@@ -87,6 +91,7 @@ const state = {
   loadMeta: vi.fn(async () => state.currentMeta),
   listRegisteredRepos: vi.fn(async () => [REPO]),
   deleteHandlerStarted: undefined as (() => void) | undefined,
+  releaseAnalyzeLock: undefined as (() => void) | undefined,
 };
 
 const armDeleteHandlerSignal = (): Promise<void> =>
@@ -167,7 +172,25 @@ vi.doMock('../../src/server/mcp-http.js', () => ({
   mountMCPEndpoints: () => async (): Promise<void> => {},
 }));
 vi.doMock('../../src/server/analyze-launch.js', () => ({
-  createLaunchAnalysisWorker: () => (): void => {},
+  createLaunchAnalysisWorker:
+    (deps: {
+      acquireRepoLock: (key: string) => string | null;
+      releaseRepoLock: (key: string) => void;
+      jobManager: JobManager;
+    }) =>
+    (job: { id: string }, targetPath: string): void => {
+      const key = canonicalRepoLockKey(targetPath);
+      const lockError = deps.acquireRepoLock(key);
+      if (lockError) {
+        deps.jobManager.updateJob(job.id, { status: 'failed', error: lockError });
+        return;
+      }
+      deps.jobManager.updateJob(job.id, { status: 'analyzing' });
+      state.releaseAnalyzeLock = () => {
+        deps.releaseRepoLock(key);
+        deps.jobManager.updateJob(job.id, { status: 'failed', error: 'test cleanup' });
+      };
+    },
 }));
 vi.doMock('../../src/server/analyze-upload.js', () => ({
   createAnalyzeUploadHandler: () => (_req: unknown, _res: unknown, next: () => void) => next(),
@@ -224,6 +247,7 @@ const runEmbedJob = async (baseUrl: string, repo: string) => {
 };
 
 const runSymlinkRace = async (
+  baseUrl: string,
   fixture: Awaited<ReturnType<typeof prepareSymlinkRace>>,
   error: RegExp,
   assertSpecific: () => void,
@@ -241,6 +265,31 @@ const runSymlinkRace = async (
     await fs.rm(fixture.root, { recursive: true, force: true });
   }
 };
+
+describe('canonical repository lock keys', () => {
+  it('captures the symlink target before the repository disappears', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-lock-key-'));
+    const target = path.join(root, 'real-repo');
+    const alias = path.join(root, 'repo-alias');
+    await fs.mkdir(path.join(target, '.gitnexus'), { recursive: true });
+    await fs.symlink(target, alias, 'dir');
+
+    try {
+      const canonicalTarget = await fs.realpath(target);
+      const captured = canonicalRepoLockKey(alias);
+      expect(captured).toBe(path.join(canonicalTarget, '.gitnexus'));
+
+      await fs.rm(target, { recursive: true, force: true });
+
+      // A recomputed key falls back to the now-dangling alias; the captured
+      // key remains the storage target that was actually locked.
+      expect(canonicalRepoLockKey(alias)).not.toBe(captured);
+      expect(captured).toBe(path.join(canonicalTarget, '.gitnexus'));
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+});
 
 describe('POST /api/embed completed-checkpoint identity', () => {
   let baseUrl = '';
@@ -276,6 +325,8 @@ describe('POST /api/embed completed-checkpoint identity', () => {
   });
 
   beforeEach(() => {
+    state.releaseAnalyzeLock?.();
+    state.releaseAnalyzeLock = undefined;
     state.currentMeta = makeMeta(MISMATCHED_DIGEST);
     state.liveIntegrity = makeIntegrity(LIVE_DIGEST);
     state.graphNodes = [{ id: 'node-1' }];
@@ -564,9 +615,45 @@ describe('POST /api/embed completed-checkpoint identity', () => {
       return fixture.raceRepo.name;
     });
 
-    await runSymlinkRace(fixture, /path\/storage identity is non-absolute or mismatched/i, () => {
-      expect(state.registerRepo).toHaveBeenCalledOnce();
-    });
+    await runSymlinkRace(
+      baseUrl,
+      fixture,
+      /path\/storage identity is non-absolute or mismatched/i,
+      () => {
+        expect(state.registerRepo).toHaveBeenCalledOnce();
+      },
+    );
+  });
+
+  it('uses one canonical lock to exclude embed and delete during symlinked analyze', async () => {
+    const fixture = await prepareSymlinkRace('gitnexus-issue269-shared-lock-');
+    state.listRegisteredRepos.mockResolvedValue([fixture.raceRepo]);
+    try {
+      const analyze = await fetch(`${baseUrl}/api/analyze`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ path: fixture.alias }),
+      });
+      expect(analyze.status).toBe(202);
+      await vi.waitFor(() => expect(state.releaseAnalyzeLock).toBeTypeOf('function'));
+
+      const embed = await fetch(`${baseUrl}/api/embed`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ repo: fixture.raceRepo.name }),
+      });
+      expect(embed.status).toBe(409);
+
+      const remove = await fetch(
+        `${baseUrl}/api/repo?repo=${encodeURIComponent(fixture.raceRepo.name)}`,
+        { method: 'DELETE' },
+      );
+      expect(remove.status).toBe(409);
+    } finally {
+      state.releaseAnalyzeLock?.();
+      state.releaseAnalyzeLock = undefined;
+      await fs.rm(fixture.root, { recursive: true, force: true });
+    }
   });
 
   it('rejects a symlink retarget during zero-checkpoint preflight before registerRepo', async () => {
@@ -580,9 +667,14 @@ describe('POST /api/embed completed-checkpoint identity', () => {
       return [fixture.raceRepo];
     });
 
-    await runSymlinkRace(fixture, /canonical registry entry is missing/i, () => {
-      expect(state.registerRepo).not.toHaveBeenCalled();
-    });
+    await runSymlinkRace(
+      baseUrl,
+      fixture,
+      /path\/storage identity is non-absolute or mismatched/i,
+      () => {
+        expect(state.registerRepo).not.toHaveBeenCalled();
+      },
+    );
   });
 
   it('rejects a symlink retarget after DB work before the terminal owner helper', async () => {
@@ -593,10 +685,15 @@ describe('POST /api/embed completed-checkpoint identity', () => {
       return { nodes: 4, edges: 5 };
     });
 
-    await runSymlinkRace(fixture, /canonical registry entry is missing/i, () => {
-      expect(state.getStrictLbugStats).toHaveBeenCalledOnce();
-      expect(state.registerRepo).not.toHaveBeenCalled();
-    });
+    await runSymlinkRace(
+      baseUrl,
+      fixture,
+      /path\/storage identity is non-absolute or mismatched/i,
+      () => {
+        expect(state.getStrictLbugStats).toHaveBeenCalledOnce();
+        expect(state.registerRepo).not.toHaveBeenCalled();
+      },
+    );
   });
 
   it.each<{ label: string; entries: RegistryEntry[]; error: RegExp }>([

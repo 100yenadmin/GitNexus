@@ -1,6 +1,17 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
-import { completionUpdateForWorkerResult } from '../../src/server/analyze-launch.js';
+const launcherState = vi.hoisted(() => ({
+  fork: vi.fn(),
+}));
+
+vi.mock('child_process', () => ({
+  fork: (...args: unknown[]) => launcherState.fork(...args),
+}));
+
+import {
+  completionUpdateForWorkerResult,
+  createLaunchAnalysisWorker,
+} from '../../src/server/analyze-launch.js';
 import type { AnalyzeResultIpc } from '../../src/server/analyze-worker-ipc.js';
 
 const result = (recoveredPromotionOnly?: boolean): AnalyzeResultIpc => ({
@@ -11,6 +22,52 @@ const result = (recoveredPromotionOnly?: boolean): AnalyzeResultIpc => ({
   recoveredPromotionOnly,
   ftsRepairedOnly: undefined,
   ftsSkipped: undefined,
+});
+
+type Listener = (...args: unknown[]) => void;
+
+const fakeChild = (send: () => void = () => {}) => {
+  const listeners = new Map<string, Listener>();
+  const child = {
+    stderr: { on: vi.fn() },
+    kill: vi.fn(),
+    on: vi.fn((event: string, listener: Listener) => {
+      listeners.set(event, listener);
+      return child;
+    }),
+    send: vi.fn(send),
+  };
+  return { child, emit: (event: string, ...args: unknown[]) => listeners.get(event)?.(...args) };
+};
+
+const fakeJobManager = () => {
+  const job = {
+    id: 'job-1',
+    status: 'queued' as 'queued' | 'analyzing' | 'complete' | 'failed',
+    progress: { phase: 'queued', percent: 0, message: 'queued' },
+    retryCount: 0,
+  };
+  return {
+    job,
+    manager: {
+      getJob: vi.fn(() => job),
+      updateJob: vi.fn((_id: string, update: Record<string, unknown>) => {
+        Object.assign(job, update);
+      }),
+      registerChild: vi.fn(),
+    },
+  };
+};
+
+const launchDeps = (
+  jobManager: ReturnType<typeof fakeJobManager>['manager'],
+  releaseRepoLock: ReturnType<typeof vi.fn>,
+) => ({
+  jobManager,
+  backend: { init: vi.fn(async () => undefined) },
+  acquireRepoLock: vi.fn(() => null),
+  releaseRepoLock,
+  closeDbHandle: vi.fn(async () => undefined),
 });
 
 describe('analyze worker recovery-only parent contract', () => {
@@ -30,5 +87,87 @@ describe('analyze worker recovery-only parent contract', () => {
       status: 'complete',
       repoName: 'demo',
     });
+  });
+});
+
+describe('analyze worker shared lock ownership', () => {
+  it('releases the captured key exactly once after terminal success and late events', async () => {
+    const { job, manager } = fakeJobManager();
+    const child = fakeChild();
+    launcherState.fork.mockReset().mockReturnValue(child.child);
+    const releaseRepoLock = vi.fn();
+    const launch = createLaunchAnalysisWorker(launchDeps(manager, releaseRepoLock));
+
+    launch(job, '/virtual/demo', {});
+    child.emit('message', { type: 'complete', result: result(true) });
+    child.emit('error', new Error('late error'));
+    child.emit('exit', 0);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(releaseRepoLock).toHaveBeenCalledOnce();
+    expect(releaseRepoLock).toHaveBeenCalledWith('/virtual/demo/.gitnexus');
+    expect(job.status).toBe('failed');
+  });
+
+  it.each([
+    [
+      'fork',
+      () => {
+        throw new Error('fork failed');
+      },
+    ],
+    [
+      'send',
+      () => {
+        throw new Error('send failed');
+      },
+    ],
+  ])('cleans up synchronously when %s throws', (_label, failure) => {
+    const { job, manager } = fakeJobManager();
+    const releaseRepoLock = vi.fn();
+    const child = fakeChild(failure);
+    launcherState.fork.mockReset().mockImplementation(() => {
+      if (_label === 'fork') throw new Error('fork failed');
+      return child.child;
+    });
+    const launch = createLaunchAnalysisWorker(launchDeps(manager, releaseRepoLock));
+
+    launch(job, '/virtual/demo', {});
+
+    expect(releaseRepoLock).toHaveBeenCalledOnce();
+    expect(releaseRepoLock).toHaveBeenCalledWith('/virtual/demo/.gitnexus');
+    expect(job.status).toBe('failed');
+    if (_label === 'send') expect(child.child.kill).toHaveBeenCalledWith('SIGTERM');
+  });
+
+  it('keeps the lock through retries and releases once when retries are exhausted', () => {
+    vi.useFakeTimers();
+    try {
+      const { job, manager } = fakeJobManager();
+      const first = fakeChild();
+      const second = fakeChild();
+      const third = fakeChild();
+      launcherState.fork
+        .mockReset()
+        .mockReturnValueOnce(first.child)
+        .mockReturnValueOnce(second.child)
+        .mockReturnValueOnce(third.child);
+      const releaseRepoLock = vi.fn();
+      const launch = createLaunchAnalysisWorker(launchDeps(manager, releaseRepoLock));
+
+      launch(job, '/virtual/demo', {});
+      first.emit('exit', 1);
+      vi.advanceTimersByTime(1000);
+      second.emit('exit', 1);
+      vi.advanceTimersByTime(2000);
+      third.emit('exit', 1);
+
+      expect(releaseRepoLock).toHaveBeenCalledOnce();
+      expect(releaseRepoLock).toHaveBeenCalledWith('/virtual/demo/.gitnexus');
+      expect(job.status).toBe('failed');
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

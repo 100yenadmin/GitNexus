@@ -17,7 +17,7 @@ import { fileURLToPath, pathToFileURL } from 'url';
 import { createRequire } from 'node:module';
 import {
   canonicalizePath,
-  getStoragePath,
+  canonicalRepoLockKey,
   INDEX_METADATA_FILE,
   listRegisteredRepos,
   registryPathEquals,
@@ -151,13 +151,31 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
     // For waitForSettledIndex: files (re)written by this job have mtimes at or
     // after this instant. Taken before the fork so no worker write predates it.
     const jobStartMs = Date.now();
-    // Acquire shared repo lock (keyed on storagePath to match embed handler)
-    const analyzeLockKey = getStoragePath(targetPath);
+    // Capture the canonical lock key before the worker can remove or retarget
+    // the repository root. The same captured key must be used for release.
+    const analyzeLockKey = canonicalRepoLockKey(targetPath);
     const lockErr = acquireRepoLock(analyzeLockKey);
     if (lockErr) {
       jobManager.updateJob(job.id, { status: 'failed', error: lockErr });
       return;
     }
+
+    let lockReleased = false;
+    const releaseLock = (): void => {
+      if (lockReleased) return;
+      lockReleased = true;
+      releaseRepoLock(analyzeLockKey);
+    };
+    let terminalMessageReceived = false;
+
+    const failSynchronousLaunch = (err: unknown): void => {
+      releaseLock();
+      const message = err instanceof Error ? err.message : String(err);
+      jobManager.updateJob(job.id, {
+        status: 'failed',
+        error: `Worker process error: ${message}`,
+      });
+    };
 
     jobManager.updateJob(job.id, { repoPath: targetPath, status: 'analyzing' });
 
@@ -172,7 +190,10 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
 
     const forkWorker = () => {
       const currentJob = jobManager.getJob(job.id);
-      if (!currentJob || currentJob.status === 'complete' || currentJob.status === 'failed') return;
+      if (!currentJob || currentJob.status === 'complete' || currentJob.status === 'failed') {
+        releaseLock();
+        return;
+      }
 
       const child = fork(workerPath, [], {
         execArgv: [...tsxHookArgs, '--max-old-space-size=8192'],
@@ -192,7 +213,15 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
         // re-release the repo lock or flip the reported status. Mirrors the `exit`
         // handler guard below; pairs with the worker's terminal-claim (#2264 P3).
         const current = jobManager.getJob(job.id);
-        if (!current || current.status === 'complete' || current.status === 'failed') return;
+        if (
+          !current ||
+          current.status === 'complete' ||
+          current.status === 'failed' ||
+          terminalMessageReceived
+        ) {
+          releaseLock();
+          return;
+        }
 
         if (msg.type === 'progress') {
           jobManager.updateJob(job.id, {
@@ -200,7 +229,8 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
             progress: { phase: msg.phase, percent: msg.percent, message: msg.message },
           });
         } else if (msg.type === 'complete') {
-          releaseRepoLock(analyzeLockKey);
+          terminalMessageReceived = true;
+          releaseLock();
           const terminalUpdate = completionUpdateForWorkerResult(msg.result);
           // Before recording the terminal result: (1) wait for the worker's on-disk
           // finalization to settle (see waitForSettledIndex), (2) evict the
@@ -232,7 +262,8 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
               });
             });
         } else if (msg.type === 'error') {
-          releaseRepoLock(analyzeLockKey);
+          terminalMessageReceived = true;
+          releaseLock();
           // A failed (force) analyze may still have rewritten DB files first.
           void closeDbHandle().catch(() => {});
           jobManager.updateJob(job.id, { status: 'failed', error: msg.message });
@@ -240,7 +271,8 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
       });
 
       child.on('error', (err) => {
-        releaseRepoLock(analyzeLockKey);
+        terminalMessageReceived = true;
+        releaseLock();
         jobManager.updateJob(job.id, {
           status: 'failed',
           error: `Worker process error: ${err.message}`,
@@ -249,7 +281,10 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
 
       child.on('exit', (code) => {
         const j = jobManager.getJob(job.id);
-        if (!j || j.status === 'complete' || j.status === 'failed') return;
+        if (!j || j.status === 'complete' || j.status === 'failed' || terminalMessageReceived) {
+          releaseLock();
+          return;
+        }
 
         // Worker crashed — attempt retry if under the limit
         if (j.retryCount < MAX_WORKER_RETRIES) {
@@ -269,10 +304,16 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
             },
           });
           stderrChunks = '';
-          setTimeout(forkWorker, delay);
+          setTimeout(() => {
+            try {
+              forkWorker();
+            } catch (err) {
+              failSynchronousLaunch(err);
+            }
+          }, delay);
         } else {
           // Exhausted retries — permanent failure
-          releaseRepoLock(analyzeLockKey);
+          releaseLock();
           jobManager.updateJob(job.id, {
             status: 'failed',
             error: `Worker crashed ${MAX_WORKER_RETRIES + 1} times (code ${code})${stderrChunks ? ': ' + stderrChunks.trim().split('\n').pop() : ''}`,
@@ -280,22 +321,35 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
         }
       });
 
-      // Register child for cancellation + timeout tracking
-      jobManager.registerChild(job.id, child);
+      try {
+        // Register child for cancellation + timeout tracking
+        jobManager.registerChild(job.id, child);
 
-      // Send start command to child
-      child.send({
-        type: 'start',
-        repoPath: targetPath,
-        options: {
-          force: !!opts.force,
-          embeddings: !!opts.embeddings,
-          dropEmbeddings: !!opts.dropEmbeddings,
-          ...(opts.registryName ? { registryName: opts.registryName } : {}),
-        },
-      });
+        // Send start command to child
+        child.send({
+          type: 'start',
+          repoPath: targetPath,
+          options: {
+            force: !!opts.force,
+            embeddings: !!opts.embeddings,
+            dropEmbeddings: !!opts.dropEmbeddings,
+            ...(opts.registryName ? { registryName: opts.registryName } : {}),
+          },
+        });
+      } catch (err) {
+        // A child may exist even when IPC setup/send fails synchronously. Do
+        // not let it analyze after the shared repository lock is released.
+        try {
+          child.kill('SIGTERM');
+        } catch {}
+        throw err;
+      }
     };
 
-    forkWorker();
+    try {
+      forkWorker();
+    } catch (err) {
+      failSynchronousLaunch(err);
+    }
   };
 }
