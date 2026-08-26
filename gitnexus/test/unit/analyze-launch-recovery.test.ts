@@ -164,6 +164,58 @@ describe('analyze worker shared lock ownership', () => {
     expect(releaseRepoLock).toHaveBeenCalledOnce();
   });
 
+  it.each([
+    { releaseError: undefined, expectedError: 'Cancelled by user' },
+    {
+      releaseError: 'release refused',
+      expectedError: 'Cancelled by user; Analyze ownership release failed: release refused',
+    },
+  ])(
+    'keeps successful worker completion cancelled after parent release ($releaseError)',
+    async ({ releaseError, expectedError }) => {
+      const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-cancel-during-release-'));
+      const repoRoot = path.join(root, 'repo');
+      await fs.mkdir(repoRoot);
+      try {
+        const { job, manager } = fakeJobManager();
+        const child = fakeChild();
+        launcherState.fork.mockReset().mockReturnValue(child.child);
+        const releaseRepoLock = vi.fn();
+        const deps = launchDeps(manager, releaseRepoLock);
+        let settleRelease!: () => void;
+        deps.ownershipRelease.mockImplementationOnce(
+          () =>
+            new Promise<void>((resolve, reject) => {
+              settleRelease = () =>
+                releaseError ? reject(new Error(releaseError)) : resolve(undefined);
+            }),
+        );
+
+        createLaunchAnalysisWorker(deps)(job, repoRoot, {});
+        await waitForWorkerStart();
+        const storagePath = path.join(repoRoot, '.gitnexus');
+        await fs.writeFile(path.join(storagePath, 'lbug'), 'db');
+        await fs.writeFile(path.join(storagePath, 'gitnexus.json'), '{}');
+        child.emit('message', { type: 'complete', result: result() });
+        child.emit('close', 0);
+        await vi.waitFor(() => expect(deps.ownershipRelease).toHaveBeenCalledOnce());
+
+        job.cancellationReason = 'Cancelled by user';
+        settleRelease();
+
+        await vi.waitFor(() => expect(job.status).toBe('failed'));
+        expect(job).toMatchObject({ error: expectedError });
+        expect(manager.updateJob).not.toHaveBeenCalledWith(
+          job.id,
+          expect.objectContaining({ status: 'complete' }),
+        );
+        expect(releaseRepoLock).toHaveBeenCalledOnce();
+      } finally {
+        await fs.rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+
   it('fails before successful terminal publication when ownership release fails', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-release-failure-'));
     const repoRoot = path.join(root, 'repo');

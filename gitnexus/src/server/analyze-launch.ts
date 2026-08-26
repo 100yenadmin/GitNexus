@@ -248,15 +248,22 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
         finalizationStarted = true;
         void releaseLock()
           .then(() => {
-            if (terminalUpdate) jobManager.updateJob(job.id, terminalUpdate);
+            const cancellationReason = jobManager.getJob(job.id)?.cancellationReason;
+            if (cancellationReason) {
+              jobManager.updateJob(job.id, { status: 'failed', error: cancellationReason });
+            } else if (terminalUpdate) {
+              jobManager.updateJob(job.id, terminalUpdate);
+            }
           })
           .catch((err) => {
             logger.error({ err }, 'analyze ownership release failed after worker finalization:');
             const releaseMessage = `Analyze ownership release failed: ${err instanceof Error ? err.message : String(err)}`;
+            const cancellationReason = jobManager.getJob(job.id)?.cancellationReason;
             jobManager.updateJob(job.id, {
               status: 'failed',
-              error:
-                terminalUpdate?.status === 'failed' && terminalUpdate.error
+              error: cancellationReason
+                ? `${cancellationReason}; ${releaseMessage}`
+                : terminalUpdate?.status === 'failed' && terminalUpdate.error
                   ? `${terminalUpdate.error}; ${releaseMessage}`
                   : releaseMessage,
             });
