@@ -53,10 +53,19 @@ const deadRecoveryLeaseSourcePath = (lockPath: string): string =>
   `${lockPath}.lease-source.${deadRecoveryLeaseRecord.pid}.` +
   `${deadRecoveryLeaseRecord.processStartToken}.${deadRecoveryLeaseRecord.nonce}`;
 
+const deadOwnershipPublicationSourcePath = (lockPath: string): string =>
+  `${lockPath}.owner-source.${deadRecoveryLeaseRecord.pid}.${deadRecoveryLeaseRecord.nonce}`;
+
 const publishDeadRecoveryLease = async (lockPath: string): Promise<void> => {
   const sourcePath = deadRecoveryLeaseSourcePath(lockPath);
   await fs.writeFile(sourcePath, `${JSON.stringify(deadRecoveryLeaseRecord)}\n`);
   await fs.link(sourcePath, `${lockPath}.reclaim`);
+};
+
+const publishDeadOwnershipLock = async (lockPath: string): Promise<void> => {
+  const sourcePath = deadOwnershipPublicationSourcePath(lockPath);
+  await fs.writeFile(sourcePath, `${JSON.stringify(deadRecoveryLeaseRecord)}\n`);
+  await fs.link(sourcePath, lockPath);
 };
 
 const recoveryResidue = async (lockPath: string): Promise<string[]> => {
@@ -702,6 +711,36 @@ describe('common analyze ownership lock', () => {
     expect(await recoveryResidue(lockPath)).toEqual([]);
   });
 
+  it('recovers a crash before atomic successor-lock publication', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-stage-lock-owner-source-'));
+    tempDirs.push(root);
+    const lockPath = path.join(root, 'analyze-staged.lock');
+    await fs.writeFile(deadOwnershipPublicationSourcePath(lockPath), 'partial');
+
+    await expect(withAnalyzeOwnershipLock(root, async () => 'recovered')).resolves.toBe(
+      'recovered',
+    );
+    await expect(fs.access(deadOwnershipPublicationSourcePath(lockPath))).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+    await expect(fs.access(lockPath)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('recovers a crash after atomic successor-lock publication', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-stage-lock-owner-published-'));
+    tempDirs.push(root);
+    const lockPath = path.join(root, 'analyze-staged.lock');
+    await publishDeadOwnershipLock(lockPath);
+
+    await expect(withAnalyzeOwnershipLock(root, async () => 'recovered')).resolves.toBe(
+      'recovered',
+    );
+    await expect(fs.access(deadOwnershipPublicationSourcePath(lockPath))).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+    await expect(fs.access(lockPath)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
   it.each([
     {
       phase: 'after atomic lease publication',
@@ -798,6 +837,64 @@ describe('common analyze ownership lock', () => {
     expect(entered).toBe(1);
     expect(await recoveryResidue(lockPath)).toEqual([]);
     await expect(fs.access(lockPath)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('returns an ownership conflict when a cleanup marker vanishes before claim publication', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-stage-lock-cleanup-missing-'));
+    tempDirs.push(root);
+    const lockPath = path.join(root, 'analyze-staged.lock');
+    const markerPath = `${lockPath}.reclaim`;
+    await writeDeadAnalyzeLock(lockPath);
+    await publishDeadRecoveryLease(lockPath);
+
+    const originalLink = fs.link.bind(fs);
+    let removedMarker = false;
+    const linkSpy = vi.spyOn(fs, 'link').mockImplementation(async (source, destination) => {
+      if (
+        String(source) === markerPath &&
+        String(destination).includes('.reclaim-cleanup.') &&
+        !removedMarker
+      ) {
+        removedMarker = true;
+        await fs.rm(markerPath);
+      }
+      return originalLink(source, destination);
+    });
+    try {
+      const attempt = withAnalyzeOwnershipLock(root, async () => undefined);
+      await expect(attempt).rejects.toBeInstanceOf(AnalyzeOwnershipConflictError);
+      await expect(attempt).rejects.toThrow(/ownership changed before cleanup/i);
+    } finally {
+      linkSpy.mockRestore();
+    }
+  });
+
+  it('retries lease-source cleanup after the marker was already released', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-stage-lock-source-retry-'));
+    tempDirs.push(root);
+    const lockPath = path.join(root, 'analyze-staged.lock');
+    await writeDeadAnalyzeLock(lockPath);
+
+    const originalRm = fs.rm.bind(fs);
+    let failedSourceRemoval = false;
+    const rmSpy = vi.spyOn(fs, 'rm').mockImplementation(async (target, options) => {
+      if (String(target).includes('.lease-source.') && !failedSourceRemoval) {
+        failedSourceRemoval = true;
+        throw Object.assign(new Error('transient source removal failure'), { code: 'EPERM' });
+      }
+      return originalRm(target, options);
+    });
+    try {
+      await expect(withAnalyzeOwnershipLock(root, async () => undefined)).rejects.toThrow(
+        /transient source removal failure/i,
+      );
+    } finally {
+      rmSpy.mockRestore();
+    }
+
+    expect(await recoveryResidue(lockPath)).toEqual([]);
+    await expect(withAnalyzeOwnershipLock(root, async () => 'retried')).resolves.toBe('retried');
+    expect(await recoveryResidue(lockPath)).toEqual([]);
   });
 
   it('does not execute a PATH-shadowed process identity helper on macOS', async () => {

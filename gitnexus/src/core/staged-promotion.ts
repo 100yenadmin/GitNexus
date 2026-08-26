@@ -488,6 +488,12 @@ const sameProcessBoundRecoveryLeaseRecord = (
 const legacyLeaseSourcePrefix = (lockPath: string): string =>
   `${path.basename(lockPath)}.lease-source.`;
 
+const ownershipPublicationSourcePrefix = (lockPath: string): string =>
+  `${path.basename(lockPath)}.owner-source.`;
+
+const ownershipPublicationSourcePath = (lockPath: string, owner: StageLockRecord): string =>
+  `${lockPath}.owner-source.${owner.pid}.${owner.nonce}`;
+
 const recoveryLeaseCleanupClaimPrefix = (lockPath: string): string =>
   `${path.basename(lockPath)}.reclaim-cleanup.`;
 
@@ -502,6 +508,30 @@ const legacyLeaseSourcePath = (
   claimant: StageLockRecord,
   claimantStartToken: string,
 ): string => `${lockPath}.lease-source.${claimant.pid}.${claimantStartToken}.${claimant.nonce}`;
+
+const clearOwnershipPublicationSources = async (lockPath: string): Promise<void> => {
+  const directory = path.dirname(lockPath);
+  const prefix = ownershipPublicationSourcePrefix(lockPath);
+  const entries = await fs.readdir(directory, { withFileTypes: true }).catch((error) => {
+    if (isMissingFilesystemError(error)) return [];
+    throw error;
+  });
+  for (const entry of entries) {
+    if (!entry.name.startsWith(prefix)) continue;
+    const sourcePath = path.join(directory, entry.name);
+    const match = entry.name.slice(prefix.length).match(/^(\d+)\.([0-9a-f]+)$/);
+    if (!entry.isFile() || !match) {
+      throw new AnalyzeOwnershipConflictError(
+        `Analyze ownership publication state is malformed at ${sourcePath}; ` +
+          'verify no writer is active before removing it.',
+      );
+    }
+    // This is only a publication hard link. Removing it cannot remove an
+    // already-published main path; a publisher that has not linked yet fails
+    // safely and retries against the winning owner.
+    await fs.rm(sourcePath, { force: true });
+  }
+};
 
 const readVerifiedProcessStartToken = async (
   pid: number,
@@ -609,7 +639,16 @@ const removeObservedRecoveryMarker = async (
   await clearOrRejectRecoveryLeaseCleanupClaims(lockPath);
   const cleanupClaimPath = recoveryLeaseCleanupClaimPath(lockPath, claimant, claimantStartToken);
   try {
-    await fs.link(markerPath, cleanupClaimPath);
+    try {
+      await fs.link(markerPath, cleanupClaimPath);
+    } catch (error) {
+      if (isMissingFilesystemError(error)) {
+        throw new AnalyzeOwnershipConflictError(
+          'Analyze recovery ownership changed before cleanup; retry.',
+        );
+      }
+      throw error;
+    }
     const competingClaims = (await listRecoveryLeaseCleanupClaims(lockPath)).filter(
       (claim) => claim.path !== cleanupClaimPath,
     );
@@ -757,8 +796,20 @@ const releaseLegacyRecoveryLease = async (lease: LegacyRecoveryLease): Promise<v
     sameProcessBoundRecoveryLeaseRecord(current, lease.claimant)
   ) {
     await fs.rm(lease.path, { force: true });
-    await fs.rm(lease.sourcePath, { force: true });
   }
+  const source = await readJson<ProcessBoundRecoveryLeaseRecord>(lease.sourcePath).catch(
+    () => undefined,
+  );
+  if (!source) return;
+  if (
+    !validProcessBoundRecoveryLeaseRecord(source) ||
+    !sameProcessBoundRecoveryLeaseRecord(source, lease.claimant)
+  ) {
+    throw new AnalyzeOwnershipConflictError(
+      `Analyze recovery lease source ownership changed at ${lease.sourcePath}; retry.`,
+    );
+  }
+  await fs.rm(lease.sourcePath, { force: true });
 };
 
 const listRecoveryClaims = async (lockPath: string): Promise<RecoveryClaim[]> => {
@@ -858,6 +909,35 @@ const hasRecoveryResidue = async (lockPath: string): Promise<boolean> => {
     });
 };
 
+const publishOwnershipLock = async (lockPath: string, record: StageLockRecord): Promise<string> => {
+  await clearOwnershipPublicationSources(lockPath);
+  const sourcePath = ownershipPublicationSourcePath(lockPath, record);
+  let sourceHandle: Awaited<ReturnType<typeof fs.open>> | undefined;
+  let published = false;
+  try {
+    sourceHandle = await fs.open(sourcePath, 'wx', 0o600);
+    await sourceHandle.writeFile(`${JSON.stringify(record)}\n`, 'utf8');
+    await sourceHandle.sync();
+    await sourceHandle.close();
+    sourceHandle = undefined;
+    try {
+      await fs.link(sourcePath, lockPath);
+    } catch (error) {
+      if (isMissingFilesystemError(error)) {
+        throw new AnalyzeOwnershipConflictError(
+          'Analyze ownership publication changed before commit; retry.',
+        );
+      }
+      throw error;
+    }
+    published = true;
+    return sourcePath;
+  } finally {
+    await sourceHandle?.close().catch(() => {});
+    if (!published) await fs.rm(sourcePath, { force: true }).catch(() => {});
+  }
+};
+
 const reclaimStaleOwnershipLock = async (
   lockPath: string,
   observedOwner: StageLockRecord,
@@ -942,7 +1022,8 @@ const withOwnershipFileLock = async <T>(
     nonce: randomBytes(16).toString('hex'),
     startedAt: new Date().toISOString(),
   };
-  let handle: Awaited<ReturnType<typeof fs.open>> | undefined;
+  let ownsLock = false;
+  let publicationSourcePath: string | undefined;
   let legacyLease: LegacyRecoveryLease | undefined;
   let claimantStartToken: string | undefined;
   const requireClaimantStartToken = async (): Promise<string> => {
@@ -961,7 +1042,10 @@ const withOwnershipFileLock = async <T>(
         }
       }
       try {
-        handle = await fs.open(lockPath, 'wx', 0o600);
+        publicationSourcePath = await publishOwnershipLock(lockPath, record);
+        ownsLock = true;
+        await fs.rm(publicationSourcePath, { force: true });
+        publicationSourcePath = undefined;
         break;
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
@@ -994,9 +1078,7 @@ const withOwnershipFileLock = async <T>(
         legacyLease = reclaimed;
       }
     }
-    if (!handle) throw new AnalyzeOwnershipConflictError('Could not acquire the analyze lock');
-    await handle.writeFile(`${JSON.stringify(record)}\n`, 'utf8');
-    await handle.sync();
+    if (!ownsLock) throw new AnalyzeOwnershipConflictError('Could not acquire the analyze lock');
     if (legacyLease) {
       await releaseLegacyRecoveryLease(legacyLease);
       legacyLease = undefined;
@@ -1010,8 +1092,10 @@ const withOwnershipFileLock = async <T>(
     return await operation();
   } finally {
     if (legacyLease) await releaseLegacyRecoveryLease(legacyLease);
-    if (handle) {
-      await handle.close().catch(() => {});
+    if (publicationSourcePath) {
+      await fs.rm(publicationSourcePath, { force: true }).catch(() => {});
+    }
+    if (ownsLock) {
       const current = await readJson<StageLockRecord>(lockPath).catch(() => undefined);
       if (current?.nonce === record.nonce) await fs.rm(lockPath, { force: true });
     }
