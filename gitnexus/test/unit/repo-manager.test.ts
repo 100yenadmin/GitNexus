@@ -1479,6 +1479,33 @@ describe('registerRepo expected owner CAS (#264)', () => {
     expect(await fs.readFile(registryPath, 'utf8')).toBe(before);
   });
 
+  it('refuses unregister when deleted storage is recreated for a different target', async () => {
+    const repoRoot = path.join(tmpHome.dbPath, 'unregister-storage-root');
+    const storageA = path.join(tmpHome.dbPath, 'unregister-storage-a');
+    const storageB = path.join(tmpHome.dbPath, 'unregister-storage-b');
+    await fs.mkdir(repoRoot);
+    await fs.mkdir(storageA);
+    await fs.mkdir(storageB);
+    const storageLink = path.join(repoRoot, '.gitnexus');
+    await fs.symlink(storageA, storageLink, 'dir');
+    const expected: RegistryEntry = {
+      ...owner(),
+      path: repoRoot,
+      storagePath: storageLink,
+    };
+    const frozen = frozenOwner(expected);
+    const registryPath = path.join(tmpHome.dbPath, 'registry.json');
+    const before = JSON.stringify([expected]);
+    await fs.writeFile(registryPath, before);
+    await fs.unlink(storageLink);
+    await fs.symlink(storageB, storageLink, 'dir');
+
+    await expect(unregisterRepo(repoRoot, { expectedOwner: frozen })).rejects.toThrow(
+      'GitNexus: expected registry storage changed before unregister',
+    );
+    expect(await fs.readFile(registryPath, 'utf8')).toBe(before);
+  });
+
   it('refuses unregister after the observed registry generation changes', async () => {
     const expected = owner();
     const changed = { ...expected, indexedAt: '2026-08-26T00:00:00.000Z' };

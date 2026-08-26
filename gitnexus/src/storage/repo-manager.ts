@@ -15,7 +15,7 @@
  */
 
 import fs from 'fs/promises';
-import { realpathSync } from 'fs';
+import { lstatSync, realpathSync } from 'fs';
 import path from 'path';
 import os from 'os';
 import { randomBytes } from 'crypto';
@@ -1630,6 +1630,21 @@ export const unregisterRepo = async (
   const expected = opts?.expectedOwner;
   if (expected && !registryPathEquals(resolved, expected.canonicalPath)) {
     throw new Error('GitNexus: expected registry owner changed before unregister');
+  }
+  if (expected) {
+    let storageExists = true;
+    try {
+      lstatSync(expected.storagePath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') storageExists = false;
+      else throw error;
+    }
+    if (
+      storageExists &&
+      !registryPathEquals(canonicalizePath(expected.storagePath), expected.canonicalStoragePath)
+    ) {
+      throw new Error('GitNexus: expected registry storage changed before unregister');
+    }
   }
   await withRegistryMutationLock(async () => {
     const entries = await readRegistry();
