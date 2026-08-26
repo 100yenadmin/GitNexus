@@ -160,6 +160,7 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
       jobManager.updateJob(job.id, { status: 'failed', error: rootLockErr });
       return;
     }
+    jobManager.deferCancellationFinalization(job.id);
     const lexicalStoragePath = getStoragePath(lockedRepoPath);
     let analyzeStorageLockKey = canonicalRepoLockKey(lockedRepoPath);
     let ownershipLease: { release(): Promise<void> } | undefined;
@@ -194,6 +195,21 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
       });
     };
 
+    const finishCancelledLaunch = async (reason: string): Promise<void> => {
+      let releaseError: unknown;
+      try {
+        await releaseLock();
+      } catch (err) {
+        releaseError = err;
+      }
+      jobManager.updateJob(job.id, {
+        status: 'failed',
+        error: releaseError
+          ? `${reason}; Analyze ownership release failed: ${releaseError instanceof Error ? releaseError.message : String(releaseError)}`
+          : reason,
+      });
+    };
+
     // ── Worker fork with auto-retry ──────────────────────────────
     const callerPath = fileURLToPath(import.meta.url);
     const isDev = callerPath.endsWith('.ts');
@@ -209,6 +225,10 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
         void releaseLock().catch((err) => {
           logger.error({ err }, 'analyze ownership release failed after terminal job:');
         });
+        return;
+      }
+      if (currentJob.cancellationReason) {
+        void finishCancelledLaunch(currentJob.cancellationReason);
         return;
       }
 
@@ -232,9 +252,13 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
           })
           .catch((err) => {
             logger.error({ err }, 'analyze ownership release failed after worker finalization:');
+            const releaseMessage = `Analyze ownership release failed: ${err instanceof Error ? err.message : String(err)}`;
             jobManager.updateJob(job.id, {
               status: 'failed',
-              error: `Analyze ownership release failed: ${err instanceof Error ? err.message : String(err)}`,
+              error:
+                terminalUpdate?.status === 'failed' && terminalUpdate.error
+                  ? `${terminalUpdate.error}; ${releaseMessage}`
+                  : releaseMessage,
             });
           });
       };
@@ -268,6 +292,13 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
           current.status === 'failed' ||
           terminalMessageReceived
         ) {
+          return;
+        }
+
+        if (current.cancellationReason) {
+          terminalMessageReceived = true;
+          terminalUpdate = { status: 'failed', error: current.cancellationReason };
+          finishTerminalCleanup(closeDbHandle());
           return;
         }
 
@@ -332,7 +363,7 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
         terminalMessageReceived = true;
         terminalUpdate = {
           status: 'failed',
-          error: `Worker process error: ${err.message}`,
+          error: current.cancellationReason ?? `Worker process error: ${err.message}`,
         };
         finishTerminalCleanup(closeDbHandle());
         // An error event does not prove process exit (IPC and kill failures can
@@ -356,6 +387,13 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
           return;
         }
         if (terminalMessageReceived) {
+          maybeReleaseAfterTerminalCleanup();
+          return;
+        }
+        if (j.cancellationReason) {
+          terminalMessageReceived = true;
+          terminalUpdate = { status: 'failed', error: j.cancellationReason };
+          finishTerminalCleanup(closeDbHandle());
           maybeReleaseAfterTerminalCleanup();
           return;
         }
@@ -440,6 +478,10 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
         const currentJob = jobManager.getJob(job.id);
         if (!currentJob || currentJob.status === 'complete' || currentJob.status === 'failed') {
           await releaseLock();
+          return;
+        }
+        if (currentJob.cancellationReason) {
+          await finishCancelledLaunch(currentJob.cancellationReason);
           return;
         }
         if (existsSync(lockedRepoPath) && !existsSync(lexicalStoragePath)) {

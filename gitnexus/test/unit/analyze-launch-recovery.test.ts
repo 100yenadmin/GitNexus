@@ -52,6 +52,8 @@ const fakeJobManager = () => {
     status: 'queued' as 'queued' | 'analyzing' | 'complete' | 'failed',
     progress: { phase: 'queued', percent: 0, message: 'queued' },
     retryCount: 0,
+    cancellationReason: undefined as string | undefined,
+    deferCancellationUntilCleanup: false,
   };
   return {
     job,
@@ -61,6 +63,9 @@ const fakeJobManager = () => {
         Object.assign(job, update);
       }),
       registerChild: vi.fn(),
+      deferCancellationFinalization: vi.fn(() => {
+        job.deferCancellationUntilCleanup = true;
+      }),
     },
   };
 };
@@ -204,14 +209,61 @@ describe('analyze worker shared lock ownership', () => {
 
     launch(job, '/virtual/demo', {});
     await waitForWorkerStart();
-    job.status = 'failed';
+    job.cancellationReason = 'Cancelled by user';
     child.emit('message', { type: 'error', message: 'cancelled' });
     expect(releaseRepoLock).not.toHaveBeenCalled();
     child.emit('close', 0);
 
-    await vi.waitFor(() => expect(releaseRepoLock).toHaveBeenCalledOnce());
+    await vi.waitFor(() => expect(job.status).toBe('failed'));
+    expect(job).toMatchObject({ error: 'Cancelled by user' });
     expect(releaseRepoLock).toHaveBeenCalledOnce();
     expect(releaseRepoLock).toHaveBeenCalledWith(virtualStoragePath, virtualRootLockKey);
+  });
+
+  it('publishes cancellation and ownership release failure together after child exit', async () => {
+    const { job, manager } = fakeJobManager();
+    const child = fakeChild();
+    launcherState.fork.mockReset().mockReturnValue(child.child);
+    const releaseRepoLock = vi.fn();
+    const deps = launchDeps(manager, releaseRepoLock);
+    deps.ownershipRelease.mockRejectedValueOnce(new Error('release refused'));
+
+    createLaunchAnalysisWorker(deps)(job, '/virtual/demo', {});
+    await waitForWorkerStart();
+    job.cancellationReason = 'Cancelled by user';
+    child.emit('close', 0);
+
+    await vi.waitFor(() => expect(job.status).toBe('failed'));
+    expect(job).toMatchObject({
+      error: 'Cancelled by user; Analyze ownership release failed: release refused',
+    });
+    expect(deps.ownershipRelease).toHaveBeenCalledOnce();
+    expect(releaseRepoLock).toHaveBeenCalledOnce();
+  });
+
+  it('cancels during ownership admission without starting a worker', async () => {
+    const { job, manager } = fakeJobManager();
+    launcherState.fork.mockReset();
+    const releaseRepoLock = vi.fn();
+    const deps = launchDeps(manager, releaseRepoLock);
+    let admitOwnership!: () => void;
+    deps.acquireAnalyzeOwnership.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          admitOwnership = () => resolve({ release: deps.ownershipRelease });
+        }),
+    );
+
+    createLaunchAnalysisWorker(deps)(job, '/virtual/demo', {});
+    await vi.waitFor(() => expect(deps.acquireAnalyzeOwnership).toHaveBeenCalledOnce());
+    job.cancellationReason = 'Cancelled by user';
+    admitOwnership();
+
+    await vi.waitFor(() => expect(job.status).toBe('failed'));
+    expect(job).toMatchObject({ error: 'Cancelled by user' });
+    expect(launcherState.fork).not.toHaveBeenCalled();
+    expect(deps.ownershipRelease).toHaveBeenCalledOnce();
+    expect(releaseRepoLock).toHaveBeenCalledOnce();
   });
 
   it('releases when terminal cleanup finishes before the worker exits', async () => {

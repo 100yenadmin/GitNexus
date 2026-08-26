@@ -2605,12 +2605,26 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
               await assertZeroClearRegistryOwner(frozenOwner, terminalOwnerMeta);
             }
 
+            // The terminal metadata commit and owner validation are complete;
+            // cancellation during ownership release is now an accepted
+            // finalization cancellation, not a deferred commit decision.
+            const cancellationRequestedBeforeRelease = barrier.cancelRequested;
+            barrier.phase = 'RUNNING';
             await ownershipLease.release();
             ownershipLease = undefined;
 
-            // Don't overwrite 'failed' if the job was cancelled while the pipeline was running
+            // Cancellation may be accepted while ownership release is pending.
+            // Preserve it as the terminal failure instead of overwriting it as complete.
             const current = embedJobManager.getJob(job.id);
-            if (!current || current.status !== 'failed') {
+            const acceptedCancellation =
+              cancellationFailure ??
+              (!cancellationRequestedBeforeRelease && barrier.cancelRequested
+                ? barrier.cancelReason
+                : undefined);
+            if (acceptedCancellation) {
+              barrier.phase = 'FAILED';
+              failureMessage = acceptedCancellation;
+            } else if (!current || current.status !== 'failed') {
               barrier.phase = 'COMPLETE';
               embedJobManager.updateJob(job.id, {
                 status: 'complete',

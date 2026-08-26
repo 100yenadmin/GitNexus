@@ -640,6 +640,44 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     expect(state.releaseOwnershipLease).toHaveBeenCalledOnce();
   });
 
+  it('keeps cancellation failed when accepted during successful ownership release', async () => {
+    state.currentMeta = makeMeta(LIVE_DIGEST);
+    let releaseStarted!: () => void;
+    const releaseRunning = new Promise<void>((resolve) => {
+      releaseStarted = resolve;
+    });
+    let finishRelease!: () => void;
+    const releaseGate = new Promise<void>((resolve) => {
+      finishRelease = resolve;
+    });
+    state.releaseOwnershipLease.mockImplementationOnce(async () => {
+      releaseStarted();
+      await releaseGate;
+    });
+
+    const response = await fetch(`${baseUrl}/api/embed`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ repo: REPO.name }),
+    });
+    expect(response.status).toBe(202);
+    const { jobId } = (await response.json()) as { jobId: string };
+    await releaseRunning;
+
+    const deleteHandlerStarted = armDeleteHandlerSignal();
+    const cancellationResponse = fetch(`${baseUrl}/api/embed/${jobId}`, { method: 'DELETE' });
+    await deleteHandlerStarted;
+    const cancelled = await cancellationResponse;
+    expect(cancelled.status).toBe(200);
+    finishRelease();
+
+    await expect(waitForTerminalJob(baseUrl, jobId)).resolves.toMatchObject({
+      status: 'failed',
+      error: 'Cancelled by user',
+    });
+    expect(state.releaseOwnershipLease).toHaveBeenCalledOnce();
+  });
+
   it('rejects an equal-count different-digest completed window before the pipeline', async () => {
     const checkpointBefore = JSON.stringify(state.currentMeta.embeddingCheckpoint);
     const response = await fetch(`${baseUrl}/api/embed`, {
