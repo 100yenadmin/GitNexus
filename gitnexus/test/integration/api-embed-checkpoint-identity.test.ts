@@ -494,7 +494,10 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     expect(state.releaseOwnershipLease).not.toHaveBeenCalled();
 
     releaseOwnership();
-    await expect(waitForTerminalJob(baseUrl, jobId)).resolves.toMatchObject({ status: 'complete' });
+    await expect(waitForTerminalJob(baseUrl, jobId)).resolves.toMatchObject({
+      status: 'complete',
+      progress: { phase: 'complete', percent: 100 },
+    });
     expect(state.releaseOwnershipLease).toHaveBeenCalledOnce();
   });
 
@@ -536,7 +539,10 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     const { jobId } = (await response.json()) as { jobId: string };
     const job = await waitForTerminalJob(baseUrl, jobId);
 
-    expect(job).toMatchObject({ status: 'failed' });
+    expect(job).toMatchObject({
+      status: 'failed',
+      progress: { phase: 'failed' },
+    });
     expect(job.error).toMatch(/preflight failed/);
     expect(job.error).toMatch(/ownership lock release failed: release retries exhausted/i);
     expect(state.releaseOwnershipLease).toHaveBeenCalledOnce();

@@ -2606,7 +2606,10 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
             const current = embedJobManager.getJob(job.id);
             if (!current || current.status !== 'failed') {
               barrier.phase = 'COMPLETE';
-              embedJobManager.updateJob(job.id, { status: 'complete' });
+              embedJobManager.updateJob(job.id, {
+                status: 'complete',
+                progress: { phase: 'complete', percent: 100, message: 'Complete' },
+              });
             }
           } catch (err: any) {
             if (barrier.phase !== 'COMPLETE') barrier.phase = 'FAILED';
@@ -2634,7 +2637,15 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
               .filter((message): message is string => Boolean(message))
               .join('; ');
             if (combinedFailure && (!current || current.status !== 'failed' || releaseMessage)) {
-              embedJobManager.updateJob(job.id, { status: 'failed', error: combinedFailure });
+              embedJobManager.updateJob(job.id, {
+                status: 'failed',
+                error: combinedFailure,
+                progress: {
+                  phase: 'failed',
+                  percent: current?.progress.percent ?? 0,
+                  message: combinedFailure,
+                },
+              });
             }
             barrier.publishTerminalOutcome();
             clearTimeout(embedTimeout);
