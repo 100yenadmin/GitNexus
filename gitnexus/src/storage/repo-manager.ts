@@ -1658,9 +1658,17 @@ const assertExpectedUnregisterOwner = (
 type RegistryRemovalReceipt = {
   removedOwner: RegistryEntry;
   removedIndex: number;
+  expectedCanonicalPath: string;
 };
 
 const rollbackRegistryRemoval = async (receipt: RegistryRemovalReceipt): Promise<void> => {
+  // Resolve the mutable display path before the registry lock. Restoring raw
+  // bytes after that path retargets would publish the old owner for a new repo.
+  if (
+    !registryPathEquals(canonicalizePath(receipt.removedOwner.path), receipt.expectedCanonicalPath)
+  ) {
+    throw new Error('GitNexus: registry owner path changed; unregister rollback refused');
+  }
   await withRegistryMutationLock(async () => {
     const fresh = await readRegistry();
     const removedJson = JSON.stringify(registryEntryProjection(receipt.removedOwner));
@@ -1715,7 +1723,11 @@ export const unregisterRepo = async (
     const [{ entry: removedOwner, index: removedIndex }] = matches;
     entries.splice(removedIndex, 1);
     await writeRegistry(entries);
-    removalReceipt = { removedOwner, removedIndex };
+    removalReceipt = {
+      removedOwner,
+      removedIndex,
+      expectedCanonicalPath: expected.canonicalPath,
+    };
   });
   if (!expected || !removalReceipt) return;
   try {

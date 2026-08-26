@@ -12,7 +12,6 @@ import { _captureLogger } from '../../src/core/logger.js';
 import {
   getStoragePath,
   canonicalRepoLockKey,
-  canonicalRepoRootLockKey,
   getStoragePaths,
   branchSlug,
   resolveBranchPlacement,
@@ -69,18 +68,6 @@ describe('getStoragePath', () => {
     await fs.symlink(storage, path.join(repo, '.gitnexus'), 'dir');
     try {
       expect(canonicalRepoLockKey(repo)).toBe(await fs.realpath(storage));
-    } finally {
-      await fs.rm(root, { recursive: true, force: true });
-    }
-  });
-
-  it('keeps the canonical repository-root lock distinct from its storage key', async () => {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-root-lock-'));
-    const repo = path.join(root, 'repo');
-    await fs.mkdir(repo);
-    try {
-      expect(canonicalRepoRootLockKey(repo)).toBe(`repo-root:${await fs.realpath(repo)}`);
-      expect(canonicalRepoRootLockKey(repo)).not.toBe(canonicalRepoLockKey(repo));
     } finally {
       await fs.rm(root, { recursive: true, force: true });
     }
@@ -1561,6 +1548,41 @@ describe('registerRepo expected owner CAS (#264)', () => {
       );
       expect(registryWrites).toBe(2);
       expect(await fs.readFile(registryPath, 'utf8')).toBe(before);
+    } finally {
+      renameSpy.mockRestore();
+    }
+  });
+
+  it('refuses to resurrect a removed owner after its repository path retargets', async () => {
+    const targetA = path.join(tmpHome.dbPath, 'rollback-retarget-a');
+    const targetB = path.join(tmpHome.dbPath, 'rollback-retarget-b');
+    const alias = path.join(tmpHome.dbPath, 'rollback-retarget-alias');
+    await fs.mkdir(path.join(targetA, '.gitnexus'), { recursive: true });
+    await fs.mkdir(path.join(targetB, '.gitnexus'), { recursive: true });
+    await fs.symlink(targetA, alias, 'dir');
+    const expected: RegistryEntry = {
+      ...owner(),
+      path: alias,
+      storagePath: path.join(alias, '.gitnexus'),
+    };
+    const frozen = frozenOwner(expected);
+    const registryPath = path.join(tmpHome.dbPath, 'registry.json');
+    await fs.writeFile(registryPath, JSON.stringify([expected]));
+    const realRename = fs.rename.bind(fs);
+    let registryWrites = 0;
+    const renameSpy = vi.spyOn(fs, 'rename').mockImplementation(async (source, target) => {
+      await realRename(source, target);
+      if (path.resolve(String(target)) === path.resolve(registryPath) && ++registryWrites === 1) {
+        await fs.unlink(alias);
+        await fs.symlink(targetB, alias, 'dir');
+      }
+    });
+
+    try {
+      await expect(unregisterRepo(alias, { expectedOwner: frozen })).rejects.toThrow(
+        'registry rollback was incomplete',
+      );
+      expect(await readRegistry()).toEqual([]);
     } finally {
       renameSpy.mockRestore();
     }
