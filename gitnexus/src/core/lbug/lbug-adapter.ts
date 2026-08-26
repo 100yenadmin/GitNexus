@@ -816,12 +816,18 @@ export const withLbugReadOnlyNonRecovering = async <T>(
 export const withLbugDb = async <T>(
   dbPath: string,
   operation: () => Promise<T>,
-  options: { readOnly?: boolean; ownershipStoragePath?: string } = {},
+  options: {
+    readOnly?: boolean;
+    ownershipStoragePath?: string;
+    ownershipRepoRoot?: string;
+  } = {},
 ): Promise<T> => {
   if (options.ownershipStoragePath) {
     const { withAnalyzeOwnershipLock } = await import('../staged-promotion.js');
-    return withAnalyzeOwnershipLock(options.ownershipStoragePath, () =>
-      withLbugDb(dbPath, operation, { readOnly: options.readOnly }),
+    return withAnalyzeOwnershipLock(
+      options.ownershipStoragePath,
+      () => withLbugDb(dbPath, operation, { readOnly: options.readOnly }),
+      { repoRoot: options.ownershipRepoRoot },
     );
   }
   let lastError: unknown;

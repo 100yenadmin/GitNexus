@@ -440,4 +440,49 @@ describe('common analyze ownership lock', () => {
       code: 'ENOENT',
     });
   });
+
+  it('retains ownership after storage is detached without recreating absent storage', async () => {
+    const parent = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-stable-owner-'));
+    tempDirs.push(parent);
+    const repoRoot = path.join(parent, 'repo');
+    const storagePath = path.join(repoRoot, '.gitnexus');
+    const detachedPath = path.join(repoRoot, '.gitnexus.detached');
+    await fs.mkdir(storagePath, { recursive: true });
+    let markDetached!: () => void;
+    const detached = new Promise<void>((resolve) => {
+      markDetached = resolve;
+    });
+    let release!: () => void;
+    const releaseGate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const owner = withAnalyzeOwnershipLock(
+      storagePath,
+      async () => {
+        await fs.rename(storagePath, detachedPath);
+        markDetached();
+        await releaseGate;
+      },
+      { repoRoot },
+    );
+    await detached;
+
+    await expect(
+      withAnalyzeOwnershipLock(storagePath, async () => undefined, {
+        repoRoot,
+        createStoragePath: false,
+      }),
+    ).rejects.toThrow('Another analyze is active');
+    await expect(fs.access(storagePath)).rejects.toMatchObject({ code: 'ENOENT' });
+
+    release();
+    await owner;
+    await expect(
+      withAnalyzeOwnershipLock(storagePath, async () => 'released', {
+        repoRoot,
+        createStoragePath: false,
+      }),
+    ).resolves.toBe('released');
+    await expect(fs.access(storagePath)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
 });

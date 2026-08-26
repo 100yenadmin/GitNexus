@@ -70,6 +70,7 @@ const state = {
   executeQuery: vi.fn(async () => state.graphNodes),
   openModes: [] as Array<boolean | undefined>,
   openOwnershipPaths: [] as Array<string | undefined>,
+  openOwnershipRepoRoots: [] as Array<string | undefined>,
   ownershipGate: undefined as Promise<void> | undefined,
   closeLbug: vi.fn(async () => undefined),
   withLbugReadOnlyNonRecovering: vi.fn((_dbPath: string, operation: () => Promise<unknown>) => {
@@ -80,10 +81,15 @@ const state = {
     async (
       _dbPath: string,
       operation: () => Promise<unknown>,
-      options?: { readOnly?: boolean; ownershipStoragePath?: string },
+      options?: {
+        readOnly?: boolean;
+        ownershipStoragePath?: string;
+        ownershipRepoRoot?: string;
+      },
     ) => {
       state.openModes.push(options?.readOnly);
       state.openOwnershipPaths.push(options?.ownershipStoragePath);
+      state.openOwnershipRepoRoots.push(options?.ownershipRepoRoot);
       if (options?.ownershipStoragePath) await state.ownershipGate;
       return operation();
     },
@@ -376,6 +382,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     state.executeQuery.mockImplementation(async () => state.graphNodes);
     state.openModes.length = 0;
     state.openOwnershipPaths.length = 0;
+    state.openOwnershipRepoRoots.length = 0;
     state.ownershipGate = undefined;
     state.closeLbug.mockClear();
     state.withLbugReadOnlyNonRecovering.mockClear();
@@ -461,6 +468,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     await vi.waitFor(() => expect(state.openOwnershipPaths).toHaveLength(1));
 
     expect(state.openOwnershipPaths).toEqual([canonicalizePath(REPO.storagePath)]);
+    expect(state.openOwnershipRepoRoots).toEqual([canonicalizePath(REPO.path)]);
     expect(state.loadMeta).toHaveBeenCalledOnce();
     expect(state.saveMeta).not.toHaveBeenCalled();
 
@@ -867,19 +875,25 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     await fs.writeFile(sentinel, 'preserve');
     const entry = { ...REPO, path: repoRoot, storagePath };
     state.listRegisteredRepos.mockResolvedValue([entry]);
+    expect(canonicalRepoLockKey(repoRoot)).toBe(canonicalizePath(storagePath));
 
     try {
-      await withAnalyzeOwnershipLock(canonicalizePath(storagePath), async () => {
-        const blocked = await fetch(`${baseUrl}/api/repo?repo=${encodeURIComponent(entry.name)}`, {
-          method: 'DELETE',
-        });
-        const body = (await blocked.json()) as { error?: string };
+      await withAnalyzeOwnershipLock(
+        canonicalizePath(storagePath),
+        async () => {
+          const blocked = await fetch(
+            `${baseUrl}/api/repo?repo=${encodeURIComponent(entry.name)}`,
+            { method: 'DELETE' },
+          );
+          const body = (await blocked.json()) as { error?: string };
 
-        expect(blocked.status).toBe(500);
-        expect(body.error).toMatch(/another analyze is active/i);
-        await expect(fs.readFile(sentinel, 'utf8')).resolves.toBe('preserve');
-        expect(state.unregisterRepo).not.toHaveBeenCalled();
-      });
+          expect(blocked.status).toBe(500);
+          expect(body.error).toMatch(/another analyze is active/i);
+          await expect(fs.readFile(sentinel, 'utf8')).resolves.toBe('preserve');
+          expect(state.unregisterRepo).not.toHaveBeenCalled();
+        },
+        { repoRoot },
+      );
 
       const removed = await fetch(`${baseUrl}/api/repo?repo=${encodeURIComponent(entry.name)}`, {
         method: 'DELETE',
@@ -920,6 +934,14 @@ describe('POST /api/embed completed-checkpoint identity', () => {
       await vi.waitFor(() => expect(state.unregisterRepo).toHaveBeenCalledOnce());
       await expect(fs.lstat(entry.storagePath)).rejects.toMatchObject({ code: 'ENOENT' });
 
+      await expect(
+        withAnalyzeOwnershipLock(canonicalizePath(entry.storagePath), async () => undefined, {
+          repoRoot,
+          createStoragePath: false,
+        }),
+      ).rejects.toThrow(/another analyze is active/i);
+      await expect(fs.lstat(entry.storagePath)).rejects.toMatchObject({ code: 'ENOENT' });
+
       const analyze = await fetch(`${baseUrl}/api/analyze`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
@@ -940,6 +962,29 @@ describe('POST /api/embed completed-checkpoint identity', () => {
       await expect(fs.readFile(sentinel, 'utf8')).resolves.toBe('preserve');
     } finally {
       finishUnregister?.();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('deletes an absent registered index without materializing storage', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-delete-absent-storage-'));
+    const repoRoot = path.join(root, 'repo');
+    const storagePath = path.join(repoRoot, '.gitnexus');
+    await fs.mkdir(repoRoot, { recursive: true });
+    const entry = { ...REPO, path: repoRoot, storagePath };
+    state.listRegisteredRepos.mockResolvedValue([entry]);
+
+    try {
+      const response = await fetch(`${baseUrl}/api/repo?repo=${encodeURIComponent(entry.name)}`, {
+        method: 'DELETE',
+      });
+
+      const responseBody = (await response.clone().json()) as { error?: string };
+      expect(response.status, responseBody.error).toBe(200);
+      await expect(response.json()).resolves.toEqual({ deleted: entry.name });
+      expect(state.unregisterRepo).toHaveBeenCalledOnce();
+      await expect(fs.lstat(storagePath)).rejects.toMatchObject({ code: 'ENOENT' });
+    } finally {
       await fs.rm(root, { recursive: true, force: true });
     }
   });

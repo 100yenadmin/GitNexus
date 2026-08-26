@@ -16,12 +16,12 @@ const makePaths = async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-lbug-owner-'));
   roots.push(root);
   const storagePath = path.join(root, '.gitnexus');
-  return { storagePath, lbugPath: path.join(storagePath, 'lbug') };
+  return { repoRoot: root, storagePath, lbugPath: path.join(storagePath, 'lbug') };
 };
 
 describe('Ladybug writable ownership admission', () => {
   it('refuses a writable session while the real analyzer owner is active', async () => {
-    const { storagePath, lbugPath } = await makePaths();
+    const { repoRoot, storagePath, lbugPath } = await makePaths();
     let markOwned!: () => void;
     const owned = new Promise<void>((resolve) => {
       markOwned = resolve;
@@ -30,15 +30,22 @@ describe('Ladybug writable ownership admission', () => {
     const ownerGate = new Promise<void>((resolve) => {
       releaseOwner = resolve;
     });
-    const analyzer = withAnalyzeOwnershipLock(storagePath, async () => {
-      markOwned();
-      await ownerGate;
-    });
+    const analyzer = withAnalyzeOwnershipLock(
+      storagePath,
+      async () => {
+        markOwned();
+        await ownerGate;
+      },
+      { repoRoot },
+    );
     await owned;
     const operation = vi.fn(async () => undefined);
 
     await expect(
-      withLbugDb(lbugPath, operation, { ownershipStoragePath: storagePath }),
+      withLbugDb(lbugPath, operation, {
+        ownershipStoragePath: storagePath,
+        ownershipRepoRoot: repoRoot,
+      }),
     ).rejects.toThrow(/another analyze is active/i);
     expect(operation).not.toHaveBeenCalled();
 
@@ -50,18 +57,21 @@ describe('Ladybug writable ownership admission', () => {
     { label: 'success', failure: undefined },
     { label: 'failure', failure: 'writer failed' },
   ])('releases the real ownership lock after writable session $label', async ({ failure }) => {
-    const { storagePath, lbugPath } = await makePaths();
+    const { repoRoot, storagePath, lbugPath } = await makePaths();
     const operation = vi.fn(async () => {
       if (failure) throw new Error(failure);
       return 'complete';
     });
 
-    const result = withLbugDb(lbugPath, operation, { ownershipStoragePath: storagePath });
+    const result = withLbugDb(lbugPath, operation, {
+      ownershipStoragePath: storagePath,
+      ownershipRepoRoot: repoRoot,
+    });
     if (failure) await expect(result).rejects.toThrow(failure);
     else await expect(result).resolves.toBe('complete');
     expect(operation).toHaveBeenCalledOnce();
-    await expect(withAnalyzeOwnershipLock(storagePath, async () => 'released')).resolves.toBe(
-      'released',
-    );
+    await expect(
+      withAnalyzeOwnershipLock(storagePath, async () => 'released', { repoRoot }),
+    ).resolves.toBe('released');
   });
 });

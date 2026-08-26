@@ -1397,24 +1397,37 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
       const storageLockKey = canonicalRepoLockKey(lockedRepoRoot);
       const rootLockKey = canonicalRepoRootLockKey(lockedRepoRoot);
       const storagePath = getStoragePath(lockedRepoRoot);
-      const registeredStorageLockKey = canonicalizePath(entry.storagePath);
       assertSafeStoragePath(entry);
-      if (
-        !registryPathEquals(registeredStorageLockKey, storageLockKey) ||
-        !registryPathEquals(canonicalizePath(entry.path), lockedRepoRoot) ||
-        !registryPathEquals(canonicalizePath(entry.storagePath), storageLockKey)
-      ) {
-        throw new Error('GitNexus repository owner changed before deletion');
-      }
       const observedStorageIdentity = await readStorageObjectIdentity(storagePath);
+      // realpath cannot canonicalize a missing final component (notably
+      // `/var` versus `/private/var` on macOS). The lexical safety check above
+      // already binds an absent entry to `<repo>/.gitnexus`, so use the frozen
+      // root-derived key until an object exists to canonicalize.
+      const registeredStorageLockKey = observedStorageIdentity
+        ? canonicalizePath(entry.storagePath)
+        : storageLockKey;
+      const ownerDrift = [
+        !registryPathEquals(registeredStorageLockKey, storageLockKey) && 'storage-owner',
+        !registryPathEquals(canonicalizePath(entry.path), lockedRepoRoot) && 'repository-root',
+      ].filter((value): value is string => typeof value === 'string');
+      if (ownerDrift.length > 0) {
+        throw new Error(
+          `GitNexus repository owner changed before deletion (${ownerDrift.join(', ')})`,
+        );
+      }
       const lockErr = acquireRepoLock(storageLockKey, rootLockKey);
       if (lockErr) {
         res.status(409).json({ error: lockErr });
         return;
       }
+      const withDeleteOwnership = <T>(operation: () => Promise<T>): Promise<T> =>
+        withAnalyzeOwnershipLock(storageLockKey, operation, {
+          repoRoot: lockedRepoRoot,
+          createStoragePath: false,
+        });
 
       try {
-        await withAnalyzeOwnershipLock(storageLockKey, async () => {
+        await withDeleteOwnership(async () => {
           if (
             !storageObjectMatches(
               await readStorageObjectIdentity(storagePath),
@@ -2322,6 +2335,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
             const withOwnedLbugDb = <T>(operation: () => Promise<T>): Promise<T> =>
               withLbugDb(lbugPath, operation, {
                 ownershipStoragePath: frozenOwner.canonicalStoragePath,
+                ownershipRepoRoot: frozenOwner.canonicalPath,
               });
             await withOwnedLbugDb(async () => {
               let embeddingMeta = await loadMeta(frozenOwner.canonicalStoragePath);

@@ -1,8 +1,9 @@
-import { randomBytes } from 'crypto';
+import { createHash, randomBytes } from 'crypto';
 import path from 'path';
 import fs from 'fs/promises';
 import { retryRename } from '../storage/fs-atomic.js';
 import {
+  canonicalizePath,
   isMissingFilesystemError,
   loadMeta,
   saveMeta,
@@ -330,15 +331,17 @@ const processIsAlive = (pid: number): boolean => {
   }
 };
 
-/** Serialize every analyzer writer; a dead owner's lock is reclaimed on the next run. */
-export const withAnalyzeOwnershipLock = async <T>(
-  storagePath: string,
+export interface AnalyzeOwnershipLockOptions {
+  /** Frozen physical repository root shared by analyze, embed, and delete. */
+  repoRoot?: string;
+  /** DELETE sets this false so locking an absent generation does not create it. */
+  createStoragePath?: boolean;
+}
+
+const withOwnershipFileLock = async <T>(
+  lockPath: string,
   operation: () => Promise<T>,
 ): Promise<T> => {
-  await fs.mkdir(storagePath, { recursive: true });
-  // Keep the existing filename so an older staged writer and a newer ordinary
-  // writer still contend during an in-place upgrade.
-  const lockPath = path.join(storagePath, 'analyze-staged.lock');
   const record: StageLockRecord = {
     schema: 'gitnexus.staged-analyze-lock/v1',
     pid: process.pid,
@@ -372,6 +375,50 @@ export const withAnalyzeOwnershipLock = async <T>(
     const current = await readJson<StageLockRecord>(lockPath).catch(() => undefined);
     if (current?.nonce === record.nonce) await fs.rm(lockPath, { force: true });
   }
+};
+
+const analyzeOwnershipCompanionPath = (repoRoot: string): string => {
+  const canonicalRoot = canonicalizePath(repoRoot);
+  const digest = createHash('sha256').update(canonicalRoot).digest('hex').slice(0, 32);
+  return path.join(path.dirname(canonicalRoot), `.gitnexus-analyze-${digest}.lock`);
+};
+
+/**
+ * Serialize every supported writer; a dead owner's lock is reclaimed on the next run.
+ *
+ * New writers first hold a transient companion lock beside the frozen physical
+ * repository root. It survives storage detach/removal. The existing storage
+ * lock remains the second boundary so in-place upgrades still exclude an older
+ * writer that acquired it before storage was detached.
+ */
+export const withAnalyzeOwnershipLock = async <T>(
+  storagePath: string,
+  operation: () => Promise<T>,
+  options: AnalyzeOwnershipLockOptions = {},
+): Promise<T> => {
+  // The caller owns storage identity and may already have frozen a physical
+  // target before repository disappearance. Resolve syntax only; never
+  // realpath/recompute that identity here.
+  const lockedStoragePath = path.resolve(storagePath);
+  const withStorageLock = async (): Promise<T> => {
+    if (options.createStoragePath === false) {
+      try {
+        await fs.access(lockedStoragePath);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return operation();
+        throw error;
+      }
+    } else {
+      await fs.mkdir(lockedStoragePath, { recursive: true });
+    }
+
+    // Keep the existing filename so an older staged writer and a newer ordinary
+    // writer still contend during an in-place upgrade.
+    return withOwnershipFileLock(path.join(lockedStoragePath, 'analyze-staged.lock'), operation);
+  };
+
+  if (!options.repoRoot) return withStorageLock();
+  return withOwnershipFileLock(analyzeOwnershipCompanionPath(options.repoRoot), withStorageLock);
 };
 
 /** @deprecated Use the common ownership lock so plain and staged writers cannot overlap. */

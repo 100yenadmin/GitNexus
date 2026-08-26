@@ -3625,16 +3625,20 @@ export async function runFullAnalysis(
   if (options.repairVector) await assertVectorRepairPreflight(repoPath);
 
   const storagePath = options.analyzeStoragePath ?? getStoragePaths(repoPath).storagePath;
-  return withAnalyzeOwnershipLock(storagePath, async () => {
-    // The first preflight avoids creating an ownership lock for a known-dirty
-    // index. Repeat it after lock acquisition because a writer may have run
-    // while this command was waiting and left new recovery or dirty state.
-    if (options.repairVector) {
-      await assertVectorRepairPreflight(repoPath, { allowAnalyzeOwnershipLock: true });
-    }
-    return runFullAnalysisImpl(repoPath, options, callbacks, {
-      repoHasGit,
-      remoteUrl: repositoryRemoteUrl,
-    });
-  });
+  return withAnalyzeOwnershipLock(
+    storagePath,
+    async () => {
+      // The first preflight avoids creating an ownership lock for a known-dirty
+      // index. Repeat it after lock acquisition because a writer may have run
+      // while this command was waiting and left new recovery or dirty state.
+      if (options.repairVector) {
+        await assertVectorRepairPreflight(repoPath, { allowAnalyzeOwnershipLock: true });
+      }
+      return runFullAnalysisImpl(repoPath, options, callbacks, {
+        repoHasGit,
+        remoteUrl: repositoryRemoteUrl,
+      });
+    },
+    { repoRoot: repoPath },
+  );
 }
