@@ -360,6 +360,28 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     exitSpy.mockRestore();
   });
 
+  it('releases the repository lock when embedding job admission throws', async () => {
+    const createJobSpy = vi.spyOn(JobManager.prototype, 'createJob').mockImplementationOnce(() => {
+      throw new Error('test admission failure');
+    });
+    const failedAdmission = await fetch(`${baseUrl}/api/embed`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ repo: REPO.name }),
+    });
+    expect(failedAdmission.status).toBe(500);
+    createJobSpy.mockRestore();
+
+    const retry = await fetch(`${baseUrl}/api/embed`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ repo: REPO.name }),
+    });
+    expect(retry.status).toBe(202);
+    const { jobId } = (await retry.json()) as { jobId: string };
+    await waitForTerminalJob(baseUrl, jobId);
+  });
+
   it('rejects an equal-count different-digest completed window before the pipeline', async () => {
     const checkpointBefore = JSON.stringify(state.currentMeta.embeddingCheckpoint);
     const response = await fetch(`${baseUrl}/api/embed`, {

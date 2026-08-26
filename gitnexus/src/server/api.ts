@@ -2063,11 +2063,11 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
           res.status(404).json({ error: 'Repository not found' });
           return;
         }
-        // Capture the canonical storage target before any asynchronous
-        // repository work. This exact key is shared with analyze/delete and
-        // remains valid even if the repository disappears while the job runs.
-        const repoLockPath = canonicalRepoLockKey(entry.path);
         const frozenOwner = freezeZeroClearRegistryOwner(entry);
+        // Freeze once, then use that same physical storage identity for both
+        // lock ownership and every embedding read/write. A second path
+        // canonicalization here would reopen the symlink-retarget window.
+        const repoLockPath = frozenOwner.canonicalStoragePath;
 
         // Check shared repo lock — prevent concurrent analyze + embed on same repo
         const lockErr = acquireRepoLock(repoLockPath);
@@ -2076,7 +2076,13 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
           return;
         }
 
-        const job = embedJobManager.createJob({ repoPath: repoLockPath });
+        let job: ReturnType<JobManager['createJob']>;
+        try {
+          job = embedJobManager.createJob({ repoPath: repoLockPath });
+        } catch (err) {
+          releaseRepoLock(repoLockPath);
+          throw err;
+        }
         embedJobManager.updateJob(job.id, {
           repoName: frozenOwner.name,
           status: 'analyzing' as any,

@@ -152,8 +152,10 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
     // after this instant. Taken before the fork so no worker write predates it.
     const jobStartMs = Date.now();
     // Capture the canonical lock key before the worker can remove or retarget
-    // the repository root. The same captured key must be used for release.
-    const analyzeLockKey = canonicalRepoLockKey(targetPath);
+    // the repository root. The same physical root is sent to every retry so a
+    // later symlink retarget cannot move the worker outside the held lock.
+    const lockedRepoPath = canonicalizePath(targetPath);
+    const analyzeLockKey = canonicalRepoLockKey(lockedRepoPath);
     const lockErr = acquireRepoLock(analyzeLockKey);
     if (lockErr) {
       jobManager.updateJob(job.id, { status: 'failed', error: lockErr });
@@ -199,6 +201,22 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
         execArgv: [...tsxHookArgs, '--max-old-space-size=8192'],
         stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
       });
+      let childExited = false;
+      let terminalCleanupStarted = false;
+      let terminalCleanupComplete = false;
+      const maybeReleaseAfterTerminalCleanup = (): void => {
+        if (childExited && terminalCleanupComplete) releaseLock();
+      };
+      const finishTerminalCleanup = (cleanup: Promise<unknown>): void => {
+        if (terminalCleanupStarted) return;
+        terminalCleanupStarted = true;
+        void cleanup
+          .catch(() => {})
+          .then(() => {
+            terminalCleanupComplete = true;
+            maybeReleaseAfterTerminalCleanup();
+          });
+      };
 
       // Capture stderr for crash diagnostics
       let stderrChunks = '';
@@ -219,7 +237,6 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
           current.status === 'failed' ||
           terminalMessageReceived
         ) {
-          releaseLock();
           return;
         }
 
@@ -230,7 +247,6 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
           });
         } else if (msg.type === 'complete') {
           terminalMessageReceived = true;
-          releaseLock();
           const terminalUpdate = completionUpdateForWorkerResult(msg.result);
           // Before recording the terminal result: (1) wait for the worker's on-disk
           // finalization to settle (see waitForSettledIndex), (2) evict the
@@ -246,33 +262,46 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
           // then fail the analyze request with explicit retry guidance.
           const settle = msg.result.recoveredPromotionOnly
             ? Promise.resolve()
-            : waitForSettledIndex(targetPath, jobStartMs);
-          settle
-            .then(() => closeDbHandle())
-            .catch(() => {}) // best-effort: eviction failure must not fail the job
-            .then(() => backend.init())
-            .then(() => {
-              jobManager.updateJob(job.id, terminalUpdate);
-            })
-            .catch((err) => {
-              logger.error({ err }, 'backend.init() failed after analyze:');
-              jobManager.updateJob(job.id, {
-                status: 'failed',
-                error: 'Server failed to reload after analysis. Try again.',
-              });
-            });
+            : waitForSettledIndex(lockedRepoPath, jobStartMs);
+          finishTerminalCleanup(
+            settle
+              .then(() => closeDbHandle())
+              .catch(() => {}) // best-effort: eviction failure must not fail the job
+              .then(() => backend.init())
+              .then(() => {
+                jobManager.updateJob(job.id, terminalUpdate);
+              })
+              .catch((err) => {
+                logger.error({ err }, 'backend.init() failed after analyze:');
+                jobManager.updateJob(job.id, {
+                  status: 'failed',
+                  error: 'Server failed to reload after analysis. Try again.',
+                });
+              }),
+          );
         } else if (msg.type === 'error') {
           terminalMessageReceived = true;
-          releaseLock();
           // A failed (force) analyze may still have rewritten DB files first.
-          void closeDbHandle().catch(() => {});
+          finishTerminalCleanup(closeDbHandle());
           jobManager.updateJob(job.id, { status: 'failed', error: msg.message });
         }
       });
 
       child.on('error', (err) => {
+        const current = jobManager.getJob(job.id);
+        // Cancellation marks the job failed before the child has finished its
+        // bounded shutdown checkpoint. Its exit event owns release in that case.
+        if (
+          !current ||
+          current.status === 'complete' ||
+          current.status === 'failed' ||
+          terminalMessageReceived
+        ) {
+          return;
+        }
         terminalMessageReceived = true;
-        releaseLock();
+        childExited = true;
+        finishTerminalCleanup(closeDbHandle());
         jobManager.updateJob(job.id, {
           status: 'failed',
           error: `Worker process error: ${err.message}`,
@@ -281,8 +310,13 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
 
       child.on('exit', (code) => {
         const j = jobManager.getJob(job.id);
-        if (!j || j.status === 'complete' || j.status === 'failed' || terminalMessageReceived) {
-          releaseLock();
+        childExited = true;
+        if (!j || j.status === 'complete' || j.status === 'failed') {
+          finishTerminalCleanup(closeDbHandle());
+          return;
+        }
+        if (terminalMessageReceived) {
+          maybeReleaseAfterTerminalCleanup();
           return;
         }
 
@@ -313,7 +347,8 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
           }, delay);
         } else {
           // Exhausted retries — permanent failure
-          releaseLock();
+          terminalMessageReceived = true;
+          finishTerminalCleanup(closeDbHandle());
           jobManager.updateJob(job.id, {
             status: 'failed',
             error: `Worker crashed ${MAX_WORKER_RETRIES + 1} times (code ${code})${stderrChunks ? ': ' + stderrChunks.trim().split('\n').pop() : ''}`,
@@ -328,7 +363,7 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
         // Send start command to child
         child.send({
           type: 'start',
-          repoPath: targetPath,
+          repoPath: lockedRepoPath,
           options: {
             force: !!opts.force,
             embeddings: !!opts.embeddings,

@@ -1,4 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 
 const launcherState = vi.hoisted(() => ({
   fork: vi.fn(),
@@ -96,18 +99,70 @@ describe('analyze worker shared lock ownership', () => {
     const child = fakeChild();
     launcherState.fork.mockReset().mockReturnValue(child.child);
     const releaseRepoLock = vi.fn();
-    const launch = createLaunchAnalysisWorker(launchDeps(manager, releaseRepoLock));
+    let finishClose!: () => void;
+    const closeGate = new Promise<void>((resolve) => {
+      finishClose = resolve;
+    });
+    const deps = launchDeps(manager, releaseRepoLock);
+    deps.closeDbHandle = vi.fn(() => closeGate);
+    const launch = createLaunchAnalysisWorker(deps);
 
     launch(job, '/virtual/demo', {});
     child.emit('message', { type: 'complete', result: result(true) });
     child.emit('error', new Error('late error'));
+    expect(releaseRepoLock).not.toHaveBeenCalled();
     child.emit('exit', 0);
-    await Promise.resolve();
-    await Promise.resolve();
+    expect(releaseRepoLock).not.toHaveBeenCalled();
+    finishClose();
+    await vi.waitFor(() => expect(job.status).toBe('failed'));
 
     expect(releaseRepoLock).toHaveBeenCalledOnce();
     expect(releaseRepoLock).toHaveBeenCalledWith('/virtual/demo/.gitnexus');
-    expect(job.status).toBe('failed');
+  });
+
+  it('keeps the lock until a cancelled worker exits', async () => {
+    const { job, manager } = fakeJobManager();
+    const child = fakeChild();
+    launcherState.fork.mockReset().mockReturnValue(child.child);
+    const releaseRepoLock = vi.fn();
+    const launch = createLaunchAnalysisWorker(launchDeps(manager, releaseRepoLock));
+
+    launch(job, '/virtual/demo', {});
+    job.status = 'failed';
+    child.emit('message', { type: 'error', message: 'cancelled' });
+    expect(releaseRepoLock).not.toHaveBeenCalled();
+    child.emit('exit', 0);
+
+    await vi.waitFor(() => expect(releaseRepoLock).toHaveBeenCalledOnce());
+    expect(releaseRepoLock).toHaveBeenCalledOnce();
+    expect(releaseRepoLock).toHaveBeenCalledWith('/virtual/demo/.gitnexus');
+  });
+
+  it('sends the same canonical repository root whose storage key is locked', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-analyze-lock-'));
+    const target = path.join(root, 'target');
+    const alias = path.join(root, 'alias');
+    await fs.mkdir(target);
+    await fs.symlink(target, alias, 'dir');
+    try {
+      const canonicalTarget = await fs.realpath(target);
+      const { job, manager } = fakeJobManager();
+      const child = fakeChild();
+      launcherState.fork.mockReset().mockReturnValue(child.child);
+      const releaseRepoLock = vi.fn();
+      const deps = launchDeps(manager, releaseRepoLock);
+
+      createLaunchAnalysisWorker(deps)(job, alias, {});
+
+      expect(deps.acquireRepoLock).toHaveBeenCalledWith(path.join(canonicalTarget, '.gitnexus'));
+      expect(child.child.send).toHaveBeenCalledWith(
+        expect.objectContaining({ repoPath: canonicalTarget }),
+      );
+      child.emit('message', { type: 'error', message: 'test cleanup' });
+      child.emit('exit', 0);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
   });
 
   it.each([
@@ -141,7 +196,7 @@ describe('analyze worker shared lock ownership', () => {
     if (_label === 'send') expect(child.child.kill).toHaveBeenCalledWith('SIGTERM');
   });
 
-  it('keeps the lock through retries and releases once when retries are exhausted', () => {
+  it('keeps the lock through retries and releases once when retries are exhausted', async () => {
     vi.useFakeTimers();
     try {
       const { job, manager } = fakeJobManager();
@@ -162,6 +217,8 @@ describe('analyze worker shared lock ownership', () => {
       second.emit('exit', 1);
       vi.advanceTimersByTime(2000);
       third.emit('exit', 1);
+      await Promise.resolve();
+      await Promise.resolve();
 
       expect(releaseRepoLock).toHaveBeenCalledOnce();
       expect(releaseRepoLock).toHaveBeenCalledWith('/virtual/demo/.gitnexus');
