@@ -1,4 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { execFileSync } from 'child_process';
+import { createHash } from 'crypto';
 import fs from 'fs/promises';
 import os from 'os';
 import path from 'path';
@@ -15,6 +17,64 @@ import { loadMeta, saveMeta, type RepoMeta } from '../../src/storage/repo-manage
 
 const tempDirs: string[] = [];
 const sourceRepo: RepositorySourceIdentity = { head: 'source-head', branch: 'main' };
+
+const recoveryEntries = async (lockPath: string): Promise<string[]> => {
+  const basename = path.basename(lockPath);
+  return (await fs.readdir(path.dirname(lockPath))).filter(
+    (entry) =>
+      entry.startsWith(`${basename}.reclaim.`) || entry.startsWith(`${basename}.lease-source.`),
+  );
+};
+
+const writeDeadAnalyzeLock = (lockPath: string): Promise<void> =>
+  fs.writeFile(
+    lockPath,
+    `${JSON.stringify({
+      schema: 'gitnexus.staged-analyze-lock/v1',
+      pid: 2_147_483_647,
+      nonce: 'dead-owner',
+      startedAt: '2026-07-20T00:00:00.000Z',
+    })}\n`,
+  );
+
+const deadRecoveryLeaseRecord = {
+  schema: 'gitnexus.staged-analyze-lock/v1',
+  pid: 2_147_483_646,
+  nonce: 'deadca11',
+  startedAt: '2026-07-20T00:00:02.000Z',
+  processStartToken: 'deadbeefdeadbeefdeadbeef',
+} as const;
+
+const deadRecoveryClaimPath = (lockPath: string): string =>
+  `${lockPath}.reclaim.${deadRecoveryLeaseRecord.pid}.` +
+  `${deadRecoveryLeaseRecord.processStartToken}.${deadRecoveryLeaseRecord.nonce}`;
+
+const deadRecoveryLeaseSourcePath = (lockPath: string): string =>
+  `${lockPath}.lease-source.${deadRecoveryLeaseRecord.pid}.` +
+  `${deadRecoveryLeaseRecord.processStartToken}.${deadRecoveryLeaseRecord.nonce}`;
+
+const deadOwnershipPublicationSourcePath = (lockPath: string): string =>
+  `${lockPath}.owner-source.${deadRecoveryLeaseRecord.pid}.${deadRecoveryLeaseRecord.nonce}`;
+
+const publishDeadRecoveryLease = async (lockPath: string): Promise<void> => {
+  const sourcePath = deadRecoveryLeaseSourcePath(lockPath);
+  await fs.writeFile(sourcePath, `${JSON.stringify(deadRecoveryLeaseRecord)}\n`);
+  await fs.link(sourcePath, `${lockPath}.reclaim`);
+};
+
+const publishDeadOwnershipLock = async (lockPath: string): Promise<void> => {
+  const sourcePath = deadOwnershipPublicationSourcePath(lockPath);
+  await fs.writeFile(sourcePath, `${JSON.stringify(deadRecoveryLeaseRecord)}\n`);
+  await fs.link(sourcePath, lockPath);
+};
+
+const recoveryResidue = async (lockPath: string): Promise<string[]> => {
+  const basename = path.basename(lockPath);
+  return (await fs.readdir(path.dirname(lockPath))).filter(
+    (entry) =>
+      entry.startsWith(`${basename}.reclaim`) || entry.startsWith(`${basename}.lease-source`),
+  );
+};
 
 const makeMeta = (generation: string): RepoMeta => ({
   repoPath: '/repo',
@@ -431,15 +491,7 @@ describe('common analyze ownership lock', () => {
   it('reclaims a lock whose owner process is gone', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-stage-lock-'));
     tempDirs.push(root);
-    await fs.writeFile(
-      path.join(root, 'analyze-staged.lock'),
-      `${JSON.stringify({
-        schema: 'gitnexus.staged-analyze-lock/v1',
-        pid: 2_147_483_647,
-        nonce: 'dead-owner',
-        startedAt: '2026-07-20T00:00:00.000Z',
-      })}\n`,
-    );
+    await writeDeadAnalyzeLock(path.join(root, 'analyze-staged.lock'));
 
     await expect(withAnalyzeOwnershipLock(root, async () => 'ok')).resolves.toBe('ok');
     await expect(fs.access(path.join(root, 'analyze-staged.lock'))).rejects.toMatchObject({
@@ -448,21 +500,29 @@ describe('common analyze ownership lock', () => {
     await expect(fs.access(path.join(root, 'analyze-staged.lock.reclaim'))).rejects.toMatchObject({
       code: 'ENOENT',
     });
+    expect(await recoveryEntries(path.join(root, 'analyze-staged.lock'))).toEqual([]);
+  });
+
+  it('does not require process-start identity for an uncontended acquisition', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-stage-lock-uncontended-'));
+    tempDirs.push(root);
+    const readFileSpy = vi.spyOn(fs, 'readFile');
+
+    await expect(withAnalyzeOwnershipLock(root, async () => 'ok')).resolves.toBe('ok');
+
+    if (process.platform === 'linux') {
+      expect(
+        readFileSpy.mock.calls.some(([target]) => String(target) === `/proc/${process.pid}/stat`),
+      ).toBe(false);
+    }
+    readFileSpy.mockRestore();
   });
 
   it('admits exactly one contender when reclaiming the same stale lock', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-stage-lock-race-'));
     tempDirs.push(root);
     const lockPath = path.join(root, 'analyze-staged.lock');
-    await fs.writeFile(
-      lockPath,
-      `${JSON.stringify({
-        schema: 'gitnexus.staged-analyze-lock/v1',
-        pid: 2_147_483_647,
-        nonce: 'dead-owner',
-        startedAt: '2026-07-20T00:00:00.000Z',
-      })}\n`,
-    );
+    await writeDeadAnalyzeLock(lockPath);
 
     let release!: () => void;
     const releaseGate = new Promise<void>((resolve) => {
@@ -498,7 +558,424 @@ describe('common analyze ownership lock', () => {
     expect(settled.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
     expect(settled.filter((result) => result.status === 'rejected')).toHaveLength(1);
     await expect(fs.access(lockPath)).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(await recoveryEntries(lockPath)).toEqual([]);
+  });
+
+  it('does not clear an active reclaimer after its final identity check', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-stage-lock-paused-reclaim-'));
+    tempDirs.push(root);
+    const lockPath = path.join(root, 'analyze-staged.lock');
+    await writeDeadAnalyzeLock(lockPath);
+
+    let markPaused!: () => void;
+    const paused = new Promise<void>((resolve) => {
+      markPaused = resolve;
+    });
+    let resume!: () => void;
+    const resumeGate = new Promise<void>((resolve) => {
+      resume = resolve;
+    });
+    const originalRm = fs.rm.bind(fs);
+    let pausedMainRemoval = false;
+    const rmSpy = vi.spyOn(fs, 'rm').mockImplementation(async (target, options) => {
+      if (String(target) === lockPath && !pausedMainRemoval) {
+        pausedMainRemoval = true;
+        markPaused();
+        await resumeGate;
+      }
+      return originalRm(target, options);
+    });
+
+    let entered = 0;
+    const reclaimer = withAnalyzeOwnershipLock(root, async () => {
+      entered += 1;
+    });
+    try {
+      await paused;
+      await expect(fs.open(`${lockPath}.reclaim`, 'wx', 0o600)).rejects.toMatchObject({
+        code: 'EEXIST',
+      });
+      await expect(withAnalyzeOwnershipLock(root, async () => undefined)).rejects.toThrow(
+        /recovery is active/i,
+      );
+      expect(entered).toBe(0);
+    } finally {
+      resume();
+      rmSpy.mockRestore();
+    }
+    await reclaimer;
+    expect(entered).toBe(1);
+    await expect(fs.access(lockPath)).rejects.toMatchObject({ code: 'ENOENT' });
     await expect(fs.access(`${lockPath}.reclaim`)).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(await recoveryEntries(lockPath)).toEqual([]);
+  });
+
+  it('uses a timezone-independent claimant identity on macOS', async () => {
+    if (process.platform !== 'darwin') return;
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-stage-lock-timezone-'));
+    tempDirs.push(root);
+    const lockPath = path.join(root, 'analyze-staged.lock');
+    await writeDeadAnalyzeLock(lockPath);
+    const startIdentity = execFileSync('/bin/ps', ['-o', 'lstart=', '-p', String(process.pid)], {
+      encoding: 'utf8',
+      env: { ...process.env, LC_ALL: 'C', LANG: 'C', TZ: 'UTC' },
+    }).trim();
+    const token = createHash('sha256').update(`darwin:${startIdentity}`).digest('hex').slice(0, 24);
+    await fs.link(lockPath, `${lockPath}.reclaim.${process.pid}.${token}.deadca11`);
+    await fs.rm(lockPath);
+    vi.stubEnv('TZ', 'America/New_York');
+
+    await expect(withAnalyzeOwnershipLock(root, async () => undefined)).rejects.toThrow(
+      /recovery is active/i,
+    );
+  });
+
+  it('recovers a dead hard-link claim left before stale-main removal', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-stage-lock-claim-before-'));
+    tempDirs.push(root);
+    const lockPath = path.join(root, 'analyze-staged.lock');
+    await writeDeadAnalyzeLock(lockPath);
+    await fs.link(lockPath, `${lockPath}.reclaim.2147483646.deadbeef.deadca11`);
+
+    await expect(withAnalyzeOwnershipLock(root, async () => 'recovered')).resolves.toBe(
+      'recovered',
+    );
+    await expect(fs.access(lockPath)).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(await recoveryEntries(lockPath)).toEqual([]);
+  });
+
+  it('recovers a dead hard-link claim left after stale-main removal', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-stage-lock-claim-after-'));
+    tempDirs.push(root);
+    const lockPath = path.join(root, 'analyze-staged.lock');
+    await writeDeadAnalyzeLock(lockPath);
+    await fs.link(lockPath, `${lockPath}.reclaim.2147483646.deadbeef.deadca11`);
+    await fs.rm(lockPath);
+
+    await expect(withAnalyzeOwnershipLock(root, async () => 'recovered')).resolves.toBe(
+      'recovered',
+    );
+    await expect(fs.access(lockPath)).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(await recoveryEntries(lockPath)).toEqual([]);
+  });
+
+  it('recovers an orphaned claim after its claimant PID is reused', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-stage-lock-claim-reused-'));
+    tempDirs.push(root);
+    const lockPath = path.join(root, 'analyze-staged.lock');
+    await writeDeadAnalyzeLock(lockPath);
+    await fs.link(lockPath, `${lockPath}.reclaim.${process.pid}.deadbeef.deadca11`);
+    await fs.rm(lockPath);
+
+    await expect(withAnalyzeOwnershipLock(root, async () => 'recovered')).resolves.toBe(
+      'recovered',
+    );
+    expect(await recoveryEntries(lockPath)).toEqual([]);
+  });
+
+  it('fails closed while a legacy recovery marker exists', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-stage-lock-legacy-'));
+    tempDirs.push(root);
+    const lockPath = path.join(root, 'analyze-staged.lock');
+    const markerPath = `${lockPath}.reclaim`;
+    await fs.writeFile(markerPath, 'legacy-recovery');
+
+    await expect(withAnalyzeOwnershipLock(root, async () => undefined)).rejects.toThrow(
+      /legacy analyze recovery is active/i,
+    );
+    await expect(fs.readFile(markerPath, 'utf8')).resolves.toBe('legacy-recovery');
+  });
+
+  it('recovers a valid legacy marker whose owner process is gone', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-stage-lock-dead-legacy-'));
+    tempDirs.push(root);
+    const lockPath = path.join(root, 'analyze-staged.lock');
+    await writeDeadAnalyzeLock(lockPath);
+    await writeDeadAnalyzeLock(`${lockPath}.reclaim`);
+
+    await expect(withAnalyzeOwnershipLock(root, async () => 'recovered')).resolves.toBe(
+      'recovered',
+    );
+    expect(await recoveryResidue(lockPath)).toEqual([]);
+  });
+
+  it('recovers a crash before atomic lease publication', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-stage-lock-lease-source-'));
+    tempDirs.push(root);
+    const lockPath = path.join(root, 'analyze-staged.lock');
+    await fs.writeFile(deadRecoveryLeaseSourcePath(lockPath), 'partial');
+
+    await expect(withAnalyzeOwnershipLock(root, async () => 'recovered')).resolves.toBe(
+      'recovered',
+    );
+    expect(await recoveryResidue(lockPath)).toEqual([]);
+  });
+
+  it('recovers a crash before atomic successor-lock publication', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-stage-lock-owner-source-'));
+    tempDirs.push(root);
+    const lockPath = path.join(root, 'analyze-staged.lock');
+    await fs.writeFile(deadOwnershipPublicationSourcePath(lockPath), 'partial');
+
+    await expect(withAnalyzeOwnershipLock(root, async () => 'recovered')).resolves.toBe(
+      'recovered',
+    );
+    await expect(fs.access(deadOwnershipPublicationSourcePath(lockPath))).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+    await expect(fs.access(lockPath)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('recovers a crash after atomic successor-lock publication', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-stage-lock-owner-published-'));
+    tempDirs.push(root);
+    const lockPath = path.join(root, 'analyze-staged.lock');
+    await publishDeadOwnershipLock(lockPath);
+
+    await expect(withAnalyzeOwnershipLock(root, async () => 'recovered')).resolves.toBe(
+      'recovered',
+    );
+    await expect(fs.access(deadOwnershipPublicationSourcePath(lockPath))).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+    await expect(fs.access(lockPath)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it.each([
+    {
+      phase: 'after atomic lease publication',
+      setup: async (lockPath: string) => {
+        await writeDeadAnalyzeLock(lockPath);
+        await publishDeadRecoveryLease(lockPath);
+      },
+    },
+    {
+      phase: 'after stale-inode claim publication',
+      setup: async (lockPath: string) => {
+        await writeDeadAnalyzeLock(lockPath);
+        await fs.link(lockPath, deadRecoveryClaimPath(lockPath));
+        await publishDeadRecoveryLease(lockPath);
+      },
+    },
+    {
+      phase: 'after stale-main removal',
+      setup: async (lockPath: string) => {
+        await writeDeadAnalyzeLock(lockPath);
+        await fs.link(lockPath, deadRecoveryClaimPath(lockPath));
+        await fs.rm(lockPath);
+        await publishDeadRecoveryLease(lockPath);
+      },
+    },
+    {
+      phase: 'after successor-lock durability',
+      setup: async (lockPath: string) => {
+        await fs.writeFile(lockPath, `${JSON.stringify(deadRecoveryLeaseRecord)}\n`);
+        await publishDeadRecoveryLease(lockPath);
+      },
+    },
+  ])('recovers a dead process-bound lease $phase', async ({ setup }) => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-stage-lock-dead-lease-'));
+    tempDirs.push(root);
+    const lockPath = path.join(root, 'analyze-staged.lock');
+    await setup(lockPath);
+    let entered = 0;
+
+    await expect(
+      withAnalyzeOwnershipLock(root, async () => {
+        entered += 1;
+        return 'recovered';
+      }),
+    ).resolves.toBe('recovered');
+    expect(entered).toBe(1);
+    expect(await recoveryResidue(lockPath)).toEqual([]);
+    await expect(fs.access(lockPath)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('does not unlink a replacement while two contenders clean a dead lease', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-stage-lock-cleanup-race-'));
+    tempDirs.push(root);
+    const lockPath = path.join(root, 'analyze-staged.lock');
+    const markerPath = `${lockPath}.reclaim`;
+    await writeDeadAnalyzeLock(lockPath);
+    await publishDeadRecoveryLease(lockPath);
+
+    let markPaused!: () => void;
+    const paused = new Promise<void>((resolve) => {
+      markPaused = resolve;
+    });
+    let resume!: () => void;
+    const resumeGate = new Promise<void>((resolve) => {
+      resume = resolve;
+    });
+    const originalRm = fs.rm.bind(fs);
+    let pausedMarkerRemoval = false;
+    const rmSpy = vi.spyOn(fs, 'rm').mockImplementation(async (target, options) => {
+      if (String(target) === markerPath && !pausedMarkerRemoval) {
+        pausedMarkerRemoval = true;
+        markPaused();
+        await resumeGate;
+      }
+      return originalRm(target, options);
+    });
+
+    let entered = 0;
+    const winner = withAnalyzeOwnershipLock(root, async () => {
+      entered += 1;
+    });
+    try {
+      await paused;
+      await expect(withAnalyzeOwnershipLock(root, async () => undefined)).rejects.toThrow(
+        /recovery cleanup is active/i,
+      );
+      expect(entered).toBe(0);
+    } finally {
+      resume();
+      rmSpy.mockRestore();
+    }
+
+    await winner;
+    expect(entered).toBe(1);
+    expect(await recoveryResidue(lockPath)).toEqual([]);
+    await expect(fs.access(lockPath)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('retries an exact locally owned cleanup claim after transient unlink failure', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-stage-lock-cleanup-retry-'));
+    tempDirs.push(root);
+    const lockPath = path.join(root, 'analyze-staged.lock');
+    await writeDeadAnalyzeLock(lockPath);
+    await publishDeadRecoveryLease(lockPath);
+
+    const originalRm = fs.rm.bind(fs);
+    let failedCleanupRemoval = false;
+    const rmSpy = vi.spyOn(fs, 'rm').mockImplementation(async (target, options) => {
+      if (String(target).includes('.reclaim-cleanup.') && !failedCleanupRemoval) {
+        failedCleanupRemoval = true;
+        throw Object.assign(new Error('transient cleanup claim failure'), { code: 'EPERM' });
+      }
+      return originalRm(target, options);
+    });
+    try {
+      await expect(withAnalyzeOwnershipLock(root, async () => undefined)).rejects.toThrow(
+        /transient cleanup claim failure/i,
+      );
+    } finally {
+      rmSpy.mockRestore();
+    }
+
+    await expect(withAnalyzeOwnershipLock(root, async () => 'retried')).resolves.toBe('retried');
+    expect(await recoveryResidue(lockPath)).toEqual([]);
+    await expect(fs.access(lockPath)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('returns an ownership conflict when a cleanup marker vanishes before claim publication', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-stage-lock-cleanup-missing-'));
+    tempDirs.push(root);
+    const lockPath = path.join(root, 'analyze-staged.lock');
+    const markerPath = `${lockPath}.reclaim`;
+    await writeDeadAnalyzeLock(lockPath);
+    await publishDeadRecoveryLease(lockPath);
+
+    const originalLink = fs.link.bind(fs);
+    let removedMarker = false;
+    const linkSpy = vi.spyOn(fs, 'link').mockImplementation(async (source, destination) => {
+      if (
+        String(source) === markerPath &&
+        String(destination).includes('.reclaim-cleanup.') &&
+        !removedMarker
+      ) {
+        removedMarker = true;
+        await fs.rm(markerPath);
+      }
+      return originalLink(source, destination);
+    });
+    try {
+      const attempt = withAnalyzeOwnershipLock(root, async () => undefined);
+      await expect(attempt).rejects.toBeInstanceOf(AnalyzeOwnershipConflictError);
+      await expect(attempt).rejects.toThrow(/ownership changed before cleanup/i);
+    } finally {
+      linkSpy.mockRestore();
+    }
+  });
+
+  it('retries lease-source cleanup after the marker was already released', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-stage-lock-source-retry-'));
+    tempDirs.push(root);
+    const lockPath = path.join(root, 'analyze-staged.lock');
+    await writeDeadAnalyzeLock(lockPath);
+
+    const originalRm = fs.rm.bind(fs);
+    let failedSourceRemoval = false;
+    const rmSpy = vi.spyOn(fs, 'rm').mockImplementation(async (target, options) => {
+      if (String(target).includes('.lease-source.') && !failedSourceRemoval) {
+        failedSourceRemoval = true;
+        throw Object.assign(new Error('transient source removal failure'), { code: 'EPERM' });
+      }
+      return originalRm(target, options);
+    });
+    try {
+      await expect(withAnalyzeOwnershipLock(root, async () => undefined)).rejects.toThrow(
+        /transient source removal failure/i,
+      );
+    } finally {
+      rmSpy.mockRestore();
+    }
+
+    expect(await recoveryResidue(lockPath)).toEqual([]);
+    await expect(withAnalyzeOwnershipLock(root, async () => 'retried')).resolves.toBe('retried');
+    expect(await recoveryResidue(lockPath)).toEqual([]);
+  });
+
+  it('does not execute a PATH-shadowed process identity helper on macOS', async () => {
+    if (process.platform !== 'darwin') return;
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-stage-lock-path-shadow-'));
+    tempDirs.push(root);
+    const lockPath = path.join(root, 'analyze-staged.lock');
+    const fakeBin = path.join(root, 'bin');
+    const sentinel = path.join(root, 'shadow-executed');
+    await fs.mkdir(fakeBin);
+    await fs.writeFile(
+      path.join(fakeBin, 'ps'),
+      `#!/bin/sh\ntouch ${JSON.stringify(sentinel)}\nprintf 'shadowed\\n'\n`,
+      { mode: 0o755 },
+    );
+    await writeDeadAnalyzeLock(lockPath);
+    const startIdentity = execFileSync('/bin/ps', ['-o', 'lstart=', '-p', String(process.pid)], {
+      encoding: 'utf8',
+      env: { ...process.env, LC_ALL: 'C', LANG: 'C', TZ: 'UTC' },
+    }).trim();
+    const token = createHash('sha256').update(`darwin:${startIdentity}`).digest('hex').slice(0, 24);
+    await fs.link(lockPath, `${lockPath}.reclaim.${process.pid}.${token}.deadca11`);
+    await fs.rm(lockPath);
+    vi.stubEnv('PATH', fakeBin);
+
+    await expect(withAnalyzeOwnershipLock(root, async () => undefined)).rejects.toThrow(
+      /recovery is active/i,
+    );
+    await expect(fs.access(sentinel)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('preserves mismatched live ownership when a dead recovery claim is ambiguous', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-stage-lock-claim-mismatch-'));
+    tempDirs.push(root);
+    const lockPath = path.join(root, 'analyze-staged.lock');
+    const unrelated = path.join(root, 'unrelated-stale-lock');
+    const liveOwner = {
+      schema: 'gitnexus.staged-analyze-lock/v1',
+      pid: process.pid,
+      nonce: 'live-owner',
+      startedAt: '2026-07-20T00:00:01.000Z',
+    };
+    await fs.writeFile(lockPath, `${JSON.stringify(liveOwner)}\n`);
+    await writeDeadAnalyzeLock(unrelated);
+    const claimPath = `${lockPath}.reclaim.2147483646.deadbeef.deadca11`;
+    await fs.link(unrelated, claimPath);
+
+    await expect(withAnalyzeOwnershipLock(root, async () => undefined)).rejects.toThrow(
+      /does not match the current lock/i,
+    );
+    await expect(fs.readFile(lockPath, 'utf8')).resolves.toBe(`${JSON.stringify(liveOwner)}\n`);
+    await expect(fs.access(claimPath)).resolves.toBeUndefined();
   });
 
   it('retains ownership after storage is detached without recreating absent storage', async () => {
