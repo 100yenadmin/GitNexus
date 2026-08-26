@@ -11,13 +11,14 @@
  */
 
 import path from 'path';
-import { existsSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, statSync } from 'node:fs';
 import { fork } from 'child_process';
 import { fileURLToPath, pathToFileURL } from 'url';
 import { createRequire } from 'node:module';
 import {
   canonicalizePath,
   canonicalRepoLockKey,
+  getStoragePath,
   INDEX_METADATA_FILE,
 } from '../storage/repo-manager.js';
 import { logger } from '../core/logger.js';
@@ -141,6 +142,13 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
     // the repository root. The same physical root is sent to every retry so a
     // later symlink retarget cannot move the worker outside the held lock.
     const lockedRepoPath = canonicalizePath(targetPath);
+    const lexicalStoragePath = getStoragePath(lockedRepoPath);
+    if (existsSync(lockedRepoPath) && !existsSync(lexicalStoragePath)) {
+      // A first analysis has no physical storage object to canonicalize. Make
+      // the directory exist before deriving the shared key so another writer
+      // cannot insert a storage symlink between key capture and worker mkdir.
+      mkdirSync(lexicalStoragePath, { recursive: true });
+    }
     const analyzeLockKey = canonicalRepoLockKey(lockedRepoPath);
     const lockErr = acquireRepoLock(analyzeLockKey);
     if (lockErr) {

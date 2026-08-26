@@ -199,6 +199,35 @@ describe('analyze worker shared lock ownership', () => {
     }
   });
 
+  it('materializes first-analysis storage before capturing the shared lock key', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-first-analyze-lock-'));
+    const repoRoot = path.join(root, 'repo');
+    await fs.mkdir(repoRoot);
+    try {
+      const { job, manager } = fakeJobManager();
+      const child = fakeChild();
+      launcherState.fork.mockReset().mockReturnValue(child.child);
+      const releaseRepoLock = vi.fn();
+      const deps = launchDeps(manager, releaseRepoLock);
+
+      createLaunchAnalysisWorker(deps)(job, repoRoot, {});
+
+      const storagePath = path.join(repoRoot, '.gitnexus');
+      expect((await fs.stat(storagePath)).isDirectory()).toBe(true);
+      const canonicalStorage = await fs.realpath(storagePath);
+      expect(deps.acquireRepoLock).toHaveBeenCalledWith(canonicalStorage);
+      expect(child.child.send).toHaveBeenCalledWith(
+        expect.objectContaining({
+          options: expect.objectContaining({ analyzeStoragePath: canonicalStorage }),
+        }),
+      );
+      child.emit('message', { type: 'error', message: 'test cleanup' });
+      child.emit('close', 0);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it('retains the lock after a child error until close proves termination', async () => {
     const { job, manager } = fakeJobManager();
     const child = fakeChild();

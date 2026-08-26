@@ -5,6 +5,7 @@ import path from 'node:path';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { EmbeddingIntegrityReport } from '../../src/core/lbug/lbug-adapter.js';
 import {
+  canonicalizePath,
   canonicalRepoLockKey,
   type RegistryEntry,
   type RepoMeta,
@@ -809,7 +810,13 @@ describe('POST /api/embed completed-checkpoint identity', () => {
       expect(response.status).toBe(200);
       await expect(fs.lstat(entry.storagePath)).rejects.toMatchObject({ code: 'ENOENT' });
       await expect(fs.readFile(sentinel, 'utf8')).resolves.toBe('preserve');
-      expect(state.unregisterRepo).toHaveBeenCalledWith(repoRoot);
+      expect(state.unregisterRepo).toHaveBeenCalledWith(repoRoot, {
+        expectedOwner: expect.objectContaining({
+          ...entry,
+          canonicalPath: canonicalizePath(repoRoot),
+          canonicalStoragePath: canonicalizePath(externalStorage),
+        }),
+      });
     } finally {
       await fs.rm(root, { recursive: true, force: true });
     }

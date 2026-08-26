@@ -1447,7 +1447,7 @@ export const registerRepo = async (
   await withRegistryMutationLock(async () => {
     const fresh = await readRegistry();
     const registryBeforeWrite =
-      expectedCanonicalStoragePath === undefined
+      expectedCanonicalPath === undefined && expectedCanonicalStoragePath === undefined
         ? undefined
         : (JSON.parse(JSON.stringify(fresh)) as RegistryEntry[]);
     if (
@@ -1539,12 +1539,17 @@ export const registerRepo = async (
     }
 
     await writeRegistry(fresh);
-    if (
+    const pathChangedAfterWrite =
+      expectedCanonicalPath !== undefined &&
+      !registryPathEquals(canonicalizePath(repoPath), expectedCanonicalPath);
+    const storageChangedAfterWrite =
       expectedCanonicalStoragePath !== undefined &&
-      !registryPathEquals(canonicalizePath(storagePath), expectedCanonicalStoragePath)
-    ) {
+      !registryPathEquals(canonicalizePath(storagePath), expectedCanonicalStoragePath);
+    if (pathChangedAfterWrite || storageChangedAfterWrite) {
       const identityError = new Error(
-        'GitNexus: expected registry storage changed during locked commit',
+        pathChangedAfterWrite
+          ? 'GitNexus: expected registry path changed during locked commit'
+          : 'GitNexus: expected registry storage changed during locked commit',
       );
       if (!registryBeforeWrite) throw identityError;
       try {
@@ -1552,7 +1557,7 @@ export const registerRepo = async (
       } catch (rollbackError) {
         throw new AggregateError(
           [identityError, rollbackError],
-          'GitNexus: registry storage changed during commit and rollback was incomplete',
+          'GitNexus: registry identity changed during commit and rollback was incomplete',
         );
       }
       throw identityError;
@@ -1595,17 +1600,57 @@ export const rollbackRegistryCommit = async (receipt: RegistryCommitReceipt): Pr
  * Remove a repo from the global registry.
  * Called after `gitnexus clean`.
  */
-export const unregisterRepo = async (repoPath: string): Promise<void> => {
+export interface UnregisterRepoOptions {
+  /** Exact registry generation and physical owner captured before deletion. */
+  expectedOwner?: Readonly<RegistryEntry & { canonicalPath: string; canonicalStoragePath: string }>;
+}
+
+const registryEntryProjection = (entry: RegistryEntry): RegistryEntry => ({
+  name: entry.name,
+  path: entry.path,
+  storagePath: entry.storagePath,
+  indexedAt: entry.indexedAt,
+  lastCommit: entry.lastCommit,
+  ...(entry.remoteUrl !== undefined ? { remoteUrl: entry.remoteUrl } : {}),
+  ...(entry.stats !== undefined ? { stats: entry.stats } : {}),
+  ...(entry.branch !== undefined ? { branch: entry.branch } : {}),
+  ...(entry.branches !== undefined ? { branches: entry.branches } : {}),
+});
+
+export const unregisterRepo = async (
+  repoPath: string,
+  opts?: UnregisterRepoOptions,
+): Promise<void> => {
   // Canonicalise BOTH sides so an unregister call issued with the
   // symlink form (`/var/folders/.../repo`) still matches an entry
   // written with the realpath form (`/private/var/folders/.../repo`),
   // and vice versa. Matches the semantics of `registerRepo` and
   // `resolveRegistryEntry` post-#1003 review.
   const resolved = canonicalizePath(repoPath);
+  const expected = opts?.expectedOwner;
+  if (expected && !registryPathEquals(resolved, expected.canonicalPath)) {
+    throw new Error('GitNexus: expected registry owner changed before unregister');
+  }
   await withRegistryMutationLock(async () => {
     const entries = await readRegistry();
-    const filtered = entries.filter((e) => !registryPathEquals(canonicalizePath(e.path), resolved));
-    await writeRegistry(filtered);
+    if (!expected) {
+      const filtered = entries.filter(
+        (e) => !registryPathEquals(canonicalizePath(e.path), resolved),
+      );
+      await writeRegistry(filtered);
+      return;
+    }
+
+    const expectedEntry = registryEntryProjection(expected);
+    const expectedJson = JSON.stringify(expectedEntry);
+    const matches = entries
+      .map((entry, index) => ({ entry, index }))
+      .filter(({ entry }) => JSON.stringify(registryEntryProjection(entry)) === expectedJson);
+    if (matches.length !== 1) {
+      throw new Error('GitNexus: expected registry owner changed before unregister');
+    }
+    entries.splice(matches[0].index, 1);
+    await writeRegistry(entries);
   });
 };
 

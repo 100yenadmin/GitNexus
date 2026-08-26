@@ -1366,7 +1366,13 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
 
         // 3. Unregister from the global registry
         const { unregisterRepo } = await import('../storage/repo-manager.js');
-        await unregisterRepo(entry.path);
+        await unregisterRepo(entry.path, {
+          expectedOwner: {
+            ...entry,
+            canonicalPath: lockedRepoRoot,
+            canonicalStoragePath: lockKey,
+          },
+        });
 
         // 4. Reinitialize backend to reflect the removal
         await backend.init().catch(() => {});
