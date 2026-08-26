@@ -8,6 +8,7 @@ import { withAnalyzeOwnershipLock } from '../../src/core/staged-promotion.js';
 const roots: string[] = [];
 
 afterEach(async () => {
+  vi.unstubAllEnvs();
   await closeLbug();
   await Promise.all(roots.splice(0).map((root) => fs.rm(root, { recursive: true, force: true })));
 });
@@ -15,6 +16,7 @@ afterEach(async () => {
 const makePaths = async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-lbug-owner-'));
   roots.push(root);
+  vi.stubEnv('GITNEXUS_HOME', path.join(root, 'home'));
   const storagePath = path.join(root, '.gitnexus');
   return { repoRoot: root, storagePath, lbugPath: path.join(storagePath, 'lbug') };
 };

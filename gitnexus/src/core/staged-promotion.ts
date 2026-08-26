@@ -4,6 +4,7 @@ import fs from 'fs/promises';
 import { retryRename } from '../storage/fs-atomic.js';
 import {
   canonicalizePath,
+  getGlobalDir,
   isMissingFilesystemError,
   loadMeta,
   saveMeta,
@@ -380,16 +381,19 @@ const withOwnershipFileLock = async <T>(
 const analyzeOwnershipCompanionPath = (repoRoot: string): string => {
   const canonicalRoot = canonicalizePath(repoRoot);
   const digest = createHash('sha256').update(canonicalRoot).digest('hex').slice(0, 32);
-  return path.join(path.dirname(canonicalRoot), `.gitnexus-analyze-${digest}.lock`);
+  return path.join(path.resolve(getGlobalDir()), 'locks', `analyze-${digest}.lock`);
 };
 
 /**
  * Serialize every supported writer; a dead owner's lock is reclaimed on the next run.
  *
- * New writers first hold a transient companion lock beside the frozen physical
- * repository root. It survives storage detach/removal. The existing storage
- * lock remains the second boundary so in-place upgrades still exclude an older
- * writer that acquired it before storage was detached.
+ * New writers first hold a transient companion lock in the user-owned global
+ * GitNexus lock directory. It survives storage and repository detach/removal
+ * without requiring write access to the repository parent. The existing
+ * storage lock remains the second boundary so an older writer that acquired it
+ * before storage was detached is still excluded. Starting a pre-companion
+ * writer after detach is outside this source contract; runtime admission must
+ * contain legacy endpoints before a current-version delete can run.
  */
 export const withAnalyzeOwnershipLock = async <T>(
   storagePath: string,
@@ -418,7 +422,9 @@ export const withAnalyzeOwnershipLock = async <T>(
   };
 
   if (!options.repoRoot) return withStorageLock();
-  return withOwnershipFileLock(analyzeOwnershipCompanionPath(options.repoRoot), withStorageLock);
+  const companionPath = analyzeOwnershipCompanionPath(options.repoRoot);
+  await fs.mkdir(path.dirname(companionPath), { recursive: true, mode: 0o700 });
+  return withOwnershipFileLock(companionPath, withStorageLock);
 };
 
 /** @deprecated Use the common ownership lock so plain and staged writers cannot overlap. */

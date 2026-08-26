@@ -345,8 +345,13 @@ describe('POST /api/embed completed-checkpoint identity', () => {
   let exitSpy: ReturnType<typeof vi.spyOn>;
   let onceSpy: ReturnType<typeof vi.spyOn>;
   let getJobSpy: ReturnType<typeof vi.spyOn>;
+  let priorGitNexusHome: string | undefined;
+  let isolatedGitNexusHomeRoot = '';
 
   beforeAll(async () => {
+    priorGitNexusHome = process.env.GITNEXUS_HOME;
+    isolatedGitNexusHomeRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-api-owner-home-'));
+    process.env.GITNEXUS_HOME = path.join(isolatedGitNexusHomeRoot, 'home');
     exitSpy = vi.spyOn(process, 'exit').mockImplementation(() => undefined as never);
     const originalOnce = process.once.bind(process);
     onceSpy = vi.spyOn(process, 'once').mockImplementation(((event: string, listener: Function) => {
@@ -428,6 +433,9 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     getJobSpy.mockRestore();
     await shutdown?.();
     exitSpy.mockRestore();
+    if (priorGitNexusHome === undefined) delete process.env.GITNEXUS_HOME;
+    else process.env.GITNEXUS_HOME = priorGitNexusHome;
+    await fs.rm(isolatedGitNexusHomeRoot, { recursive: true, force: true });
   });
 
   it('releases the repository lock when embedding job admission throws', async () => {

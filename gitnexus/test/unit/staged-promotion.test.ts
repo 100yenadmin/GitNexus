@@ -48,7 +48,13 @@ const exists = async (filePath: string): Promise<boolean> =>
     .catch(() => false);
 
 afterEach(async () => {
-  await Promise.all(tempDirs.splice(0).map((dir) => fs.rm(dir, { recursive: true, force: true })));
+  vi.unstubAllEnvs();
+  await Promise.all(
+    tempDirs.splice(0).map(async (dir) => {
+      await fs.chmod(dir, 0o700).catch(() => {});
+      await fs.rm(dir, { recursive: true, force: true });
+    }),
+  );
 });
 
 describe('staged promotion journal', () => {
@@ -447,7 +453,11 @@ describe('common analyze ownership lock', () => {
     const repoRoot = path.join(parent, 'repo');
     const storagePath = path.join(repoRoot, '.gitnexus');
     const detachedPath = path.join(repoRoot, '.gitnexus.detached');
+    const isolatedHome = path.join(parent, 'home');
+    vi.stubEnv('GITNEXUS_HOME', isolatedHome);
+    await fs.mkdir(isolatedHome, { recursive: true });
     await fs.mkdir(storagePath, { recursive: true });
+    if (process.platform !== 'win32') await fs.chmod(parent, 0o555);
     let markDetached!: () => void;
     const detached = new Promise<void>((resolve) => {
       markDetached = resolve;
@@ -466,6 +476,10 @@ describe('common analyze ownership lock', () => {
       { repoRoot },
     );
     await detached;
+    const lockEntries = await fs.readdir(path.join(isolatedHome, 'locks'));
+    expect(lockEntries).toHaveLength(1);
+    expect(lockEntries[0]).toMatch(/^analyze-[0-9a-f]{32}\.lock$/);
+    expect((await fs.readdir(parent)).sort()).toEqual(['home', 'repo']);
 
     await expect(
       withAnalyzeOwnershipLock(storagePath, async () => undefined, {
