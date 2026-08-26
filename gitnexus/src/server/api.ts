@@ -2316,7 +2316,11 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                 await hasEmbeddableNodes(executeQuery, embedController.signal);
               });
             }
-            await withLbugDb(lbugPath, async () => {
+            const withOwnedLbugDb = <T>(operation: () => Promise<T>): Promise<T> =>
+              withLbugDb(lbugPath, operation, {
+                ownershipStoragePath: frozenOwner.canonicalStoragePath,
+              });
+            await withOwnedLbugDb(async () => {
               let embeddingMeta = await loadMeta(frozenOwner.canonicalStoragePath);
               const authoritativeLegacy = isEmptyLegacyCheckpoint(
                 embeddingMeta?.embeddingCheckpoint,
