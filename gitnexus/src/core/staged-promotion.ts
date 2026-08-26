@@ -459,6 +459,7 @@ interface RecoveryLeaseCleanupClaim {
 }
 
 const activeRecoveryPaths = new Set<string>();
+const locallyOrphanedRecoveryLeaseCleanupClaims = new Set<string>();
 
 const recoveryClaimPrefix = (lockPath: string): string => `${path.basename(lockPath)}.reclaim.`;
 
@@ -615,6 +616,15 @@ const listRecoveryLeaseCleanupClaims = async (
 
 const clearOrRejectRecoveryLeaseCleanupClaims = async (lockPath: string): Promise<void> => {
   for (const claim of await listRecoveryLeaseCleanupClaims(lockPath)) {
+    if (locallyOrphanedRecoveryLeaseCleanupClaims.has(claim.path)) {
+      try {
+        await fs.rm(claim.path);
+      } catch (error) {
+        if (!isMissingFilesystemError(error)) throw error;
+      }
+      locallyOrphanedRecoveryLeaseCleanupClaims.delete(claim.path);
+      continue;
+    }
     const liveStartToken = await readVerifiedProcessStartToken(
       claim.pid,
       'analyze recovery cleanup owner',
@@ -686,7 +696,17 @@ const removeObservedRecoveryMarker = async (
     // unlink, so a concurrently published replacement cannot be removed.
     await fs.rm(markerPath);
   } finally {
-    await fs.rm(cleanupClaimPath, { force: true }).catch(() => {});
+    try {
+      await fs.rm(cleanupClaimPath);
+      locallyOrphanedRecoveryLeaseCleanupClaims.delete(cleanupClaimPath);
+    } catch (error) {
+      if (isMissingFilesystemError(error)) {
+        locallyOrphanedRecoveryLeaseCleanupClaims.delete(cleanupClaimPath);
+      } else {
+        locallyOrphanedRecoveryLeaseCleanupClaims.add(cleanupClaimPath);
+        throw error;
+      }
+    }
   }
 };
 

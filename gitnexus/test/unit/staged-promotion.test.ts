@@ -839,6 +839,35 @@ describe('common analyze ownership lock', () => {
     await expect(fs.access(lockPath)).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
+  it('retries an exact locally owned cleanup claim after transient unlink failure', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-stage-lock-cleanup-retry-'));
+    tempDirs.push(root);
+    const lockPath = path.join(root, 'analyze-staged.lock');
+    await writeDeadAnalyzeLock(lockPath);
+    await publishDeadRecoveryLease(lockPath);
+
+    const originalRm = fs.rm.bind(fs);
+    let failedCleanupRemoval = false;
+    const rmSpy = vi.spyOn(fs, 'rm').mockImplementation(async (target, options) => {
+      if (String(target).includes('.reclaim-cleanup.') && !failedCleanupRemoval) {
+        failedCleanupRemoval = true;
+        throw Object.assign(new Error('transient cleanup claim failure'), { code: 'EPERM' });
+      }
+      return originalRm(target, options);
+    });
+    try {
+      await expect(withAnalyzeOwnershipLock(root, async () => undefined)).rejects.toThrow(
+        /transient cleanup claim failure/i,
+      );
+    } finally {
+      rmSpy.mockRestore();
+    }
+
+    await expect(withAnalyzeOwnershipLock(root, async () => 'retried')).resolves.toBe('retried');
+    expect(await recoveryResidue(lockPath)).toEqual([]);
+    await expect(fs.access(lockPath)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
   it('returns an ownership conflict when a cleanup marker vanishes before claim publication', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-stage-lock-cleanup-missing-'));
     tempDirs.push(root);
