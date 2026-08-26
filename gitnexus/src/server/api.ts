@@ -24,6 +24,7 @@ import {
   rollbackRegistryCommit,
   listRegisteredRepos,
   getStoragePath,
+  assertSafeStoragePath,
   registryPathEquals,
   type RegistryEntry,
   type RepoMeta,
@@ -1304,12 +1305,17 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         return;
       }
 
-      // Acquire repo lock — prevents deleting while analyze/embed is in flight
-      // Capture the canonical storage target before acquisition and carry it
-      // through deletion. Once the repo is removed, canonicalization falls
-      // back to the unresolved path and cannot recover this lock key.
-      const lockKey = canonicalRepoLockKey(entry.path);
-      const storagePath = lockKey;
+      // Acquire repo lock — prevents deleting while analyze/embed is in flight.
+      // Capture one physical repository root, then derive two deliberately
+      // different identities from it:
+      //   - real storage target for lock ownership;
+      //   - lexical `<physical-root>/.gitnexus` entry for recursive removal.
+      // `fs.rm` must never receive the realpath-derived lock key because the
+      // final `.gitnexus` component may itself be a symlink to unrelated data.
+      assertSafeStoragePath(entry);
+      const lockedRepoRoot = canonicalizePath(entry.path);
+      const lockKey = canonicalRepoLockKey(lockedRepoRoot);
+      const storagePath = getStoragePath(lockedRepoRoot);
       const lockErr = acquireRepoLock(lockKey);
       if (lockErr) {
         res.status(409).json({ error: lockErr });

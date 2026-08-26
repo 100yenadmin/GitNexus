@@ -101,6 +101,7 @@ const state = {
     },
   ),
   rollbackRegistryCommit: vi.fn(async () => undefined),
+  unregisterRepo: vi.fn(async () => undefined),
   saveMeta: vi.fn(async (_storagePath: string, next: RepoMeta) => {
     state.currentMeta = next;
   }),
@@ -150,6 +151,7 @@ vi.doMock('../../src/storage/repo-manager.js', async () => ({
   loadMeta: state.loadMeta,
   registerRepo: state.registerRepo,
   rollbackRegistryCommit: state.rollbackRegistryCommit,
+  unregisterRepo: state.unregisterRepo,
   saveMeta: state.saveMeta,
 }));
 
@@ -378,6 +380,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
       },
     );
     state.rollbackRegistryCommit.mockClear();
+    state.unregisterRepo.mockClear();
     state.saveMeta.mockClear();
     state.loadMeta.mockReset();
     state.loadMeta.mockImplementation(async () => state.currentMeta);
@@ -716,6 +719,35 @@ describe('POST /api/embed completed-checkpoint identity', () => {
       state.releaseAnalyzeLock?.();
       state.releaseAnalyzeLock = undefined;
       await fs.rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it('deletes only the lexical storage link while retaining its external target', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-issue269-delete-link-'));
+    const repoRoot = path.join(root, 'repo');
+    const externalStorage = path.join(root, 'external-storage');
+    const sentinel = path.join(externalStorage, 'sentinel.txt');
+    await fs.mkdir(repoRoot);
+    await fs.mkdir(externalStorage);
+    await fs.writeFile(sentinel, 'preserve');
+    await fs.symlink(externalStorage, path.join(repoRoot, '.gitnexus'), 'dir');
+    const entry = {
+      ...REPO,
+      path: repoRoot,
+      storagePath: path.join(repoRoot, '.gitnexus'),
+    };
+    state.listRegisteredRepos.mockResolvedValue([entry]);
+
+    try {
+      const response = await fetch(`${baseUrl}/api/repo?repo=${encodeURIComponent(entry.name)}`, {
+        method: 'DELETE',
+      });
+      expect(response.status).toBe(200);
+      await expect(fs.lstat(entry.storagePath)).rejects.toMatchObject({ code: 'ENOENT' });
+      await expect(fs.readFile(sentinel, 'utf8')).resolves.toBe('preserve');
+      expect(state.unregisterRepo).toHaveBeenCalledWith(repoRoot);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 
