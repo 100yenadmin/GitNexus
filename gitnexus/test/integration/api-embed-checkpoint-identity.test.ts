@@ -542,6 +542,23 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     expect(state.releaseOwnershipLease).toHaveBeenCalledOnce();
   });
 
+  it('terminalizes an empty embedding error with the fallback message', async () => {
+    state.loadMeta.mockRejectedValueOnce(new Error(''));
+
+    const response = await fetch(`${baseUrl}/api/embed`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ repo: REPO.name }),
+    });
+    expect(response.status).toBe(202);
+    const { jobId } = (await response.json()) as { jobId: string };
+
+    await expect(waitForTerminalJob(baseUrl, jobId)).resolves.toMatchObject({
+      status: 'failed',
+      error: 'Embedding generation failed',
+    });
+  });
+
   it('publishes cancellation and ownership cleanup failures together after release', async () => {
     state.currentMeta = makeMeta(LIVE_DIGEST);
     let pipelineStarted!: () => void;
@@ -549,21 +566,37 @@ describe('POST /api/embed completed-checkpoint identity', () => {
       pipelineStarted = resolve;
     });
     state.runEmbeddingPipeline.mockImplementation(async (...args: unknown[]) => {
+      const reportProgress = args[2] as (progress: { phase: string; percent: number }) => void;
       const options = args[6] as { signal: AbortSignal };
       pipelineStarted();
       await new Promise<void>((_resolve, reject) => {
+        const rejectWithWrappedAbort = () => {
+          reportProgress({ phase: 'error', percent: 0 });
+          const wrapped = new Error('Embedding request cancelled (redacted endpoint)', {
+            cause: new DOMException('pipeline cancelled', 'AbortError'),
+          });
+          wrapped.name = 'HttpEmbeddingError';
+          reject(wrapped);
+        };
         if (options.signal.aborted) {
-          reject(new DOMException('pipeline cancelled', 'AbortError'));
+          rejectWithWrappedAbort();
           return;
         }
-        options.signal.addEventListener(
-          'abort',
-          () => reject(new DOMException('pipeline cancelled', 'AbortError')),
-          { once: true },
-        );
+        options.signal.addEventListener('abort', rejectWithWrappedAbort, { once: true });
       });
     });
-    state.releaseOwnershipLease.mockRejectedValue(new Error('release retries exhausted'));
+    let cleanupStarted!: () => void;
+    const cleanupRunning = new Promise<void>((resolve) => {
+      cleanupStarted = resolve;
+    });
+    let failCleanup!: () => void;
+    const cleanupRelease = new Promise<void>((_resolve, reject) => {
+      failCleanup = () => reject(new Error('release retries exhausted'));
+    });
+    state.releaseOwnershipLease.mockImplementation(async () => {
+      cleanupStarted();
+      return cleanupRelease;
+    });
 
     const response = await fetch(`${baseUrl}/api/embed`, {
       method: 'POST',
@@ -574,13 +607,30 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     const { jobId } = (await response.json()) as { jobId: string };
     await pipelineRunning;
 
+    const progressResponse = await fetch(`${baseUrl}/api/embed/${jobId}/progress`);
+    expect(progressResponse.status).toBe(200);
+    let progressSettled = false;
+    const progressText = progressResponse.text().then((text) => {
+      progressSettled = true;
+      return text;
+    });
+
     const cancelled = await fetch(`${baseUrl}/api/embed/${jobId}`, { method: 'DELETE' });
     expect(cancelled.status).toBe(200);
+    await cleanupRunning;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(progressSettled).toBe(false);
+
+    failCleanup();
     const job = await waitForTerminalJob(baseUrl, jobId);
+    const events = await progressText;
 
     expect(job).toMatchObject({ status: 'failed' });
     expect(job.error).toMatch(/cancelled by user/i);
     expect(job.error).toMatch(/ownership lock release failed: release retries exhausted/i);
+    expect(events).toMatch(/event: failed/);
+    expect(events).toMatch(/cancelled by user/i);
+    expect(events).toMatch(/ownership lock release failed: release retries exhausted/i);
     expect(state.releaseOwnershipLease).toHaveBeenCalledOnce();
   });
 

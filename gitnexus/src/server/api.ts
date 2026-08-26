@@ -2262,6 +2262,14 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         embedBarriers.set(job.id, barrier);
         embedAborters.set(job.id, () => embedController.abort());
         let cancellationFailure: string | undefined;
+        const causedByAbort = (error: unknown): boolean => {
+          let current = error;
+          for (let depth = 0; depth < 4 && current instanceof Error; depth++) {
+            if (current.name === 'AbortError') return true;
+            current = current.cause;
+          }
+          return false;
+        };
         const cancelEmbedding = (reason: string): boolean => {
           const current = embedJobManager.getJob(job.id);
           if (!current || current.status === 'complete' || current.status === 'failed') {
@@ -2520,8 +2528,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                 (p) => {
                   embedJobManager.updateJob(job.id, {
                     progress: {
-                      phase:
-                        p.phase === 'ready' ? 'complete' : p.phase === 'error' ? 'failed' : p.phase,
+                      phase: p.phase === 'ready' || p.phase === 'error' ? 'embedding' : p.phase,
                       percent: p.percent,
                       message:
                         p.phase === 'loading-model'
@@ -2607,9 +2614,9 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
             if (!current || current.status !== 'failed') {
               failureMessage =
                 cancellationFailure ??
-                (err?.name === 'AbortError' && barrier.cancelReason
+                (causedByAbort(err) && barrier.cancelReason
                   ? barrier.cancelReason
-                  : (err.message ?? 'Embedding generation failed'));
+                  : err.message || 'Embedding generation failed');
             }
           } finally {
             let releaseMessage: string | undefined;
