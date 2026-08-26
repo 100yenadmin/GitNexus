@@ -503,17 +503,65 @@ describe('common analyze ownership lock', () => {
     expect(await recoveryEntries(path.join(root, 'analyze-staged.lock'))).toEqual([]);
   });
 
+  it('reclaims a lock when a live pid belongs to a different process generation', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-stage-lock-pid-reuse-'));
+    tempDirs.push(root);
+    const lockPath = path.join(root, 'analyze-staged.lock');
+    await fs.writeFile(
+      lockPath,
+      `${JSON.stringify({
+        schema: 'gitnexus.staged-analyze-lock/v1',
+        pid: process.pid,
+        nonce: 'prior-process-generation',
+        startedAt: '2026-07-20T00:00:00.000Z',
+        processStartToken: '000000000000000000000000',
+      })}\n`,
+    );
+
+    await expect(withAnalyzeOwnershipLock(root, async () => 'ok')).resolves.toBe('ok');
+    await expect(fs.access(lockPath)).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(await recoveryEntries(lockPath)).toEqual([]);
+  });
+
+  it('keeps a live legacy tokenless owner fail-closed and byte-identical', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-stage-lock-legacy-live-'));
+    tempDirs.push(root);
+    const lockPath = path.join(root, 'analyze-staged.lock');
+    const original = `${JSON.stringify({
+      schema: 'gitnexus.staged-analyze-lock/v1',
+      pid: process.pid,
+      nonce: 'legacy-live-owner',
+      startedAt: '2026-07-20T00:00:00.000Z',
+    })}\n`;
+    await fs.writeFile(lockPath, original);
+
+    await expect(withAnalyzeOwnershipLock(root, async () => undefined)).rejects.toThrow(
+      'Another analyze is active',
+    );
+    await expect(fs.readFile(lockPath, 'utf8')).resolves.toBe(original);
+    expect(await recoveryEntries(lockPath)).toEqual([]);
+  });
+
   it('does not require process-start identity for an uncontended acquisition', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-stage-lock-uncontended-'));
     tempDirs.push(root);
     const readFileSpy = vi.spyOn(fs, 'readFile');
 
+    if (process.platform === 'linux') {
+      readFileSpy.mockRejectedValueOnce(
+        Object.assign(new Error('process identity unavailable'), { code: 'EACCES' }),
+      );
+    }
+
     await expect(withAnalyzeOwnershipLock(root, async () => 'ok')).resolves.toBe('ok');
+    await expect(fs.access(path.join(root, 'analyze-staged.lock'))).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
 
     if (process.platform === 'linux') {
       expect(
         readFileSpy.mock.calls.some(([target]) => String(target) === `/proc/${process.pid}/stat`),
-      ).toBe(false);
+      ).toBe(true);
     }
     readFileSpy.mockRestore();
   });

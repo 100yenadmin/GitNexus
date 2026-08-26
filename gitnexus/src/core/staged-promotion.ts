@@ -115,6 +115,7 @@ interface StageLockRecord {
   pid: number;
   nonce: string;
   startedAt: string;
+  processStartToken?: string;
 }
 
 export class AnalyzeOwnershipConflictError extends Error {
@@ -421,7 +422,10 @@ const validStageLockRecord = (value: unknown): value is StageLockRecord => {
     (candidate.pid ?? 0) > 0 &&
     typeof candidate.nonce === 'string' &&
     candidate.nonce.length > 0 &&
-    typeof candidate.startedAt === 'string'
+    typeof candidate.startedAt === 'string' &&
+    (candidate.processStartToken === undefined ||
+      (typeof candidate.processStartToken === 'string' &&
+        /^[0-9a-f]{24}$/.test(candidate.processStartToken)))
   );
 };
 
@@ -429,7 +433,8 @@ const sameStageLockRecord = (left: StageLockRecord, right: StageLockRecord): boo
   left.schema === right.schema &&
   left.pid === right.pid &&
   left.nonce === right.nonce &&
-  left.startedAt === right.startedAt;
+  left.startedAt === right.startedAt &&
+  left.processStartToken === right.processStartToken;
 
 const sameFileObject = (left: FileIdentity, right: FileIdentity): boolean =>
   left.dev === right.dev && left.ino === right.ino;
@@ -543,6 +548,21 @@ const readVerifiedProcessStartToken = async (
       `Could not verify ${purpose} pid ${pid}; retry after verifying no writer is active.`,
     );
   });
+
+const primaryLockOwnerIsActive = async (
+  owner: StageLockRecord,
+  purpose: string,
+): Promise<boolean> => {
+  if (!processIsAlive(owner.pid)) return false;
+  if (!owner.processStartToken) return true;
+  const liveStartToken = await readVerifiedProcessStartToken(owner.pid, purpose);
+  if (!liveStartToken) {
+    throw new AnalyzeOwnershipConflictError(
+      `Could not verify ${purpose} pid ${owner.pid}; retry after verifying no writer is active.`,
+    );
+  }
+  return liveStartToken === owner.processStartToken;
+};
 
 const clearLegacyLeaseSources = async (lockPath: string): Promise<void> => {
   const directory = path.dirname(lockPath);
@@ -990,11 +1010,11 @@ const reclaimStaleOwnershipLock = async (
         !claimOwner ||
         !validStageLockRecord(claimOwner) ||
         !claimIdentity ||
-        !sameStageLockRecord(claimOwner, observedOwner) ||
-        processIsAlive(claimOwner.pid)
+        !sameStageLockRecord(claimOwner, observedOwner)
       ) {
         return false;
       }
+      if (await primaryLockOwnerIsActive(claimOwner, 'analyze lock owner')) return false;
       const current = await readJson<StageLockRecord>(lockPath).catch(() => undefined);
       const currentIdentity = await statRegularFile(lockPath);
       if (current || currentIdentity) {
@@ -1003,11 +1023,11 @@ const reclaimStaleOwnershipLock = async (
           !validStageLockRecord(current) ||
           !currentIdentity ||
           !sameStageLockRecord(current, observedOwner) ||
-          !sameFileObject(currentIdentity, claimIdentity) ||
-          processIsAlive(current.pid)
+          !sameFileObject(currentIdentity, claimIdentity)
         ) {
           return false;
         }
+        if (await primaryLockOwnerIsActive(current, 'analyze lock owner')) return false;
         try {
           await fs.rm(lockPath);
         } catch (error) {
@@ -1036,16 +1056,18 @@ const withOwnershipFileLock = async <T>(
   lockPath: string,
   operation: () => Promise<T>,
 ): Promise<T> => {
+  const ownerProcessStartToken = await processStartToken(process.pid).catch(() => undefined);
   const record: StageLockRecord = {
     schema: 'gitnexus.staged-analyze-lock/v1',
     pid: process.pid,
     nonce: randomBytes(16).toString('hex'),
     startedAt: new Date().toISOString(),
+    ...(ownerProcessStartToken ? { processStartToken: ownerProcessStartToken } : {}),
   };
   let ownsLock = false;
   let publicationSourcePath: string | undefined;
   let legacyLease: LegacyRecoveryLease | undefined;
-  let claimantStartToken: string | undefined;
+  let claimantStartToken: string | undefined = ownerProcessStartToken;
   const requireClaimantStartToken = async (): Promise<string> => {
     claimantStartToken ??= await getCurrentProcessStartToken().catch(() => {
       throw new AnalyzeOwnershipConflictError(
@@ -1075,7 +1097,7 @@ const withOwnershipFileLock = async <T>(
             'Analyze ownership is initializing or unreadable; retry after verifying the current owner.',
           );
         }
-        if (processIsAlive(owner.pid)) {
+        if (await primaryLockOwnerIsActive(owner, 'analyze lock owner')) {
           throw new AnalyzeOwnershipConflictError(
             `Another analyze is active (pid ${owner.pid}, started ${owner.startedAt}).`,
           );
