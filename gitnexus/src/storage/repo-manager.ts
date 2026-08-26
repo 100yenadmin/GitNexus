@@ -1140,6 +1140,8 @@ export interface RegisterRepoOptions {
   expectedOwner?: ExpectedRegistryOwner;
   /** Internal frozen physical identity for a separately preserved display path. */
   expectedCanonicalPath?: string;
+  /** Internal frozen storage identity held by the analyze ownership lock. */
+  expectedCanonicalStoragePath?: string;
   /** Internal in-memory receipt used to roll back a later coupled-store failure. */
   commitReceipt?: RegistryCommitReceiptRef;
 }
@@ -1306,11 +1308,18 @@ export const registerRepo = async (
   const expectedOwnerCanonicalPath = opts?.expectedOwner?.canonicalPath;
   const expectedOwnerCanonicalStorage = opts?.expectedOwner?.canonicalStoragePath;
   const expectedCanonicalPath = opts?.expectedCanonicalPath;
+  const expectedCanonicalStoragePath = opts?.expectedCanonicalStoragePath;
   if (
     expectedCanonicalPath !== undefined &&
     !registryPathEquals(canonicalInput, expectedCanonicalPath)
   ) {
     throw new Error('GitNexus: expected registry path changed during locked commit');
+  }
+  if (
+    expectedCanonicalStoragePath !== undefined &&
+    !registryPathEquals(canonicalizePath(storagePath), expectedCanonicalStoragePath)
+  ) {
+    throw new Error('GitNexus: expected registry storage changed during locked commit');
   }
 
   // Capture a current origin when callers provide older metadata without the
@@ -1437,11 +1446,21 @@ export const registerRepo = async (
   let commitReceipt: RegistryCommitReceipt | undefined;
   await withRegistryMutationLock(async () => {
     const fresh = await readRegistry();
+    const registryBeforeWrite =
+      expectedCanonicalStoragePath === undefined
+        ? undefined
+        : (JSON.parse(JSON.stringify(fresh)) as RegistryEntry[]);
     if (
       expectedCanonicalPath !== undefined &&
       !registryPathEquals(canonicalizePath(repoPath), expectedCanonicalPath)
     ) {
       throw new Error('GitNexus: expected registry path changed during locked commit');
+    }
+    if (
+      expectedCanonicalStoragePath !== undefined &&
+      !registryPathEquals(canonicalizePath(storagePath), expectedCanonicalStoragePath)
+    ) {
+      throw new Error('GitNexus: expected registry storage changed during locked commit');
     }
     // Close the analyze/index TOCTOU window: another process may have registered
     // this remote after the initial read but before our atomic registry write.
@@ -1520,6 +1539,24 @@ export const registerRepo = async (
     }
 
     await writeRegistry(fresh);
+    if (
+      expectedCanonicalStoragePath !== undefined &&
+      !registryPathEquals(canonicalizePath(storagePath), expectedCanonicalStoragePath)
+    ) {
+      const identityError = new Error(
+        'GitNexus: expected registry storage changed during locked commit',
+      );
+      if (!registryBeforeWrite) throw identityError;
+      try {
+        await writeRegistry(registryBeforeWrite);
+      } catch (rollbackError) {
+        throw new AggregateError(
+          [identityError, rollbackError],
+          'GitNexus: registry storage changed during commit and rollback was incomplete',
+        );
+      }
+      throw identityError;
+    }
     commitReceipt = {
       previousOwner: freshExisting ? { ...freshExisting } : null,
       committedOwner: { ...merged },
@@ -1834,9 +1871,13 @@ export const isRepoRegistered = async (repoPath: string): Promise<boolean> => {
  * Callers must skip this assertion on the `alreadyUpToDate` early-return
  * path, where the rebuild was deliberately not run.
  */
-export const assertAnalysisFinalized = async (repoPath: string): Promise<void> => {
+export const assertAnalysisFinalized = async (
+  repoPath: string,
+  expectedCanonicalStoragePath?: string,
+): Promise<void> => {
   const resolved = path.resolve(repoPath);
-  const { storagePath, metaPath } = getStoragePaths(resolved);
+  const storagePath = expectedCanonicalStoragePath ?? getStoragePaths(resolved).storagePath;
+  const metaPath = path.join(storagePath, INDEX_METADATA_FILE);
 
   try {
     await fs.access(metaPath);
@@ -1844,7 +1885,20 @@ export const assertAnalysisFinalized = async (repoPath: string): Promise<void> =
     throw new AnalysisNotFinalizedError(resolved, storagePath, 'meta', getGlobalRegistryPath());
   }
 
-  if (!(await isRepoRegistered(resolved))) {
+  const isRegistered = expectedCanonicalStoragePath
+    ? (await readRegistry()).some(
+        (entry) =>
+          path.isAbsolute(entry.path) &&
+          path.isAbsolute(entry.storagePath) &&
+          registryPathEquals(canonicalizePath(entry.path), canonicalizePath(resolved)) &&
+          registryPathEquals(canonicalizePath(entry.storagePath), expectedCanonicalStoragePath) &&
+          registryPathEquals(
+            canonicalizePath(getStoragePath(entry.path)),
+            expectedCanonicalStoragePath,
+          ),
+      )
+    : await isRepoRegistered(resolved);
+  if (!isRegistered) {
     throw new AnalysisNotFinalizedError(
       resolved,
       storagePath,

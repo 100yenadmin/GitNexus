@@ -721,7 +721,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
       expect(state.saveMeta).toHaveBeenCalledTimes(2);
       expect(state.saveMeta).toHaveBeenNthCalledWith(
         2,
-        expect.stringContaining('canonical-a/.gitnexus'),
+        expect.stringContaining(path.join('canonical-a', '.gitnexus')),
         expect.objectContaining({ embeddingCheckpoint: expect.anything() }),
       );
       expect(JSON.stringify(state.currentMeta.embeddingCheckpoint)).toBe(checkpointBefore);

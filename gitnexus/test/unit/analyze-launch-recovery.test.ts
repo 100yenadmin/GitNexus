@@ -26,6 +26,7 @@ const result = (recoveredPromotionOnly?: boolean): AnalyzeResultIpc => ({
   ftsRepairedOnly: undefined,
   ftsSkipped: undefined,
 });
+const virtualStoragePath = path.resolve('/virtual/demo', '.gitnexus');
 
 type Listener = (...args: unknown[]) => void;
 
@@ -117,7 +118,7 @@ describe('analyze worker shared lock ownership', () => {
     await vi.waitFor(() => expect(job.status).toBe('failed'));
 
     expect(releaseRepoLock).toHaveBeenCalledOnce();
-    expect(releaseRepoLock).toHaveBeenCalledWith('/virtual/demo/.gitnexus');
+    expect(releaseRepoLock).toHaveBeenCalledWith(virtualStoragePath);
   });
 
   it('keeps the lock until a cancelled worker exits', async () => {
@@ -135,7 +136,7 @@ describe('analyze worker shared lock ownership', () => {
 
     await vi.waitFor(() => expect(releaseRepoLock).toHaveBeenCalledOnce());
     expect(releaseRepoLock).toHaveBeenCalledOnce();
-    expect(releaseRepoLock).toHaveBeenCalledWith('/virtual/demo/.gitnexus');
+    expect(releaseRepoLock).toHaveBeenCalledWith(virtualStoragePath);
   });
 
   it('releases when terminal cleanup finishes before the worker exits', async () => {
@@ -154,7 +155,7 @@ describe('analyze worker shared lock ownership', () => {
     child.emit('close', 1);
 
     expect(releaseRepoLock).toHaveBeenCalledOnce();
-    expect(releaseRepoLock).toHaveBeenCalledWith('/virtual/demo/.gitnexus');
+    expect(releaseRepoLock).toHaveBeenCalledWith(virtualStoragePath);
   });
 
   it('sends the frozen storage target when the repository storage link retargets', async () => {
@@ -247,7 +248,7 @@ describe('analyze worker shared lock ownership', () => {
     } else {
       expect(releaseRepoLock).toHaveBeenCalledOnce();
     }
-    expect(releaseRepoLock).toHaveBeenCalledWith('/virtual/demo/.gitnexus');
+    expect(releaseRepoLock).toHaveBeenCalledWith(virtualStoragePath);
     expect(job.status).toBe('failed');
     if (_label === 'send') expect(child.child.kill).toHaveBeenCalledWith('SIGTERM');
   });
@@ -277,7 +278,7 @@ describe('analyze worker shared lock ownership', () => {
       await Promise.resolve();
 
       expect(releaseRepoLock).toHaveBeenCalledOnce();
-      expect(releaseRepoLock).toHaveBeenCalledWith('/virtual/demo/.gitnexus');
+      expect(releaseRepoLock).toHaveBeenCalledWith(virtualStoragePath);
       expect(job.status).toBe('failed');
     } finally {
       vi.useRealTimers();

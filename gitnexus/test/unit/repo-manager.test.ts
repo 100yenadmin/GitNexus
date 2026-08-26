@@ -1284,6 +1284,7 @@ describe('registerRepo expected owner CAS (#264)', () => {
         {
           expectedOwner: frozenOwner(expected),
           expectedCanonicalPath: canonicalizePath(target),
+          expectedCanonicalStoragePath: canonicalizePath(path.join(alias, '.gitnexus')),
         },
       ),
     ).resolves.toBe(expected.name);
@@ -1314,6 +1315,88 @@ describe('registerRepo expected owner CAS (#264)', () => {
       registerRepo(alias, { ...meta('new'), repoPath: alias }, { expectedCanonicalPath }),
     ).rejects.toThrow('GitNexus: expected registry path changed during locked commit');
     expect(await fs.readFile(registryPath, 'utf8')).toBe(before);
+  });
+
+  it('rejects a storage-link retarget before the locked commit without changing registry bytes', async () => {
+    const repoRoot = path.join(tmpHome.dbPath, 'storage-display-root');
+    const storageA = path.join(tmpHome.dbPath, 'storage-display-a');
+    const storageB = path.join(tmpHome.dbPath, 'storage-display-b');
+    await fs.mkdir(repoRoot);
+    await fs.mkdir(storageA);
+    await fs.mkdir(storageB);
+    const storageLink = path.join(repoRoot, '.gitnexus');
+    await fs.symlink(storageA, storageLink, 'dir');
+    const expectedCanonicalStoragePath = canonicalizePath(storageLink);
+    const registryPath = path.join(tmpHome.dbPath, 'registry.json');
+    const lockPath = `${registryPath}.lock`;
+    const before = '[]';
+    await fs.writeFile(registryPath, before);
+    await fs.writeFile(
+      lockPath,
+      JSON.stringify({
+        schema: 'gitnexus.registry-lock/v1',
+        pid: process.pid,
+        nonce: 'held-storage',
+        startedAt: new Date().toISOString(),
+      }),
+    );
+    const openSpy = vi.spyOn(fs, 'open');
+    const pending = registerRepo(
+      repoRoot,
+      { ...meta('new'), repoPath: repoRoot },
+      { expectedCanonicalStoragePath },
+    );
+    try {
+      await vi.waitFor(() => expect(openSpy).toHaveBeenCalledWith(lockPath, 'wx', 0o600));
+      await fs.unlink(storageLink);
+      await fs.symlink(storageB, storageLink, 'dir');
+      await fs.rm(lockPath);
+
+      await expect(pending).rejects.toThrow(
+        'GitNexus: expected registry storage changed during locked commit',
+      );
+      expect(await fs.readFile(registryPath, 'utf8')).toBe(before);
+    } finally {
+      openSpy.mockRestore();
+    }
+  });
+
+  it('rolls back registry bytes when the storage link retargets during the atomic write', async () => {
+    const repoRoot = path.join(tmpHome.dbPath, 'storage-write-root');
+    const storageA = path.join(tmpHome.dbPath, 'storage-write-a');
+    const storageB = path.join(tmpHome.dbPath, 'storage-write-b');
+    await fs.mkdir(repoRoot);
+    await fs.mkdir(storageA);
+    await fs.mkdir(storageB);
+    const storageLink = path.join(repoRoot, '.gitnexus');
+    await fs.symlink(storageA, storageLink, 'dir');
+    const expectedCanonicalStoragePath = canonicalizePath(storageLink);
+    const registryPath = path.join(tmpHome.dbPath, 'registry.json');
+    const before = '[]';
+    await fs.writeFile(registryPath, before);
+    const realRename = fs.rename.bind(fs);
+    let registryWrites = 0;
+    const renameSpy = vi.spyOn(fs, 'rename').mockImplementation(async (source, target) => {
+      await realRename(source, target);
+      if (path.resolve(String(target)) === path.resolve(registryPath) && ++registryWrites === 1) {
+        await fs.unlink(storageLink);
+        await fs.symlink(storageB, storageLink, 'dir');
+      }
+    });
+
+    try {
+      await expect(
+        registerRepo(
+          repoRoot,
+          { ...meta('new'), repoPath: repoRoot },
+          { expectedCanonicalStoragePath },
+        ),
+      ).rejects.toThrow('GitNexus: expected registry storage changed during locked commit');
+      expect(registryWrites).toBe(2);
+      expect(await fs.readFile(registryPath, 'utf8')).toBe(before);
+    } finally {
+      renameSpy.mockRestore();
+    }
   });
 });
 

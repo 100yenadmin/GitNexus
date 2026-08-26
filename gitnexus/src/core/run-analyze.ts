@@ -786,6 +786,12 @@ const runFullAnalysisImpl = async (
   const { repoHasGit, remoteUrl: repositoryRemoteUrl } = repositoryIdentity;
   const persistedRepoPath = options.registryPath ?? repoPath;
   const expectedPersistedCanonicalPath = canonicalizePath(repoPath);
+  const frozenRegistryIdentity = {
+    expectedCanonicalPath: expectedPersistedCanonicalPath,
+    ...(options.analyzeStoragePath
+      ? { expectedCanonicalStoragePath: options.analyzeStoragePath }
+      : {}),
+  };
 
   // Resolve + validate operator-provided FTS config once, before the expensive
   // parse/load phases. A typo fails here in ms; createSearchFTSIndexes reuses
@@ -959,7 +965,7 @@ const runFullAnalysisImpl = async (
       name: options.registryName,
       allowDuplicateName: options.allowDuplicateName,
       branch: placement.branch,
-      expectedCanonicalPath: expectedPersistedCanonicalPath,
+      ...frozenRegistryIdentity,
     });
   };
 
@@ -1233,7 +1239,7 @@ const runFullAnalysisImpl = async (
       projectName = await registerRepo(persistedRepoPath, repairedMeta, {
         name: options.registryName,
         allowDuplicateName: options.allowDuplicateName,
-        expectedCanonicalPath: expectedPersistedCanonicalPath,
+        ...frozenRegistryIdentity,
       });
     } finally {
       await closeLbug().catch(() => {});
@@ -3480,7 +3486,7 @@ const runFullAnalysisImpl = async (
         name: options.registryName,
         allowDuplicateName: options.allowDuplicateName,
         branch: placement.branch,
-        expectedCanonicalPath: expectedPersistedCanonicalPath,
+        ...frozenRegistryIdentity,
       });
     }
 

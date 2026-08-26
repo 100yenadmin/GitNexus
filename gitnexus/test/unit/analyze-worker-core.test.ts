@@ -77,6 +77,25 @@ describe('runWorkerAnalysis — finalize guard (#2264 P2)', () => {
     expect(completes).toHaveLength(1);
   });
 
+  it('finalizes against the physical storage target captured by the launcher', async () => {
+    const send = vi.fn<(msg: WorkerMessage) => void>();
+    const finalize = vi.fn<WorkerAnalysisDeps['assertAnalysisFinalized']>(async () => undefined);
+
+    await runWorkerAnalysis(
+      '/repo',
+      { analyzeStoragePath: '/storage-a' },
+      {
+        runFullAnalysis: okRun,
+        assertAnalysisFinalized: finalize,
+        send,
+        claimTerminal: alwaysClaim,
+      },
+    );
+
+    expect(finalize).toHaveBeenCalledWith('/repo', '/storage-a');
+    expect(send).toHaveBeenCalledWith(expect.objectContaining({ type: 'complete' }));
+  });
+
   it('reports error when finalization passes but the analysis itself throws', async () => {
     const send = vi.fn<(msg: WorkerMessage) => void>();
     const failingRun: WorkerAnalysisDeps['runFullAnalysis'] = vi.fn(async () => {
