@@ -68,6 +68,8 @@ const state = {
   graphNodes: [{ id: 'node-1' }],
   executeQuery: vi.fn(async () => state.graphNodes),
   openModes: [] as Array<boolean | undefined>,
+  openOwnershipPaths: [] as Array<string | undefined>,
+  ownershipGate: undefined as Promise<void> | undefined,
   closeLbug: vi.fn(async () => undefined),
   withLbugReadOnlyNonRecovering: vi.fn((_dbPath: string, operation: () => Promise<unknown>) => {
     state.openModes.push(true);
@@ -77,9 +79,11 @@ const state = {
     async (
       _dbPath: string,
       operation: () => Promise<unknown>,
-      options?: { readOnly?: boolean },
+      options?: { readOnly?: boolean; ownershipStoragePath?: string },
     ) => {
       state.openModes.push(options?.readOnly);
+      state.openOwnershipPaths.push(options?.ownershipStoragePath);
+      if (options?.ownershipStoragePath) await state.ownershipGate;
       return operation();
     },
   ),
@@ -370,6 +374,8 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     state.executeQuery.mockReset();
     state.executeQuery.mockImplementation(async () => state.graphNodes);
     state.openModes.length = 0;
+    state.openOwnershipPaths.length = 0;
+    state.ownershipGate = undefined;
     state.closeLbug.mockClear();
     state.withLbugReadOnlyNonRecovering.mockClear();
     state.withLbugDb.mockClear();
@@ -436,6 +442,29 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     expect(retry.status).toBe(202);
     const { jobId } = (await retry.json()) as { jobId: string };
     await waitForTerminalJob(baseUrl, jobId);
+  });
+
+  it('admits writable embedding through the frozen cross-process owner', async () => {
+    state.currentMeta = makeMeta(LIVE_DIGEST);
+    let releaseOwnership!: () => void;
+    state.ownershipGate = new Promise<void>((resolve) => {
+      releaseOwnership = resolve;
+    });
+
+    const response = await fetch(`${baseUrl}/api/embed`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ repo: REPO.name }),
+    });
+    const { jobId } = (await response.json()) as { jobId: string };
+    await vi.waitFor(() => expect(state.openOwnershipPaths).toHaveLength(1));
+
+    expect(state.openOwnershipPaths).toEqual([canonicalizePath(REPO.storagePath)]);
+    expect(state.loadMeta).toHaveBeenCalledOnce();
+    expect(state.saveMeta).not.toHaveBeenCalled();
+
+    releaseOwnership();
+    await expect(waitForTerminalJob(baseUrl, jobId)).resolves.toMatchObject({ status: 'complete' });
   });
 
   it('rejects an equal-count different-digest completed window before the pipeline', async () => {

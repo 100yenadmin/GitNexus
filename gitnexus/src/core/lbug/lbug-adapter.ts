@@ -816,8 +816,14 @@ export const withLbugReadOnlyNonRecovering = async <T>(
 export const withLbugDb = async <T>(
   dbPath: string,
   operation: () => Promise<T>,
-  options: { readOnly?: boolean } = {},
+  options: { readOnly?: boolean; ownershipStoragePath?: string } = {},
 ): Promise<T> => {
+  if (options.ownershipStoragePath) {
+    const { withAnalyzeOwnershipLock } = await import('../staged-promotion.js');
+    return withAnalyzeOwnershipLock(options.ownershipStoragePath, () =>
+      withLbugDb(dbPath, operation, { readOnly: options.readOnly }),
+    );
+  }
   let lastError: unknown;
   const readOnly = options.readOnly === true;
   for (let attempt = 1; attempt <= DB_LOCK_RETRY_ATTEMPTS; attempt++) {
