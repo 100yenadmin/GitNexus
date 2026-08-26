@@ -19,8 +19,6 @@ import {
   canonicalizePath,
   canonicalRepoLockKey,
   INDEX_METADATA_FILE,
-  listRegisteredRepos,
-  registryPathEquals,
 } from '../storage/repo-manager.js';
 import { logger } from '../core/logger.js';
 import type { JobManager } from './analyze-job.js';
@@ -94,20 +92,11 @@ const FINALIZE_SETTLE_POLL_MS = 200;
  * non-force analyze legitimately rewrites nothing.
  */
 /**
- * Look up the analyzed repo's registered storage path. The request's
- * user-provided path is used only as a comparison key; the filesystem probes
- * below run against the registry's own `storagePath` — the server-owned
- * record readers resolve through, and not a user-controlled value
- * (CodeQL js/path-injection).
+ * Probe only the physical storage target captured before lock acquisition.
+ * Re-resolving a repository or registry symlink here could observe a retarget
+ * and wait on storage the worker never owned.
  */
-const registeredStoragePath = async (targetPath: string): Promise<string | null> => {
-  const target = canonicalizePath(path.resolve(targetPath));
-  const entries = await listRegisteredRepos();
-  const entry = entries.find((e) => registryPathEquals(canonicalizePath(e.path), target));
-  return entry?.storagePath ?? null;
-};
-
-const waitForSettledIndex = async (targetPath: string, jobStartMs: number): Promise<void> => {
+const waitForSettledIndex = async (storagePath: string, jobStartMs: number): Promise<void> => {
   const settled = (storagePath: string): boolean => {
     try {
       const lbugStat = statSync(path.join(storagePath, 'lbug'));
@@ -125,13 +114,10 @@ const waitForSettledIndex = async (targetPath: string, jobStartMs: number): Prom
   };
   const deadline = Date.now() + FINALIZE_SETTLE_TIMEOUT_MS;
   for (;;) {
-    // Re-resolved each round: the worker registers the repo as part of the
-    // finalization this gate is waiting out.
-    const storagePath = await registeredStoragePath(targetPath);
-    if (storagePath && settled(storagePath)) return;
+    if (settled(storagePath)) return;
     if (Date.now() > deadline) {
       logger.warn(
-        { targetPath },
+        { storagePath },
         'analyze finalization not visible after timeout; completing job anyway',
       );
       return;
@@ -262,7 +248,7 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
           // then fail the analyze request with explicit retry guidance.
           const settle = msg.result.recoveredPromotionOnly
             ? Promise.resolve()
-            : waitForSettledIndex(lockedRepoPath, jobStartMs);
+            : waitForSettledIndex(analyzeLockKey, jobStartMs);
           finishTerminalCleanup(
             settle
               .then(() => closeDbHandle())
@@ -376,6 +362,10 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
           repoPath: lockedRepoPath,
           options: {
             registryPath: targetPath,
+            // Keep every analyzer filesystem write on the same physical
+            // storage target whose shared repository lock is held. The repo's
+            // lexical `.gitnexus` path may be retargeted after acquisition.
+            analyzeStoragePath: analyzeLockKey,
             force: !!opts.force,
             embeddings: !!opts.embeddings,
             dropEmbeddings: !!opts.dropEmbeddings,

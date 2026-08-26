@@ -66,6 +66,7 @@ import { quarantineSidecarsForDirtyRecovery } from './lbug/sidecar-recovery.js';
 import {
   getStoragePaths,
   resolveBranchPlacement,
+  branchSlug,
   saveMeta,
   loadMeta,
   ensureGitNexusIgnored,
@@ -185,6 +186,12 @@ export interface AnalyzeOptions {
    * the stable path the operator registered.
    */
   registryPath?: string;
+  /**
+   * Internal server-only physical storage target captured before the shared
+   * repository lock is acquired. Never canonicalize this value again: doing
+   * so after a `.gitnexus` symlink retarget would escape the held lock.
+   */
+  analyzeStoragePath?: string;
   /**
    * Force a full re-index of the pipeline. Callers may OR this with
    * other flags that imply re-analysis (e.g. `--skills`), so the value
@@ -805,7 +812,7 @@ const runFullAnalysisImpl = async (
   // `storagePath` is ALWAYS the flat `.gitnexus` — content-addressed caches
   // (parse-cache, parsedfile-store) and the kuzu-migration cleanup live there
   // and are shared across branches (#2106 KTD7).
-  const { storagePath } = getStoragePaths(repoPath);
+  const storagePath = options.analyzeStoragePath ?? getStoragePaths(repoPath).storagePath;
 
   const currentCommit = repoHasGit ? getCurrentCommit(repoPath) : '';
 
@@ -835,7 +842,23 @@ const runFullAnalysisImpl = async (
   });
   const branchLabel = options.branch ?? checkedOutBranch;
   const placement = options.branch ? await resolveBranchPlacement(repoPath, branchLabel) : {};
-  const canonicalPaths = getStoragePaths(repoPath, placement.branch);
+  const canonicalPaths = options.analyzeStoragePath
+    ? {
+        storagePath,
+        lbugPath: path.join(
+          placement.branch
+            ? path.join(storagePath, 'branches', branchSlug(placement.branch))
+            : storagePath,
+          'lbug',
+        ),
+        metaPath: path.join(
+          placement.branch
+            ? path.join(storagePath, 'branches', branchSlug(placement.branch))
+            : storagePath,
+          INDEX_METADATA_FILE,
+        ),
+      }
+    : getStoragePaths(repoPath, placement.branch);
   // Prevent a previous analyze in the same process from leaking its graph hint
   // into any pre-pipeline database open in this run.
   setBufferPoolSizeHint(undefined);
@@ -886,7 +909,9 @@ const runFullAnalysisImpl = async (
     saveMeta(metaDir, markPendingImplicitFlatAdoption(meta));
   const adoptAndRestampImplicitFlatBranch = async (meta: RepoMeta): Promise<RepoMeta> => {
     if (!implicitFlatBranch) return meta;
-    const outcome = await adoptFlatBranchLabel(repoPath, implicitFlatBranch);
+    const outcome = options.analyzeStoragePath
+      ? await adoptFlatBranchLabel(repoPath, implicitFlatBranch, storagePath)
+      : await adoptFlatBranchLabel(repoPath, implicitFlatBranch);
     if (outcome !== 'ADOPTED') {
       log(
         `Warning: workspace branch adoption returned ${outcome}; ` +
@@ -3558,6 +3583,9 @@ export async function runFullAnalysis(
   ) {
     throw new Error('GitNexus: analyze display path changed before worker start');
   }
+  if (options.analyzeStoragePath !== undefined && !path.isAbsolute(options.analyzeStoragePath)) {
+    throw new Error('GitNexus: analyze storage target must be absolute');
+  }
   if (options.incrementalOnly && options.dropEmbeddings) {
     throw new Error(
       'Cannot combine `--incremental-only` with `--drop-embeddings`. ' +
@@ -3590,7 +3618,7 @@ export async function runFullAnalysis(
   await assertCanonicalRepositoryIdentity(repoPath, repositoryRemoteUrl);
   if (options.repairVector) await assertVectorRepairPreflight(repoPath);
 
-  const { storagePath } = getStoragePaths(repoPath);
+  const storagePath = options.analyzeStoragePath ?? getStoragePaths(repoPath).storagePath;
   return withAnalyzeOwnershipLock(storagePath, async () => {
     // The first preflight avoids creating an ownership lock for a known-dirty
     // index. Repeat it after lock acquisition because a writer may have run

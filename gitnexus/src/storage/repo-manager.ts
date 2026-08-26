@@ -1621,6 +1621,7 @@ export type FlatBranchAdoptionOutcome = 'ADOPTED' | 'PRIMARY_DRIFT_RECONCILED' |
 export const adoptFlatBranchLabel = async (
   repoPath: string,
   branch: string,
+  frozenStoragePath?: string,
 ): Promise<FlatBranchAdoptionOutcome> => {
   const canonicalInput = canonicalizePath(repoPath);
   const isRegistered = (list: RegistryEntry[]): number =>
@@ -1641,7 +1642,7 @@ export const adoptFlatBranchLabel = async (
   if (initialEntries[initialIdx].branch === branch && !observedSummary) return 'ADOPTED';
 
   const resolved = path.resolve(repoPath);
-  const { storagePath } = getStoragePaths(resolved);
+  const storagePath = frozenStoragePath ?? getStoragePaths(resolved).storagePath;
   // Remove a shadowed sub-index directory, mirroring `clean --branch`'s
   // containment guard: the target MUST live under .gitnexus/branches/.
   const branchDir = path.join(storagePath, BRANCHES_DIR, branchSlug(branch));

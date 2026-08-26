@@ -157,13 +157,15 @@ describe('analyze worker shared lock ownership', () => {
     expect(releaseRepoLock).toHaveBeenCalledWith('/virtual/demo/.gitnexus');
   });
 
-  it('sends the same canonical repository root whose storage key is locked', async () => {
+  it('sends the frozen storage target when the repository storage link retargets', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-analyze-lock-'));
     const target = path.join(root, 'target');
     const storage = path.join(root, 'physical-storage');
+    const retargetedStorage = path.join(root, 'retargeted-storage');
     const alias = path.join(root, 'alias');
     await fs.mkdir(target);
     await fs.mkdir(storage);
+    await fs.mkdir(retargetedStorage);
     await fs.symlink(storage, path.join(target, '.gitnexus'), 'dir');
     await fs.symlink(target, alias, 'dir');
     try {
@@ -176,12 +178,17 @@ describe('analyze worker shared lock ownership', () => {
       const deps = launchDeps(manager, releaseRepoLock);
 
       createLaunchAnalysisWorker(deps)(job, alias, {});
+      await fs.unlink(path.join(target, '.gitnexus'));
+      await fs.symlink(retargetedStorage, path.join(target, '.gitnexus'), 'dir');
 
       expect(deps.acquireRepoLock).toHaveBeenCalledWith(canonicalStorage);
       expect(child.child.send).toHaveBeenCalledWith(
         expect.objectContaining({
           repoPath: canonicalTarget,
-          options: expect.objectContaining({ registryPath: alias }),
+          options: expect.objectContaining({
+            registryPath: alias,
+            analyzeStoragePath: canonicalStorage,
+          }),
         }),
       );
       child.emit('message', { type: 'error', message: 'test cleanup' });

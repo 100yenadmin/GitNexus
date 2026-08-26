@@ -636,12 +636,15 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     expect(state.getStrictLbugStats.mock.invocationCallOrder[0]).toBeLessThan(
       state.listRegisteredRepos.mock.invocationCallOrder[1],
     );
-    expect(state.listRegisteredRepos).toHaveBeenCalledTimes(2);
+    expect(state.listRegisteredRepos).toHaveBeenCalledTimes(3);
     expect(state.listRegisteredRepos.mock.invocationCallOrder[1]).toBeLessThan(
       state.registerRepo.mock.invocationCallOrder[0],
     );
     expect(state.registerRepo.mock.invocationCallOrder[0]).toBeLessThan(
       state.saveMeta.mock.invocationCallOrder[0],
+    );
+    expect(state.saveMeta.mock.invocationCallOrder[0]).toBeLessThan(
+      state.listRegisteredRepos.mock.invocationCallOrder[2],
     );
     expect(state.registerRepo).toHaveBeenCalledWith(
       REPO.path,
@@ -689,6 +692,43 @@ describe('POST /api/embed completed-checkpoint identity', () => {
         expect(state.rollbackRegistryCommit).toHaveBeenCalledOnce();
       },
     );
+  });
+
+  it('restores registry and metadata preimages when the owner retargets during a successful save', async () => {
+    const fixture = await prepareSymlinkRace('gitnexus-issue269-post-save-');
+    state.listRegisteredRepos.mockResolvedValue([fixture.raceRepo]);
+    const checkpointBefore = JSON.stringify(state.currentMeta.embeddingCheckpoint);
+    state.registerRepo.mockImplementation(async (_repoPath, _meta, options) => {
+      if (options?.commitReceipt) {
+        options.commitReceipt.value = {
+          previousOwner: fixture.raceRepo,
+          committedOwner: fixture.raceRepo,
+        };
+      }
+      return fixture.raceRepo.name;
+    });
+    state.saveMeta.mockImplementationOnce(async (_storagePath, next) => {
+      state.currentMeta = next;
+      await fixture.retarget();
+    });
+
+    try {
+      const job = await runEmbedJob(baseUrl, fixture.raceRepo.name);
+      expect(job.status).toBe('failed');
+      expect(job.error).toMatch(/path\/storage identity is non-absolute or mismatched/i);
+      expect(state.registerRepo).toHaveBeenCalledOnce();
+      expect(state.rollbackRegistryCommit).toHaveBeenCalledOnce();
+      expect(state.saveMeta).toHaveBeenCalledTimes(2);
+      expect(state.saveMeta).toHaveBeenNthCalledWith(
+        2,
+        expect.stringContaining('canonical-a/.gitnexus'),
+        expect.objectContaining({ embeddingCheckpoint: expect.anything() }),
+      );
+      expect(JSON.stringify(state.currentMeta.embeddingCheckpoint)).toBe(checkpointBefore);
+      expect(state.currentMeta.repoPath).toBe(fixture.alias);
+    } finally {
+      await fs.rm(fixture.root, { recursive: true, force: true });
+    }
   });
 
   it('uses one canonical lock to exclude embed and delete during symlinked analyze', async () => {
