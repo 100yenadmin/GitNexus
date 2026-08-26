@@ -11,16 +11,15 @@
  */
 
 import path from 'path';
-import { existsSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, statSync } from 'node:fs';
 import { fork } from 'child_process';
 import { fileURLToPath, pathToFileURL } from 'url';
 import { createRequire } from 'node:module';
 import {
   canonicalizePath,
+  canonicalRepoLockKey,
   getStoragePath,
   INDEX_METADATA_FILE,
-  listRegisteredRepos,
-  registryPathEquals,
 } from '../storage/repo-manager.js';
 import { logger } from '../core/logger.js';
 import type { JobManager } from './analyze-job.js';
@@ -94,20 +93,11 @@ const FINALIZE_SETTLE_POLL_MS = 200;
  * non-force analyze legitimately rewrites nothing.
  */
 /**
- * Look up the analyzed repo's registered storage path. The request's
- * user-provided path is used only as a comparison key; the filesystem probes
- * below run against the registry's own `storagePath` — the server-owned
- * record readers resolve through, and not a user-controlled value
- * (CodeQL js/path-injection).
+ * Probe only the physical storage target captured before lock acquisition.
+ * Re-resolving a repository or registry symlink here could observe a retarget
+ * and wait on storage the worker never owned.
  */
-const registeredStoragePath = async (targetPath: string): Promise<string | null> => {
-  const target = canonicalizePath(path.resolve(targetPath));
-  const entries = await listRegisteredRepos();
-  const entry = entries.find((e) => registryPathEquals(canonicalizePath(e.path), target));
-  return entry?.storagePath ?? null;
-};
-
-const waitForSettledIndex = async (targetPath: string, jobStartMs: number): Promise<void> => {
+const waitForSettledIndex = async (storagePath: string, jobStartMs: number): Promise<void> => {
   const settled = (storagePath: string): boolean => {
     try {
       const lbugStat = statSync(path.join(storagePath, 'lbug'));
@@ -125,13 +115,10 @@ const waitForSettledIndex = async (targetPath: string, jobStartMs: number): Prom
   };
   const deadline = Date.now() + FINALIZE_SETTLE_TIMEOUT_MS;
   for (;;) {
-    // Re-resolved each round: the worker registers the repo as part of the
-    // finalization this gate is waiting out.
-    const storagePath = await registeredStoragePath(targetPath);
-    if (storagePath && settled(storagePath)) return;
+    if (settled(storagePath)) return;
     if (Date.now() > deadline) {
       logger.warn(
-        { targetPath },
+        { storagePath },
         'analyze finalization not visible after timeout; completing job anyway',
       );
       return;
@@ -151,13 +138,40 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
     // For waitForSettledIndex: files (re)written by this job have mtimes at or
     // after this instant. Taken before the fork so no worker write predates it.
     const jobStartMs = Date.now();
-    // Acquire shared repo lock (keyed on storagePath to match embed handler)
-    const analyzeLockKey = getStoragePath(targetPath);
+    // Capture the canonical lock key before the worker can remove or retarget
+    // the repository root. The same physical root is sent to every retry so a
+    // later symlink retarget cannot move the worker outside the held lock.
+    const lockedRepoPath = canonicalizePath(targetPath);
+    const lexicalStoragePath = getStoragePath(lockedRepoPath);
+    if (existsSync(lockedRepoPath) && !existsSync(lexicalStoragePath)) {
+      // A first analysis has no physical storage object to canonicalize. Make
+      // the directory exist before deriving the shared key so another writer
+      // cannot insert a storage symlink between key capture and worker mkdir.
+      mkdirSync(lexicalStoragePath, { recursive: true });
+    }
+    const analyzeLockKey = canonicalRepoLockKey(lockedRepoPath);
     const lockErr = acquireRepoLock(analyzeLockKey);
     if (lockErr) {
       jobManager.updateJob(job.id, { status: 'failed', error: lockErr });
       return;
     }
+
+    let lockReleased = false;
+    const releaseLock = (): void => {
+      if (lockReleased) return;
+      lockReleased = true;
+      releaseRepoLock(analyzeLockKey);
+    };
+    let terminalMessageReceived = false;
+
+    const failSynchronousLaunch = (err: unknown): void => {
+      releaseLock();
+      const message = err instanceof Error ? err.message : String(err);
+      jobManager.updateJob(job.id, {
+        status: 'failed',
+        error: `Worker process error: ${message}`,
+      });
+    };
 
     jobManager.updateJob(job.id, { repoPath: targetPath, status: 'analyzing' });
 
@@ -172,12 +186,31 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
 
     const forkWorker = () => {
       const currentJob = jobManager.getJob(job.id);
-      if (!currentJob || currentJob.status === 'complete' || currentJob.status === 'failed') return;
+      if (!currentJob || currentJob.status === 'complete' || currentJob.status === 'failed') {
+        releaseLock();
+        return;
+      }
 
       const child = fork(workerPath, [], {
         execArgv: [...tsxHookArgs, '--max-old-space-size=8192'],
         stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
       });
+      let childExited = false;
+      let terminalCleanupStarted = false;
+      let terminalCleanupComplete = false;
+      const maybeReleaseAfterTerminalCleanup = (): void => {
+        if (childExited && terminalCleanupComplete) releaseLock();
+      };
+      const finishTerminalCleanup = (cleanup: Promise<unknown>): void => {
+        if (terminalCleanupStarted) return;
+        terminalCleanupStarted = true;
+        void cleanup
+          .catch(() => {})
+          .then(() => {
+            terminalCleanupComplete = true;
+            maybeReleaseAfterTerminalCleanup();
+          });
+      };
 
       // Capture stderr for crash diagnostics
       let stderrChunks = '';
@@ -192,7 +225,14 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
         // re-release the repo lock or flip the reported status. Mirrors the `exit`
         // handler guard below; pairs with the worker's terminal-claim (#2264 P3).
         const current = jobManager.getJob(job.id);
-        if (!current || current.status === 'complete' || current.status === 'failed') return;
+        if (
+          !current ||
+          current.status === 'complete' ||
+          current.status === 'failed' ||
+          terminalMessageReceived
+        ) {
+          return;
+        }
 
         if (msg.type === 'progress') {
           jobManager.updateJob(job.id, {
@@ -200,7 +240,7 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
             progress: { phase: msg.phase, percent: msg.percent, message: msg.message },
           });
         } else if (msg.type === 'complete') {
-          releaseRepoLock(analyzeLockKey);
+          terminalMessageReceived = true;
           const terminalUpdate = completionUpdateForWorkerResult(msg.result);
           // Before recording the terminal result: (1) wait for the worker's on-disk
           // finalization to settle (see waitForSettledIndex), (2) evict the
@@ -216,40 +256,73 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
           // then fail the analyze request with explicit retry guidance.
           const settle = msg.result.recoveredPromotionOnly
             ? Promise.resolve()
-            : waitForSettledIndex(targetPath, jobStartMs);
-          settle
-            .then(() => closeDbHandle())
-            .catch(() => {}) // best-effort: eviction failure must not fail the job
-            .then(() => backend.init())
-            .then(() => {
-              jobManager.updateJob(job.id, terminalUpdate);
-            })
-            .catch((err) => {
-              logger.error({ err }, 'backend.init() failed after analyze:');
-              jobManager.updateJob(job.id, {
-                status: 'failed',
-                error: 'Server failed to reload after analysis. Try again.',
-              });
-            });
+            : waitForSettledIndex(analyzeLockKey, jobStartMs);
+          finishTerminalCleanup(
+            settle
+              .then(() => closeDbHandle())
+              .catch(() => {}) // best-effort: eviction failure must not fail the job
+              .then(() => backend.init())
+              .then(() => {
+                jobManager.updateJob(job.id, terminalUpdate);
+              })
+              .catch((err) => {
+                logger.error({ err }, 'backend.init() failed after analyze:');
+                jobManager.updateJob(job.id, {
+                  status: 'failed',
+                  error: 'Server failed to reload after analysis. Try again.',
+                });
+              }),
+          );
         } else if (msg.type === 'error') {
-          releaseRepoLock(analyzeLockKey);
+          terminalMessageReceived = true;
           // A failed (force) analyze may still have rewritten DB files first.
-          void closeDbHandle().catch(() => {});
+          finishTerminalCleanup(closeDbHandle());
           jobManager.updateJob(job.id, { status: 'failed', error: msg.message });
         }
       });
 
       child.on('error', (err) => {
-        releaseRepoLock(analyzeLockKey);
+        const current = jobManager.getJob(job.id);
+        // Cancellation marks the job failed before the child has finished its
+        // bounded shutdown checkpoint. Its exit event owns release in that case.
+        if (
+          !current ||
+          current.status === 'complete' ||
+          current.status === 'failed' ||
+          terminalMessageReceived
+        ) {
+          return;
+        }
+        terminalMessageReceived = true;
+        finishTerminalCleanup(closeDbHandle());
         jobManager.updateJob(job.id, {
           status: 'failed',
           error: `Worker process error: ${err.message}`,
         });
+        // An error event does not prove process exit (IPC and kill failures can
+        // emit it while the child is still alive). Retain the repository lock
+        // until `close`, and request termination so no analyzer survives the
+        // failed parent-side channel.
+        try {
+          child.kill('SIGTERM');
+        } catch {}
       });
 
-      child.on('exit', (code) => {
+      // `close` follows actual process termination (and also a failed spawn)
+      // after the stdio handles are closed. It is the sole event allowed to
+      // prove the child can no longer touch repository storage.
+      child.on('close', (code) => {
         const j = jobManager.getJob(job.id);
-        if (!j || j.status === 'complete' || j.status === 'failed') return;
+        childExited = true;
+        if (!j || j.status === 'complete' || j.status === 'failed') {
+          finishTerminalCleanup(closeDbHandle());
+          maybeReleaseAfterTerminalCleanup();
+          return;
+        }
+        if (terminalMessageReceived) {
+          maybeReleaseAfterTerminalCleanup();
+          return;
+        }
 
         // Worker crashed — attempt retry if under the limit
         if (j.retryCount < MAX_WORKER_RETRIES) {
@@ -269,10 +342,17 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
             },
           });
           stderrChunks = '';
-          setTimeout(forkWorker, delay);
+          setTimeout(() => {
+            try {
+              forkWorker();
+            } catch (err) {
+              failSynchronousLaunch(err);
+            }
+          }, delay);
         } else {
           // Exhausted retries — permanent failure
-          releaseRepoLock(analyzeLockKey);
+          terminalMessageReceived = true;
+          finishTerminalCleanup(closeDbHandle());
           jobManager.updateJob(job.id, {
             status: 'failed',
             error: `Worker crashed ${MAX_WORKER_RETRIES + 1} times (code ${code})${stderrChunks ? ': ' + stderrChunks.trim().split('\n').pop() : ''}`,
@@ -280,22 +360,47 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
         }
       });
 
-      // Register child for cancellation + timeout tracking
-      jobManager.registerChild(job.id, child);
+      try {
+        // Register child for cancellation + timeout tracking
+        jobManager.registerChild(job.id, child);
 
-      // Send start command to child
-      child.send({
-        type: 'start',
-        repoPath: targetPath,
-        options: {
-          force: !!opts.force,
-          embeddings: !!opts.embeddings,
-          dropEmbeddings: !!opts.dropEmbeddings,
-          ...(opts.registryName ? { registryName: opts.registryName } : {}),
-        },
-      });
+        // Send start command to child
+        child.send({
+          type: 'start',
+          repoPath: lockedRepoPath,
+          options: {
+            registryPath: targetPath,
+            // Keep every analyzer filesystem write on the same physical
+            // storage target whose shared repository lock is held. The repo's
+            // lexical `.gitnexus` path may be retargeted after acquisition.
+            analyzeStoragePath: analyzeLockKey,
+            force: !!opts.force,
+            embeddings: !!opts.embeddings,
+            dropEmbeddings: !!opts.dropEmbeddings,
+            ...(opts.registryName ? { registryName: opts.registryName } : {}),
+          },
+        });
+      } catch (err) {
+        // A child may exist even when IPC setup/send fails synchronously. Do
+        // not release the shared repository lock until `close` proves it can
+        // no longer analyze.
+        terminalMessageReceived = true;
+        finishTerminalCleanup(closeDbHandle());
+        const message = err instanceof Error ? err.message : String(err);
+        jobManager.updateJob(job.id, {
+          status: 'failed',
+          error: `Worker process error: ${message}`,
+        });
+        try {
+          child.kill('SIGTERM');
+        } catch {}
+      }
     };
 
-    forkWorker();
+    try {
+      forkWorker();
+    } catch (err) {
+      failSynchronousLaunch(err);
+    }
   };
 }

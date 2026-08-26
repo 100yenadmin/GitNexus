@@ -66,6 +66,7 @@ import { quarantineSidecarsForDirtyRecovery } from './lbug/sidecar-recovery.js';
 import {
   getStoragePaths,
   resolveBranchPlacement,
+  branchSlug,
   saveMeta,
   loadMeta,
   ensureGitNexusIgnored,
@@ -77,6 +78,8 @@ import {
   cleanupOldKuzuFiles,
   reconcileMetadataFiles,
   isMissingFilesystemError,
+  canonicalizePath,
+  registryPathEquals,
   INDEX_METADATA_FILE,
   INCREMENTAL_SCHEMA_VERSION,
   type RepoMeta,
@@ -177,6 +180,18 @@ export interface AnalyzeCallbacks {
 }
 
 export interface AnalyzeOptions {
+  /**
+   * Internal server-only display path. Filesystem work stays bound to the
+   * canonical `repoPath` argument while metadata and registry projections keep
+   * the stable path the operator registered.
+   */
+  registryPath?: string;
+  /**
+   * Internal server-only physical storage target captured before the shared
+   * repository lock is acquired. Never canonicalize this value again: doing
+   * so after a `.gitnexus` symlink retarget would escape the held lock.
+   */
+  analyzeStoragePath?: string;
   /**
    * Force a full re-index of the pipeline. Callers may OR this with
    * other flags that imply re-analysis (e.g. `--skills`), so the value
@@ -769,6 +784,14 @@ const runFullAnalysisImpl = async (
     callbacks.onProgress(phase, percent, message);
 
   const { repoHasGit, remoteUrl: repositoryRemoteUrl } = repositoryIdentity;
+  const persistedRepoPath = options.registryPath ?? repoPath;
+  const expectedPersistedCanonicalPath = canonicalizePath(repoPath);
+  const frozenRegistryIdentity = {
+    expectedCanonicalPath: expectedPersistedCanonicalPath,
+    ...(options.analyzeStoragePath
+      ? { expectedCanonicalStoragePath: options.analyzeStoragePath }
+      : {}),
+  };
 
   // Resolve + validate operator-provided FTS config once, before the expensive
   // parse/load phases. A typo fails here in ms; createSearchFTSIndexes reuses
@@ -795,7 +818,7 @@ const runFullAnalysisImpl = async (
   // `storagePath` is ALWAYS the flat `.gitnexus` — content-addressed caches
   // (parse-cache, parsedfile-store) and the kuzu-migration cleanup live there
   // and are shared across branches (#2106 KTD7).
-  const { storagePath } = getStoragePaths(repoPath);
+  const storagePath = options.analyzeStoragePath ?? getStoragePaths(repoPath).storagePath;
 
   const currentCommit = repoHasGit ? getCurrentCommit(repoPath) : '';
 
@@ -825,7 +848,23 @@ const runFullAnalysisImpl = async (
   });
   const branchLabel = options.branch ?? checkedOutBranch;
   const placement = options.branch ? await resolveBranchPlacement(repoPath, branchLabel) : {};
-  const canonicalPaths = getStoragePaths(repoPath, placement.branch);
+  const canonicalPaths = options.analyzeStoragePath
+    ? {
+        storagePath,
+        lbugPath: path.join(
+          placement.branch
+            ? path.join(storagePath, 'branches', branchSlug(placement.branch))
+            : storagePath,
+          'lbug',
+        ),
+        metaPath: path.join(
+          placement.branch
+            ? path.join(storagePath, 'branches', branchSlug(placement.branch))
+            : storagePath,
+          INDEX_METADATA_FILE,
+        ),
+      }
+    : getStoragePaths(repoPath, placement.branch);
   // Prevent a previous analyze in the same process from leaking its graph hint
   // into any pre-pipeline database open in this run.
   setBufferPoolSizeHint(undefined);
@@ -876,7 +915,9 @@ const runFullAnalysisImpl = async (
     saveMeta(metaDir, markPendingImplicitFlatAdoption(meta));
   const adoptAndRestampImplicitFlatBranch = async (meta: RepoMeta): Promise<RepoMeta> => {
     if (!implicitFlatBranch) return meta;
-    const outcome = await adoptFlatBranchLabel(repoPath, implicitFlatBranch);
+    const outcome = options.analyzeStoragePath
+      ? await adoptFlatBranchLabel(repoPath, implicitFlatBranch, storagePath)
+      : await adoptFlatBranchLabel(repoPath, implicitFlatBranch);
     if (outcome !== 'ADOPTED') {
       log(
         `Warning: workspace branch adoption returned ${outcome}; ` +
@@ -920,10 +961,11 @@ const runFullAnalysisImpl = async (
       ? markPendingImplicitFlatAdoption(meta)
       : preservePreAdoptionBranch(meta);
     await saveMeta(canonicalMetaDir, protectedMeta);
-    return registerRepo(repoPath, protectedMeta, {
+    return registerRepo(persistedRepoPath, protectedMeta, {
       name: options.registryName,
       allowDuplicateName: options.allowDuplicateName,
       branch: placement.branch,
+      ...frozenRegistryIdentity,
     });
   };
 
@@ -1171,7 +1213,7 @@ const runFullAnalysisImpl = async (
         // the stale marker, or the next repair/resume re-enters recovery.
         embeddingCheckpoint: undefined,
         incrementalInProgress: undefined,
-        repoPath,
+        repoPath: persistedRepoPath,
         remoteUrl: repositoryRemoteUrl ?? existingMeta.remoteUrl,
         stats: {
           ...existingMeta.stats,
@@ -1194,9 +1236,10 @@ const runFullAnalysisImpl = async (
       };
       repairedMeta = preservePreAdoptionBranch(repairedMeta);
       await saveMeta(canonicalMetaDir, repairedMeta);
-      projectName = await registerRepo(repoPath, repairedMeta, {
+      projectName = await registerRepo(persistedRepoPath, repairedMeta, {
         name: options.registryName,
         allowDuplicateName: options.allowDuplicateName,
+        ...frozenRegistryIdentity,
       });
     } finally {
       await closeLbug().catch(() => {});
@@ -3140,7 +3183,7 @@ const runFullAnalysisImpl = async (
         for (const [key, value] of newFileHashes) fileHashes[key] = value;
         await savePreAdoptionMeta(metaDir, {
           ...(existingMeta ?? {}),
-          repoPath,
+          repoPath: persistedRepoPath,
           lastCommit: currentCommit,
           indexedAt: new Date().toISOString(),
           branch: branchLabel ?? existingMeta?.branch,
@@ -3274,7 +3317,7 @@ const runFullAnalysisImpl = async (
     // literal widens the vectorSearch.status ternary to `string` and the
     // honesty contract silently decays to "whatever interpolates".
     const meta: RepoMeta = preservePreAdoptionBranch({
-      repoPath,
+      repoPath: persistedRepoPath,
       lastCommit: currentCommit,
       indexedAt: new Date().toISOString(),
       // Branch identity this index represents (#2106). Recorded for the flat
@@ -3439,10 +3482,11 @@ const runFullAnalysisImpl = async (
     } else {
       // Forward the --name alias and registry-collision bypass only after the
       // canonical DB is finalized. In staged mode this same commit is journaled.
-      projectName = await registerRepo(repoPath, metadataToCommit, {
+      projectName = await registerRepo(persistedRepoPath, metadataToCommit, {
         name: options.registryName,
         allowDuplicateName: options.allowDuplicateName,
         branch: placement.branch,
+        ...frozenRegistryIdentity,
       });
     }
 
@@ -3539,6 +3583,15 @@ export async function runFullAnalysis(
   options: AnalyzeOptions,
   callbacks: AnalyzeCallbacks,
 ): Promise<AnalyzeResult> {
+  if (
+    options.registryPath !== undefined &&
+    !registryPathEquals(canonicalizePath(options.registryPath), canonicalizePath(repoPath))
+  ) {
+    throw new Error('GitNexus: analyze display path changed before worker start');
+  }
+  if (options.analyzeStoragePath !== undefined && !path.isAbsolute(options.analyzeStoragePath)) {
+    throw new Error('GitNexus: analyze storage target must be absolute');
+  }
   if (options.incrementalOnly && options.dropEmbeddings) {
     throw new Error(
       'Cannot combine `--incremental-only` with `--drop-embeddings`. ' +
@@ -3571,7 +3624,7 @@ export async function runFullAnalysis(
   await assertCanonicalRepositoryIdentity(repoPath, repositoryRemoteUrl);
   if (options.repairVector) await assertVectorRepairPreflight(repoPath);
 
-  const { storagePath } = getStoragePaths(repoPath);
+  const storagePath = options.analyzeStoragePath ?? getStoragePaths(repoPath).storagePath;
   return withAnalyzeOwnershipLock(storagePath, async () => {
     // The first preflight avoids creating an ownership lock for a known-dirty
     // index. Repeat it after lock acquisition because a writer may have run

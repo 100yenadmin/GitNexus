@@ -1,7 +1,15 @@
 import http from 'node:http';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { EmbeddingIntegrityReport } from '../../src/core/lbug/lbug-adapter.js';
-import type { RegistryEntry, RepoMeta } from '../../src/storage/repo-manager.js';
+import {
+  canonicalizePath,
+  canonicalRepoLockKey,
+  type RegistryEntry,
+  type RepoMeta,
+} from '../../src/storage/repo-manager.js';
 import { escapeCypherString } from '../../src/core/lbug/cypher-escape.js';
 import { JobManager } from '../../src/server/analyze-job.js';
 
@@ -33,20 +41,21 @@ const makeIntegrity = (digest: string, physicalRows = 3): EmbeddingIntegrityRepo
   recoverableIdentitySha256: digest,
 });
 
-const makeMeta = (digest: string): RepoMeta => ({
-  repoPath: REPO.path,
+const makeMeta = (digest: string, repoPath = REPO.path, zeroCheckpoint = false): RepoMeta => ({
+  repoPath,
   lastCommit: REPO.lastCommit,
   indexedAt: REPO.indexedAt,
   stats: { embeddings: 3 },
   embeddingCheckpoint: {
     at: REPO.indexedAt,
-    nodesProcessed: 1,
-    totalNodes: 2,
+    nodesProcessed: zeroCheckpoint ? 0 : 1,
+    totalNodes: zeroCheckpoint ? 0 : 2,
     chunksProcessed: 3,
     ...identity,
-    physicalRows: 3,
-    validRows: 3,
-    recoverableIdentitySha256: digest,
+    provider: zeroCheckpoint ? undefined : identity.provider,
+    physicalRows: zeroCheckpoint ? undefined : 3,
+    validRows: zeroCheckpoint ? undefined : 3,
+    recoverableIdentitySha256: zeroCheckpoint ? undefined : digest,
     pendingNodeIds: [],
   },
 });
@@ -76,13 +85,31 @@ const state = {
   getActiveEmbeddingIdentity: vi.fn(() => identity),
   inspectEmbeddingIntegrity: vi.fn(async () => state.liveIntegrity),
   getStrictLbugStats: vi.fn(async () => ({ nodes: 4, edges: 5 })),
-  registerRepo: vi.fn(async () => REPO.name),
+  registerRepo: vi.fn(
+    async (
+      _repoPath?: string,
+      _meta?: RepoMeta,
+      options?: {
+        commitReceipt?: {
+          value?: { previousOwner: RegistryEntry | null; committedOwner: RegistryEntry };
+        };
+      },
+    ) => {
+      if (options?.commitReceipt) {
+        options.commitReceipt.value = { previousOwner: REPO, committedOwner: REPO };
+      }
+      return REPO.name;
+    },
+  ),
+  rollbackRegistryCommit: vi.fn(async () => undefined),
+  unregisterRepo: vi.fn(async () => undefined),
   saveMeta: vi.fn(async (_storagePath: string, next: RepoMeta) => {
     state.currentMeta = next;
   }),
   loadMeta: vi.fn(async () => state.currentMeta),
   listRegisteredRepos: vi.fn(async () => [REPO]),
   deleteHandlerStarted: undefined as (() => void) | undefined,
+  releaseAnalyzeLock: undefined as (() => void) | undefined,
 };
 
 const armDeleteHandlerSignal = (): Promise<void> =>
@@ -93,6 +120,30 @@ const armDeleteHandlerSignal = (): Promise<void> =>
     };
   });
 
+const prepareSymlinkRace = async (prefix: string) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
+  const targetA = path.join(root, 'canonical-a');
+  const targetB = path.join(root, 'canonical-b');
+  const alias = path.join(root, 'repo-alias');
+  await Promise.all([
+    fs.mkdir(path.join(targetA, '.gitnexus'), { recursive: true }),
+    fs.mkdir(path.join(targetB, '.gitnexus'), { recursive: true }),
+  ]);
+  await fs.symlink(targetA, alias, 'dir');
+  const raceRepo = { ...REPO, path: alias, storagePath: path.join(alias, '.gitnexus') };
+  state.currentMeta = makeMeta(LIVE_DIGEST, alias, true);
+  Object.assign(state, { liveIntegrity: makeIntegrity(LIVE_DIGEST, 0), graphNodes: [] });
+  return {
+    root,
+    alias,
+    raceRepo,
+    retarget: async () => {
+      await fs.unlink(alias);
+      await fs.symlink(targetB, alias, 'dir');
+    },
+  };
+};
+
 vi.doMock('../../src/storage/repo-manager.js', async () => ({
   ...(await vi.importActual<typeof import('../../src/storage/repo-manager.js')>(
     '../../src/storage/repo-manager.js',
@@ -100,6 +151,8 @@ vi.doMock('../../src/storage/repo-manager.js', async () => ({
   listRegisteredRepos: state.listRegisteredRepos,
   loadMeta: state.loadMeta,
   registerRepo: state.registerRepo,
+  rollbackRegistryCommit: state.rollbackRegistryCommit,
+  unregisterRepo: state.unregisterRepo,
   saveMeta: state.saveMeta,
 }));
 
@@ -139,7 +192,25 @@ vi.doMock('../../src/server/mcp-http.js', () => ({
   mountMCPEndpoints: () => async (): Promise<void> => {},
 }));
 vi.doMock('../../src/server/analyze-launch.js', () => ({
-  createLaunchAnalysisWorker: () => (): void => {},
+  createLaunchAnalysisWorker:
+    (deps: {
+      acquireRepoLock: (key: string) => string | null;
+      releaseRepoLock: (key: string) => void;
+      jobManager: JobManager;
+    }) =>
+    (job: { id: string }, targetPath: string): void => {
+      const key = canonicalRepoLockKey(targetPath);
+      const lockError = deps.acquireRepoLock(key);
+      if (lockError) {
+        deps.jobManager.updateJob(job.id, { status: 'failed', error: lockError });
+        return;
+      }
+      deps.jobManager.updateJob(job.id, { status: 'analyzing' });
+      state.releaseAnalyzeLock = () => {
+        deps.releaseRepoLock(key);
+        deps.jobManager.updateJob(job.id, { status: 'failed', error: 'test cleanup' });
+      };
+    },
 }));
 vi.doMock('../../src/server/analyze-upload.js', () => ({
   createAnalyzeUploadHandler: () => (_req: unknown, _res: unknown, next: () => void) => next(),
@@ -185,6 +256,61 @@ const waitForTerminalJob = async (baseUrl: string, jobId: string) => {
   throw new Error(`embedding job ${jobId} did not reach a terminal state`);
 };
 
+const runEmbedJob = async (baseUrl: string, repo: string) => {
+  const response = await fetch(`${baseUrl}/api/embed`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ repo }),
+  });
+  const { jobId } = (await response.json()) as { jobId: string };
+  return waitForTerminalJob(baseUrl, jobId);
+};
+
+const runSymlinkRace = async (
+  baseUrl: string,
+  fixture: Awaited<ReturnType<typeof prepareSymlinkRace>>,
+  error: RegExp,
+  assertSpecific: () => void,
+): Promise<void> => {
+  try {
+    const checkpointBefore = JSON.stringify(state.currentMeta.embeddingCheckpoint);
+    const job = await runEmbedJob(baseUrl, fixture.raceRepo.name);
+    expect(job.status).toBe('failed');
+    expect(job.error).toMatch(error);
+    assertSpecific();
+    expect(state.saveMeta).not.toHaveBeenCalled();
+    expect(JSON.stringify(state.currentMeta.embeddingCheckpoint)).toBe(checkpointBefore);
+    expect(state.currentMeta.repoPath).toBe(fixture.alias);
+  } finally {
+    await fs.rm(fixture.root, { recursive: true, force: true });
+  }
+};
+
+describe('canonical repository lock keys', () => {
+  it('captures the symlink target before the repository disappears', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-lock-key-'));
+    const target = path.join(root, 'real-repo');
+    const alias = path.join(root, 'repo-alias');
+    await fs.mkdir(path.join(target, '.gitnexus'), { recursive: true });
+    await fs.symlink(target, alias, 'dir');
+
+    try {
+      const canonicalTarget = await fs.realpath(target);
+      const captured = canonicalRepoLockKey(alias);
+      expect(captured).toBe(path.join(canonicalTarget, '.gitnexus'));
+
+      await fs.rm(target, { recursive: true, force: true });
+
+      // A recomputed key falls back to the now-dangling alias; the captured
+      // key remains the storage target that was actually locked.
+      expect(canonicalRepoLockKey(alias)).not.toBe(captured);
+      expect(captured).toBe(path.join(canonicalTarget, '.gitnexus'));
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('POST /api/embed completed-checkpoint identity', () => {
   let baseUrl = '';
   let shutdown: (() => Promise<void>) | undefined;
@@ -219,6 +345,8 @@ describe('POST /api/embed completed-checkpoint identity', () => {
   });
 
   beforeEach(() => {
+    state.releaseAnalyzeLock?.();
+    state.releaseAnalyzeLock = undefined;
     state.currentMeta = makeMeta(MISMATCHED_DIGEST);
     state.liveIntegrity = makeIntegrity(LIVE_DIGEST);
     state.graphNodes = [{ id: 'node-1' }];
@@ -236,7 +364,24 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     state.runEmbeddingPipeline.mockReset();
     state.runEmbeddingPipeline.mockResolvedValue(undefined);
     state.registerRepo.mockReset();
-    state.registerRepo.mockResolvedValue(REPO.name);
+    state.registerRepo.mockImplementation(
+      async (
+        _repoPath?: string,
+        _meta?: RepoMeta,
+        options?: {
+          commitReceipt?: {
+            value?: { previousOwner: RegistryEntry | null; committedOwner: RegistryEntry };
+          };
+        },
+      ) => {
+        if (options?.commitReceipt) {
+          options.commitReceipt.value = { previousOwner: REPO, committedOwner: REPO };
+        }
+        return REPO.name;
+      },
+    );
+    state.rollbackRegistryCommit.mockClear();
+    state.unregisterRepo.mockClear();
     state.saveMeta.mockClear();
     state.loadMeta.mockReset();
     state.loadMeta.mockImplementation(async () => state.currentMeta);
@@ -250,6 +395,28 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     getJobSpy.mockRestore();
     await shutdown?.();
     exitSpy.mockRestore();
+  });
+
+  it('releases the repository lock when embedding job admission throws', async () => {
+    const createJobSpy = vi.spyOn(JobManager.prototype, 'createJob').mockImplementationOnce(() => {
+      throw new Error('test admission failure');
+    });
+    const failedAdmission = await fetch(`${baseUrl}/api/embed`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ repo: REPO.name }),
+    });
+    expect(failedAdmission.status).toBe(500);
+    createJobSpy.mockRestore();
+
+    const retry = await fetch(`${baseUrl}/api/embed`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ repo: REPO.name }),
+    });
+    expect(retry.status).toBe(202);
+    const { jobId } = (await retry.json()) as { jobId: string };
+    await waitForTerminalJob(baseUrl, jobId);
   });
 
   it('rejects an equal-count different-digest completed window before the pipeline', async () => {
@@ -318,6 +485,30 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     expect(state.runEmbeddingPipeline).toHaveBeenCalledOnce();
     expect(state.currentMeta.stats?.embeddings).toBe(3);
     expect(state.currentMeta.embeddingCheckpoint).toBeUndefined();
+  });
+
+  it('fails ordinary completion when the owner retargets during terminal metadata save', async () => {
+    const fixture = await prepareSymlinkRace('gitnexus-issue269-ordinary-terminal-');
+    state.currentMeta = makeMeta(LIVE_DIGEST, fixture.alias);
+    state.liveIntegrity = makeIntegrity(LIVE_DIGEST, 3);
+    state.graphNodes = [{ id: 'node-1' }];
+    state.listRegisteredRepos.mockResolvedValue([fixture.raceRepo]);
+    state.saveMeta.mockImplementationOnce(async (_storagePath, next) => {
+      state.currentMeta = next;
+      await fixture.retarget();
+    });
+
+    try {
+      const job = await runEmbedJob(baseUrl, fixture.raceRepo.name);
+
+      expect(job.status).toBe('failed');
+      expect(job.error).toMatch(/path\/storage identity is non-absolute or mismatched/i);
+      expect(state.runEmbeddingPipeline).toHaveBeenCalledOnce();
+      expect(state.saveMeta).toHaveBeenCalledOnce();
+      expect(state.currentMeta.embeddingCheckpoint).toBeUndefined();
+    } finally {
+      await fs.rm(fixture.root, { recursive: true, force: true });
+    }
   });
 
   it('rejects a nonlegacy provider mismatch before writable Ladybug', async () => {
@@ -470,12 +661,15 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     expect(state.getStrictLbugStats.mock.invocationCallOrder[0]).toBeLessThan(
       state.listRegisteredRepos.mock.invocationCallOrder[1],
     );
-    expect(state.listRegisteredRepos).toHaveBeenCalledTimes(2);
+    expect(state.listRegisteredRepos).toHaveBeenCalledTimes(3);
     expect(state.listRegisteredRepos.mock.invocationCallOrder[1]).toBeLessThan(
       state.registerRepo.mock.invocationCallOrder[0],
     );
     expect(state.registerRepo.mock.invocationCallOrder[0]).toBeLessThan(
       state.saveMeta.mock.invocationCallOrder[0],
+    );
+    expect(state.saveMeta.mock.invocationCallOrder[0]).toBeLessThan(
+      state.listRegisteredRepos.mock.invocationCallOrder[2],
     );
     expect(state.registerRepo).toHaveBeenCalledWith(
       REPO.path,
@@ -483,11 +677,227 @@ describe('POST /api/embed completed-checkpoint identity', () => {
         stats: { nodes: 4, edges: 5, embeddings: 0 },
         embeddingCheckpoint: undefined,
       }),
-      { name: REPO.name, allowDuplicateName: true, expectedOwner: enrichedRepo },
+      {
+        name: REPO.name,
+        allowDuplicateName: true,
+        commitReceipt: expect.objectContaining({ value: expect.anything() }),
+        expectedOwner: expect.objectContaining({
+          ...enrichedRepo,
+          canonicalPath: enrichedRepo.path,
+          canonicalStoragePath: enrichedRepo.storagePath,
+        }),
+      },
     );
+    expect(state.saveMeta).toHaveBeenCalledWith(REPO.storagePath, expect.anything());
     expect(state.currentMeta.stats).toEqual({ nodes: 4, edges: 5, embeddings: 0 });
     expect(state.currentMeta.remoteUrl).toBeUndefined();
     expect(state.currentMeta.embeddingCheckpoint).toBeUndefined();
+  });
+
+  it('retains the checkpoint when the owner symlink retargets after registry commit', async () => {
+    const fixture = await prepareSymlinkRace('gitnexus-issue269-');
+    state.listRegisteredRepos.mockResolvedValue([fixture.raceRepo]);
+    state.registerRepo.mockImplementation(async (_repoPath, _meta, options) => {
+      if (options?.commitReceipt) {
+        options.commitReceipt.value = {
+          previousOwner: fixture.raceRepo,
+          committedOwner: fixture.raceRepo,
+        };
+      }
+      await fixture.retarget();
+      return fixture.raceRepo.name;
+    });
+
+    await runSymlinkRace(
+      baseUrl,
+      fixture,
+      /path\/storage identity is non-absolute or mismatched/i,
+      () => {
+        expect(state.registerRepo).toHaveBeenCalledOnce();
+        expect(state.rollbackRegistryCommit).toHaveBeenCalledOnce();
+      },
+    );
+  });
+
+  it('restores registry and metadata preimages when the owner retargets during a successful save', async () => {
+    const fixture = await prepareSymlinkRace('gitnexus-issue269-post-save-');
+    state.listRegisteredRepos.mockResolvedValue([fixture.raceRepo]);
+    const checkpointBefore = JSON.stringify(state.currentMeta.embeddingCheckpoint);
+    state.registerRepo.mockImplementation(async (_repoPath, _meta, options) => {
+      if (options?.commitReceipt) {
+        options.commitReceipt.value = {
+          previousOwner: fixture.raceRepo,
+          committedOwner: fixture.raceRepo,
+        };
+      }
+      return fixture.raceRepo.name;
+    });
+    state.saveMeta.mockImplementationOnce(async (_storagePath, next) => {
+      state.currentMeta = next;
+      await fixture.retarget();
+    });
+
+    try {
+      const job = await runEmbedJob(baseUrl, fixture.raceRepo.name);
+      expect(job.status).toBe('failed');
+      expect(job.error).toMatch(/path\/storage identity is non-absolute or mismatched/i);
+      expect(state.registerRepo).toHaveBeenCalledOnce();
+      expect(state.rollbackRegistryCommit).toHaveBeenCalledOnce();
+      expect(state.saveMeta).toHaveBeenCalledTimes(2);
+      expect(state.saveMeta).toHaveBeenNthCalledWith(
+        2,
+        expect.stringContaining(path.join('canonical-a', '.gitnexus')),
+        expect.objectContaining({ embeddingCheckpoint: expect.anything() }),
+      );
+      expect(JSON.stringify(state.currentMeta.embeddingCheckpoint)).toBe(checkpointBefore);
+      expect(state.currentMeta.repoPath).toBe(fixture.alias);
+    } finally {
+      await fs.rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it('uses one canonical lock to exclude embed and delete during symlinked analyze', async () => {
+    const fixture = await prepareSymlinkRace('gitnexus-issue269-shared-lock-');
+    state.listRegisteredRepos.mockResolvedValue([fixture.raceRepo]);
+    try {
+      const analyze = await fetch(`${baseUrl}/api/analyze`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ path: fixture.alias }),
+      });
+      expect(analyze.status).toBe(202);
+      await vi.waitFor(() => expect(state.releaseAnalyzeLock).toBeTypeOf('function'));
+
+      const embed = await fetch(`${baseUrl}/api/embed`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ repo: fixture.raceRepo.name }),
+      });
+      expect(embed.status).toBe(409);
+
+      const remove = await fetch(
+        `${baseUrl}/api/repo?repo=${encodeURIComponent(fixture.raceRepo.name)}`,
+        { method: 'DELETE' },
+      );
+      expect(remove.status).toBe(409);
+    } finally {
+      state.releaseAnalyzeLock?.();
+      state.releaseAnalyzeLock = undefined;
+      await fs.rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it('deletes only the lexical storage link while retaining its external target', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-issue269-delete-link-'));
+    const repoRoot = path.join(root, 'repo');
+    const externalStorage = path.join(root, 'external-storage');
+    const sentinel = path.join(externalStorage, 'sentinel.txt');
+    await fs.mkdir(repoRoot);
+    await fs.mkdir(externalStorage);
+    await fs.writeFile(sentinel, 'preserve');
+    await fs.symlink(externalStorage, path.join(repoRoot, '.gitnexus'), 'dir');
+    const entry = {
+      ...REPO,
+      path: repoRoot,
+      storagePath: path.join(repoRoot, '.gitnexus'),
+    };
+    state.listRegisteredRepos.mockResolvedValue([entry]);
+
+    try {
+      const response = await fetch(`${baseUrl}/api/repo?repo=${encodeURIComponent(entry.name)}`, {
+        method: 'DELETE',
+      });
+      expect(response.status).toBe(200);
+      await expect(fs.lstat(entry.storagePath)).rejects.toMatchObject({ code: 'ENOENT' });
+      await expect(fs.readFile(sentinel, 'utf8')).resolves.toBe('preserve');
+      expect(state.unregisterRepo).toHaveBeenCalledWith(repoRoot, {
+        expectedOwner: expect.objectContaining({
+          ...entry,
+          canonicalPath: canonicalizePath(repoRoot),
+          canonicalStoragePath: canonicalizePath(externalStorage),
+        }),
+      });
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses delete when the captured storage link is replaced by a directory', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-issue269-delete-replace-'));
+    const repoRoot = path.join(root, 'repo');
+    const externalStorage = path.join(root, 'external-storage');
+    const externalSentinel = path.join(externalStorage, 'preserved.txt');
+    const replacementSentinel = path.join(repoRoot, '.gitnexus', 'replacement.txt');
+    await fs.mkdir(repoRoot);
+    await fs.mkdir(externalStorage);
+    await fs.writeFile(externalSentinel, 'preserve external');
+    await fs.symlink(externalStorage, path.join(repoRoot, '.gitnexus'), 'dir');
+    const entry = {
+      ...REPO,
+      path: repoRoot,
+      storagePath: path.join(repoRoot, '.gitnexus'),
+    };
+    state.listRegisteredRepos.mockResolvedValue([entry]);
+    state.closeLbug.mockImplementationOnce(async () => {
+      await fs.unlink(entry.storagePath);
+      await fs.mkdir(entry.storagePath);
+      await fs.writeFile(replacementSentinel, 'preserve replacement');
+    });
+
+    try {
+      const response = await fetch(`${baseUrl}/api/repo?repo=${encodeURIComponent(entry.name)}`, {
+        method: 'DELETE',
+      });
+      const body = (await response.json()) as { error?: string };
+
+      expect(response.status).toBe(500);
+      expect(body.error).toMatch(/storage identity changed before deletion/i);
+      await expect(fs.readFile(externalSentinel, 'utf8')).resolves.toBe('preserve external');
+      await expect(fs.readFile(replacementSentinel, 'utf8')).resolves.toBe('preserve replacement');
+      expect(state.unregisterRepo).not.toHaveBeenCalled();
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a symlink retarget during zero-checkpoint preflight before registerRepo', async () => {
+    const fixture = await prepareSymlinkRace('gitnexus-issue269-preflight-');
+    let registryReads = 0;
+    state.listRegisteredRepos.mockImplementation(async () => {
+      registryReads += 1;
+      if (registryReads === 2) {
+        await fixture.retarget();
+      }
+      return [fixture.raceRepo];
+    });
+
+    await runSymlinkRace(
+      baseUrl,
+      fixture,
+      /path\/storage identity is non-absolute or mismatched/i,
+      () => {
+        expect(state.registerRepo).not.toHaveBeenCalled();
+      },
+    );
+  });
+
+  it('rejects a symlink retarget after DB work before the terminal owner helper', async () => {
+    const fixture = await prepareSymlinkRace('gitnexus-issue269-pre-helper-');
+    state.listRegisteredRepos.mockResolvedValue([fixture.raceRepo]);
+    state.getStrictLbugStats.mockImplementationOnce(async () => {
+      await fixture.retarget();
+      return { nodes: 4, edges: 5 };
+    });
+
+    await runSymlinkRace(
+      baseUrl,
+      fixture,
+      /path\/storage identity is non-absolute or mismatched/i,
+      () => {
+        expect(state.getStrictLbugStats).toHaveBeenCalledOnce();
+        expect(state.registerRepo).not.toHaveBeenCalled();
+      },
+    );
   });
 
   it.each<{ label: string; entries: RegistryEntry[]; error: RegExp }>([
