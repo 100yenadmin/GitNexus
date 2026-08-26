@@ -161,7 +161,7 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
       return;
     }
     const lexicalStoragePath = getStoragePath(lockedRepoPath);
-    const analyzeStorageLockKey = canonicalRepoLockKey(lockedRepoPath);
+    let analyzeStorageLockKey = canonicalRepoLockKey(lockedRepoPath);
     let ownershipLease: { release(): Promise<void> } | undefined;
     let storageLockHeld = false;
     let lockReleased = false;
@@ -447,6 +447,11 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
           // storage cannot race DELETE between materialization and worker start.
           mkdirSync(lexicalStoragePath, { recursive: true });
         }
+        // Storage may have been absent when ownership admission began, then
+        // materialized as a symlink while the companion was pending. Re-freeze
+        // its physical identity only after admission and carry that one target
+        // through the local lock, worker, finalization, and release paths.
+        analyzeStorageLockKey = canonicalRepoLockKey(lockedRepoPath);
         const storageLockErr = acquireRepoLock(analyzeStorageLockKey);
         if (storageLockErr) throw new Error(storageLockErr);
         storageLockHeld = true;

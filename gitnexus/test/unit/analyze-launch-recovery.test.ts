@@ -320,6 +320,54 @@ describe('analyze worker shared lock ownership', () => {
     }
   });
 
+  it('re-freezes first-analysis storage after ownership admission', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-first-analyze-retarget-'));
+    const repoRoot = path.join(root, 'repo');
+    const physicalStorage = path.join(root, 'physical-storage');
+    const retargetedStorage = path.join(root, 'retargeted-storage');
+    const lexicalStorage = path.join(repoRoot, '.gitnexus');
+    await fs.mkdir(repoRoot);
+    await fs.mkdir(physicalStorage);
+    await fs.mkdir(retargetedStorage);
+    try {
+      const { job, manager } = fakeJobManager();
+      const child = fakeChild();
+      launcherState.fork.mockReset().mockReturnValue(child.child);
+      const releaseRepoLock = vi.fn();
+      const deps = launchDeps(manager, releaseRepoLock);
+      deps.acquireAnalyzeOwnership.mockImplementationOnce(async (storagePath, ownerRoot) => {
+        const canonicalRoot = await fs.realpath(repoRoot);
+        expect(storagePath).toBe(path.join(canonicalRoot, '.gitnexus'));
+        expect(ownerRoot).toBe(canonicalRoot);
+        await fs.symlink(physicalStorage, lexicalStorage, 'dir');
+        return { release: deps.ownershipRelease };
+      });
+
+      createLaunchAnalysisWorker(deps)(job, repoRoot, {});
+      await waitForWorkerStart();
+
+      const canonicalStorage = await fs.realpath(physicalStorage);
+      expect(deps.acquireRepoLock).toHaveBeenNthCalledWith(2, canonicalStorage);
+      expect(child.child.send).toHaveBeenCalledWith(
+        expect.objectContaining({
+          options: expect.objectContaining({ analyzeStoragePath: canonicalStorage }),
+        }),
+      );
+
+      await fs.unlink(lexicalStorage);
+      await fs.symlink(retargetedStorage, lexicalStorage, 'dir');
+      child.emit('message', { type: 'error', message: 'test cleanup' });
+      child.emit('close', 0);
+      await vi.waitFor(() => expect(releaseRepoLock).toHaveBeenCalledOnce());
+      expect(releaseRepoLock).toHaveBeenCalledWith(
+        canonicalStorage,
+        canonicalRepoRootLockKey(repoRoot),
+      );
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it('refuses a delete-held root key before materializing first-analysis storage', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-delete-first-lock-'));
     const repoRoot = path.join(root, 'repo');
