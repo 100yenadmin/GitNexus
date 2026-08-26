@@ -115,6 +115,13 @@ interface StageLockRecord {
   startedAt: string;
 }
 
+export class AnalyzeOwnershipConflictError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'AnalyzeOwnershipConflictError';
+  }
+}
+
 const metaIdentity = (meta: RepoMeta): MetaIdentity => ({
   lastCommit: meta.lastCommit,
   indexedAt: meta.indexedAt,
@@ -332,6 +339,66 @@ const processIsAlive = (pid: number): boolean => {
   }
 };
 
+const validStageLockRecord = (value: unknown): value is StageLockRecord => {
+  const candidate = value as Partial<StageLockRecord> | null;
+  return (
+    !!candidate &&
+    candidate.schema === 'gitnexus.staged-analyze-lock/v1' &&
+    Number.isSafeInteger(candidate.pid) &&
+    (candidate.pid ?? 0) > 0 &&
+    typeof candidate.nonce === 'string' &&
+    candidate.nonce.length > 0 &&
+    typeof candidate.startedAt === 'string'
+  );
+};
+
+const sameStageLockRecord = (left: StageLockRecord, right: StageLockRecord): boolean =>
+  left.schema === right.schema &&
+  left.pid === right.pid &&
+  left.nonce === right.nonce &&
+  left.startedAt === right.startedAt;
+
+const reclaimStaleOwnershipLock = async (
+  lockPath: string,
+  observedOwner: StageLockRecord,
+  claimant: StageLockRecord,
+): Promise<boolean> => {
+  const recoveryPath = `${lockPath}.reclaim`;
+  let recoveryHandle: Awaited<ReturnType<typeof fs.open>> | undefined;
+  try {
+    recoveryHandle = await fs.open(recoveryPath, 'wx', 0o600);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
+      throw new AnalyzeOwnershipConflictError(
+        'Analyze lock recovery is already active; retry after the current owner releases it.',
+      );
+    }
+    throw error;
+  }
+
+  try {
+    await recoveryHandle.writeFile(`${JSON.stringify(claimant)}\n`, 'utf8');
+    await recoveryHandle.sync();
+    const current = await readJson<StageLockRecord>(lockPath).catch(() => undefined);
+    if (
+      !current ||
+      !validStageLockRecord(current) ||
+      !sameStageLockRecord(current, observedOwner) ||
+      processIsAlive(current.pid)
+    ) {
+      return false;
+    }
+    await fs.rm(lockPath);
+    return true;
+  } finally {
+    await recoveryHandle.close().catch(() => {});
+    const currentRecovery = await readJson<StageLockRecord>(recoveryPath).catch(() => undefined);
+    if (currentRecovery?.nonce === claimant.nonce) {
+      await fs.rm(recoveryPath, { force: true });
+    }
+  }
+};
+
 export interface AnalyzeOwnershipLockOptions {
   /** Frozen physical repository root shared by analyze, embed, and delete. */
   repoRoot?: string;
@@ -356,17 +423,28 @@ const withOwnershipFileLock = async <T>(
       break;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-      const owner = await readJson<StageLockRecord>(lockPath);
-      if (owner?.schema === record.schema && processIsAlive(owner.pid)) {
-        throw new Error(
+      const owner = await readJson<StageLockRecord>(lockPath).catch(() => undefined);
+      if (!owner || !validStageLockRecord(owner)) {
+        throw new AnalyzeOwnershipConflictError(
+          'Analyze ownership is initializing or unreadable; retry after verifying the current owner.',
+        );
+      }
+      if (processIsAlive(owner.pid)) {
+        throw new AnalyzeOwnershipConflictError(
           `Another analyze is active (pid ${owner.pid}, started ${owner.startedAt}).`,
         );
       }
-      if (attempt === 1) throw new Error('Could not reclaim the stale analyze lock');
-      await fs.rm(lockPath, { force: true });
+      if (attempt === 1) {
+        throw new AnalyzeOwnershipConflictError('Could not acquire the reclaimed analyze lock');
+      }
+      if (!(await reclaimStaleOwnershipLock(lockPath, owner, record))) {
+        throw new AnalyzeOwnershipConflictError(
+          'Analyze ownership changed during stale-lock recovery; retry.',
+        );
+      }
     }
   }
-  if (!handle) throw new Error('Could not acquire the analyze lock');
+  if (!handle) throw new AnalyzeOwnershipConflictError('Could not acquire the analyze lock');
   try {
     await handle.writeFile(`${JSON.stringify(record)}\n`, 'utf8');
     await handle.sync();
@@ -381,6 +459,8 @@ const withOwnershipFileLock = async <T>(
 const analyzeOwnershipCompanionPath = (repoRoot: string): string => {
   const canonicalRoot = canonicalizePath(repoRoot);
   const digest = createHash('sha256').update(canonicalRoot).digest('hex').slice(0, 32);
+  // GITNEXUS_HOME is the managed writer namespace. Runtime admission must
+  // prevent differently configured homes from mutating one repository.
   return path.join(path.resolve(getGlobalDir()), 'locks', `analyze-${digest}.lock`);
 };
 

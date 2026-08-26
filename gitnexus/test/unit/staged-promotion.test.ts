@@ -3,6 +3,7 @@ import fs from 'fs/promises';
 import os from 'os';
 import path from 'path';
 import {
+  AnalyzeOwnershipConflictError,
   getStagedAnalyzePaths,
   prepareStagedWorkspace,
   promoteStagedGeneration,
@@ -417,9 +418,8 @@ describe('common analyze ownership lock', () => {
           release = resolve;
         }),
     );
-    await vi.waitFor(async () => {
-      await expect(fs.access(path.join(root, 'analyze-staged.lock'))).resolves.toBeUndefined();
-    });
+    await vi.waitFor(() => expect(release).toBeTypeOf('function'));
+    await expect(fs.access(path.join(root, 'analyze-staged.lock'))).resolves.toBeUndefined();
 
     await expect(withAnalyzeOwnershipLock(root, async () => undefined)).rejects.toThrow(
       'Another analyze is active',
@@ -445,6 +445,60 @@ describe('common analyze ownership lock', () => {
     await expect(fs.access(path.join(root, 'analyze-staged.lock'))).rejects.toMatchObject({
       code: 'ENOENT',
     });
+    await expect(fs.access(path.join(root, 'analyze-staged.lock.reclaim'))).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+  });
+
+  it('admits exactly one contender when reclaiming the same stale lock', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-stage-lock-race-'));
+    tempDirs.push(root);
+    const lockPath = path.join(root, 'analyze-staged.lock');
+    await fs.writeFile(
+      lockPath,
+      `${JSON.stringify({
+        schema: 'gitnexus.staged-analyze-lock/v1',
+        pid: 2_147_483_647,
+        nonce: 'dead-owner',
+        startedAt: '2026-07-20T00:00:00.000Z',
+      })}\n`,
+    );
+
+    let release!: () => void;
+    const releaseGate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let entered = 0;
+    const contender = () =>
+      withAnalyzeOwnershipLock(root, async () => {
+        entered += 1;
+        await releaseGate;
+      });
+    const attempts = [contender(), contender()];
+
+    try {
+      const firstSettled = await Promise.race(
+        attempts.map((attempt) =>
+          attempt.then(
+            () => ({ status: 'fulfilled' as const }),
+            (error: unknown) => ({ status: 'rejected' as const, error }),
+          ),
+        ),
+      );
+      expect(firstSettled.status).toBe('rejected');
+      if (firstSettled.status === 'rejected') {
+        expect(firstSettled.error).toBeInstanceOf(AnalyzeOwnershipConflictError);
+      }
+      await vi.waitFor(() => expect(entered).toBe(1));
+    } finally {
+      release();
+    }
+
+    const settled = await Promise.allSettled(attempts);
+    expect(settled.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
+    expect(settled.filter((result) => result.status === 'rejected')).toHaveLength(1);
+    await expect(fs.access(lockPath)).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(fs.access(`${lockPath}.reclaim`)).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
   it('retains ownership after storage is detached without recreating absent storage', async () => {

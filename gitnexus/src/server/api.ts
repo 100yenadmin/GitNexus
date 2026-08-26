@@ -70,7 +70,10 @@ import { assertCompletedCheckpointIdentity } from '../core/embeddings/checkpoint
 import type { EmbeddingIdentity } from '../core/embeddings/embedding-identity.js';
 import { EMBEDDABLE_LABELS } from '../core/embeddings/types.js';
 import { escapeCypherString } from '../core/lbug/cypher-escape.js';
-import { withAnalyzeOwnershipLock } from '../core/staged-promotion.js';
+import {
+  AnalyzeOwnershipConflictError,
+  withAnalyzeOwnershipLock,
+} from '../core/staged-promotion.js';
 
 const _require = createRequire(import.meta.url);
 const pkg = _require('../../package.json');
@@ -1529,7 +1532,9 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         releaseRepoLock(storageLockKey, rootLockKey);
       }
     } catch (err: any) {
-      res.status(500).json({ error: err.message || 'Failed to delete repo' });
+      res
+        .status(err instanceof AnalyzeOwnershipConflictError ? 409 : 500)
+        .json({ error: err.message || 'Failed to delete repo' });
     }
   });
 

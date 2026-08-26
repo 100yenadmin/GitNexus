@@ -895,7 +895,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
           );
           const body = (await blocked.json()) as { error?: string };
 
-          expect(blocked.status).toBe(500);
+          expect(blocked.status).toBe(409);
           expect(body.error).toMatch(/another analyze is active/i);
           await expect(fs.readFile(sentinel, 'utf8')).resolves.toBe('preserve');
           expect(state.unregisterRepo).not.toHaveBeenCalled();
