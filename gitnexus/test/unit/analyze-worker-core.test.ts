@@ -80,18 +80,33 @@ describe('runWorkerAnalysis — finalize guard (#2264 P2)', () => {
   it('finalizes against the physical storage target captured by the launcher', async () => {
     const send = vi.fn<(msg: WorkerMessage) => void>();
     const finalize = vi.fn<WorkerAnalysisDeps['assertAnalysisFinalized']>(async () => undefined);
+    const run = vi.fn<WorkerAnalysisDeps['runFullAnalysis']>(async () => baseResult);
 
     await runWorkerAnalysis(
       '/repo',
-      { analyzeStoragePath: '/storage-a' },
       {
-        runFullAnalysis: okRun,
+        analyzeStoragePath: '/storage-a',
+        registryPath: '/registry/repo',
+      },
+      {
+        runFullAnalysis: run,
         assertAnalysisFinalized: finalize,
         send,
         claimTerminal: alwaysClaim,
       },
+      { parentAnalyzeOwnershipHeld: true },
     );
 
+    expect(run).toHaveBeenCalledWith(
+      '/repo',
+      expect.objectContaining({
+        analyzeStoragePath: '/storage-a',
+        registryPath: '/registry/repo',
+        skipNativeCloseOnExit: true,
+      }),
+      expect.any(Object),
+      { parentAnalyzeOwnershipHeld: true },
+    );
     expect(finalize).toHaveBeenCalledWith('/repo', '/storage-a');
     expect(send).toHaveBeenCalledWith(expect.objectContaining({ type: 'complete' }));
   });

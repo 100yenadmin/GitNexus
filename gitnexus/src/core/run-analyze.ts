@@ -3578,11 +3578,25 @@ const runFullAnalysisImpl = async (
   }
 };
 
+type AnalyzeInternalContext = {
+  /** The server parent owns the frozen storage/root lease through finalization. */
+  parentAnalyzeOwnershipHeld?: boolean;
+};
+
 export async function runFullAnalysis(
   repoPath: string,
   options: AnalyzeOptions,
   callbacks: AnalyzeCallbacks,
+  internal: AnalyzeInternalContext = {},
 ): Promise<AnalyzeResult> {
+  if (
+    internal.parentAnalyzeOwnershipHeld &&
+    (!options.analyzeStoragePath || !options.registryPath)
+  ) {
+    throw new Error(
+      'Parent-held analyze ownership requires frozen analyzeStoragePath and registryPath.',
+    );
+  }
   if (
     options.registryPath !== undefined &&
     !registryPathEquals(canonicalizePath(options.registryPath), canonicalizePath(repoPath))
@@ -3625,20 +3639,22 @@ export async function runFullAnalysis(
   if (options.repairVector) await assertVectorRepairPreflight(repoPath);
 
   const storagePath = options.analyzeStoragePath ?? getStoragePaths(repoPath).storagePath;
-  return withAnalyzeOwnershipLock(
-    storagePath,
-    async () => {
-      // The first preflight avoids creating an ownership lock for a known-dirty
-      // index. Repeat it after lock acquisition because a writer may have run
-      // while this command was waiting and left new recovery or dirty state.
-      if (options.repairVector) {
-        await assertVectorRepairPreflight(repoPath, { allowAnalyzeOwnershipLock: true });
-      }
-      return runFullAnalysisImpl(repoPath, options, callbacks, {
-        repoHasGit,
-        remoteUrl: repositoryRemoteUrl,
-      });
-    },
-    { repoRoot: repoPath },
-  );
+  const runWithOwnedStorage = async (): Promise<AnalyzeResult> => {
+    // The first preflight avoids creating an ownership lock for a known-dirty
+    // index. Repeat it after lock acquisition because a writer may have run
+    // while this command was waiting and left new recovery or dirty state.
+    if (options.repairVector) {
+      await assertVectorRepairPreflight(repoPath, { allowAnalyzeOwnershipLock: true });
+    }
+    return runFullAnalysisImpl(repoPath, options, callbacks, {
+      repoHasGit,
+      remoteUrl: repositoryRemoteUrl,
+    });
+  };
+
+  if (internal.parentAnalyzeOwnershipHeld) {
+    return runWithOwnedStorage();
+  }
+
+  return withAnalyzeOwnershipLock(storagePath, runWithOwnedStorage, { repoRoot: repoPath });
 }

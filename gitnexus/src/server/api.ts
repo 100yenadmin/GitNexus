@@ -1197,6 +1197,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
     backend,
     acquireRepoLock,
     releaseRepoLock,
+    acquireAnalyzeOwnership: acquireLbugOwnership,
     closeDbHandle: closeLbug,
   });
 
