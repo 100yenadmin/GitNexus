@@ -383,7 +383,9 @@ const readProcessStartIdentity = async (pid: number): Promise<string | undefined
   }
 
   try {
-    const { stdout } = await execFileAsync('ps', ['-o', 'lstart=', '-p', String(pid)]);
+    const { stdout } = await execFileAsync('ps', ['-o', 'lstart=', '-p', String(pid)], {
+      env: { ...process.env, LC_ALL: 'C', LANG: 'C', TZ: 'UTC' },
+    });
     const value = stdout.trim();
     return value ? `${process.platform}:${value}` : undefined;
   } catch (error) {
@@ -436,6 +438,12 @@ interface RecoveryClaim {
   nonce: string;
 }
 
+interface LegacyRecoveryLease {
+  path: string;
+  handle: Awaited<ReturnType<typeof fs.open>>;
+  claimant: StageLockRecord;
+}
+
 const activeRecoveryPaths = new Set<string>();
 
 const recoveryClaimPrefix = (lockPath: string): string => `${path.basename(lockPath)}.reclaim.`;
@@ -459,6 +467,41 @@ const assertNoLegacyRecoveryMarker = async (lockPath: string): Promise<void> => 
     throw new AnalyzeOwnershipConflictError(
       `A legacy analyze recovery is active at ${legacyPath}; retry after it completes.`,
     );
+  }
+};
+
+const acquireLegacyRecoveryLease = async (
+  lockPath: string,
+  claimant: StageLockRecord,
+): Promise<LegacyRecoveryLease> => {
+  const recoveryPath = `${lockPath}.reclaim`;
+  let handle: Awaited<ReturnType<typeof fs.open>>;
+  try {
+    handle = await fs.open(recoveryPath, 'wx', 0o600);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
+      throw new AnalyzeOwnershipConflictError(
+        'Analyze lock recovery is already active; retry after the current owner releases it.',
+      );
+    }
+    throw error;
+  }
+  try {
+    await handle.writeFile(`${JSON.stringify(claimant)}\n`, 'utf8');
+    await handle.sync();
+    return { path: recoveryPath, handle, claimant };
+  } catch (error) {
+    await handle.close().catch(() => {});
+    await fs.rm(recoveryPath, { force: true }).catch(() => {});
+    throw error;
+  }
+};
+
+const releaseLegacyRecoveryLease = async (lease: LegacyRecoveryLease): Promise<void> => {
+  await lease.handle.close().catch(() => {});
+  const current = await readJson<StageLockRecord>(lease.path).catch(() => undefined);
+  if (current && validStageLockRecord(current) && sameStageLockRecord(current, lease.claimant)) {
+    await fs.rm(lease.path, { force: true });
   }
 };
 
@@ -499,7 +542,12 @@ const listRecoveryClaims = async (lockPath: string): Promise<RecoveryClaim[]> =>
 const clearRecoveryClaims = async (lockPath: string): Promise<void> => {
   await assertNoLegacyRecoveryMarker(lockPath);
   for (const claim of await listRecoveryClaims(lockPath)) {
-    if ((await processStartToken(claim.pid)) === claim.processStartToken) {
+    const liveStartToken = await processStartToken(claim.pid).catch(() => {
+      throw new AnalyzeOwnershipConflictError(
+        `Could not verify analyze recovery owner pid ${claim.pid}; retry after verifying no writer is active.`,
+      );
+    });
+    if (liveStartToken === claim.processStartToken) {
       throw new AnalyzeOwnershipConflictError(
         `Analyze lock recovery is active (pid ${claim.pid}); retry after it completes.`,
       );
@@ -541,17 +589,23 @@ const reclaimStaleOwnershipLock = async (
   observedOwner: StageLockRecord,
   claimant: StageLockRecord,
   claimantStartToken: string,
-): Promise<boolean> => {
+): Promise<LegacyRecoveryLease | false> => {
   if (activeRecoveryPaths.has(lockPath)) {
     throw new AnalyzeOwnershipConflictError('Analyze lock recovery is already active; retry.');
   }
   activeRecoveryPaths.add(lockPath);
   const claimPath = recoveryClaimPath(lockPath, claimant, claimantStartToken);
+  let legacyLease: LegacyRecoveryLease | undefined;
+  let keepLegacyLease = false;
   try {
+    legacyLease = await acquireLegacyRecoveryLease(lockPath, claimant);
     try {
       await fs.link(lockPath, claimPath);
     } catch (error) {
-      if (isMissingFilesystemError(error)) return true;
+      if (isMissingFilesystemError(error)) {
+        keepLegacyLease = true;
+        return legacyLease;
+      }
       throw error;
     }
 
@@ -586,11 +640,13 @@ const reclaimStaleOwnershipLock = async (
           if (!isMissingFilesystemError(error)) throw error;
         }
       }
-      return true;
+      keepLegacyLease = true;
+      return legacyLease;
     } finally {
       await fs.rm(claimPath, { force: true });
     }
   } finally {
+    if (legacyLease && !keepLegacyLease) await releaseLegacyRecoveryLease(legacyLease);
     activeRecoveryPaths.delete(lockPath);
   }
 };
@@ -612,49 +668,68 @@ const withOwnershipFileLock = async <T>(
     nonce: randomBytes(16).toString('hex'),
     startedAt: new Date().toISOString(),
   };
-  const claimantStartToken = await getCurrentProcessStartToken();
   let handle: Awaited<ReturnType<typeof fs.open>> | undefined;
-  for (let attempt = 0; attempt < 2; attempt++) {
-    await clearRecoveryClaims(lockPath);
-    try {
-      handle = await fs.open(lockPath, 'wx', 0o600);
-      break;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-      const owner = await readJson<StageLockRecord>(lockPath).catch(() => undefined);
-      if (!owner || !validStageLockRecord(owner)) {
-        throw new AnalyzeOwnershipConflictError(
-          'Analyze ownership is initializing or unreadable; retry after verifying the current owner.',
+  let legacyLease: LegacyRecoveryLease | undefined;
+  try {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      if (!legacyLease) await clearRecoveryClaims(lockPath);
+      try {
+        handle = await fs.open(lockPath, 'wx', 0o600);
+        break;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+        const owner = await readJson<StageLockRecord>(lockPath).catch(() => undefined);
+        if (!owner || !validStageLockRecord(owner)) {
+          throw new AnalyzeOwnershipConflictError(
+            'Analyze ownership is initializing or unreadable; retry after verifying the current owner.',
+          );
+        }
+        if (processIsAlive(owner.pid)) {
+          throw new AnalyzeOwnershipConflictError(
+            `Another analyze is active (pid ${owner.pid}, started ${owner.startedAt}).`,
+          );
+        }
+        if (attempt === 1) {
+          throw new AnalyzeOwnershipConflictError('Could not acquire the reclaimed analyze lock');
+        }
+        const claimantStartToken = await getCurrentProcessStartToken().catch(() => {
+          throw new AnalyzeOwnershipConflictError(
+            'Could not establish process identity for stale-lock recovery; retry after verifying no writer is active.',
+          );
+        });
+        const reclaimed = await reclaimStaleOwnershipLock(
+          lockPath,
+          owner,
+          record,
+          claimantStartToken,
         );
-      }
-      if (processIsAlive(owner.pid)) {
-        throw new AnalyzeOwnershipConflictError(
-          `Another analyze is active (pid ${owner.pid}, started ${owner.startedAt}).`,
-        );
-      }
-      if (attempt === 1) {
-        throw new AnalyzeOwnershipConflictError('Could not acquire the reclaimed analyze lock');
-      }
-      if (!(await reclaimStaleOwnershipLock(lockPath, owner, record, claimantStartToken))) {
-        throw new AnalyzeOwnershipConflictError(
-          'Analyze ownership changed during stale-lock recovery; retry.',
-        );
+        if (!reclaimed) {
+          throw new AnalyzeOwnershipConflictError(
+            'Analyze ownership changed during stale-lock recovery; retry.',
+          );
+        }
+        legacyLease = reclaimed;
       }
     }
-  }
-  if (!handle) throw new AnalyzeOwnershipConflictError('Could not acquire the analyze lock');
-  try {
+    if (!handle) throw new AnalyzeOwnershipConflictError('Could not acquire the analyze lock');
     await handle.writeFile(`${JSON.stringify(record)}\n`, 'utf8');
     await handle.sync();
+    if (legacyLease) {
+      await releaseLegacyRecoveryLease(legacyLease);
+      legacyLease = undefined;
+    }
     // A contender that observed the prior stale owner may have linked it just
     // before this owner replaced the main path. Clear only safe stale claims;
     // any ambiguous claim keeps this owner out of the callback.
     await clearRecoveryClaims(lockPath);
     return await operation();
   } finally {
-    await handle.close().catch(() => {});
-    const current = await readJson<StageLockRecord>(lockPath).catch(() => undefined);
-    if (current?.nonce === record.nonce) await fs.rm(lockPath, { force: true });
+    if (legacyLease) await releaseLegacyRecoveryLease(legacyLease);
+    if (handle) {
+      await handle.close().catch(() => {});
+      const current = await readJson<StageLockRecord>(lockPath).catch(() => undefined);
+      if (current?.nonce === record.nonce) await fs.rm(lockPath, { force: true });
+    }
   }
 };
 

@@ -1,4 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { execFileSync } from 'child_process';
+import { createHash } from 'crypto';
 import fs from 'fs/promises';
 import os from 'os';
 import path from 'path';
@@ -453,7 +455,25 @@ describe('common analyze ownership lock', () => {
     await expect(fs.access(path.join(root, 'analyze-staged.lock'))).rejects.toMatchObject({
       code: 'ENOENT',
     });
+    await expect(fs.access(path.join(root, 'analyze-staged.lock.reclaim'))).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
     expect(await recoveryEntries(path.join(root, 'analyze-staged.lock'))).toEqual([]);
+  });
+
+  it('does not require process-start identity for an uncontended acquisition', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-stage-lock-uncontended-'));
+    tempDirs.push(root);
+    const readFileSpy = vi.spyOn(fs, 'readFile');
+
+    await expect(withAnalyzeOwnershipLock(root, async () => 'ok')).resolves.toBe('ok');
+
+    if (process.platform === 'linux') {
+      expect(
+        readFileSpy.mock.calls.some(([target]) => String(target) === `/proc/${process.pid}/stat`),
+      ).toBe(false);
+    }
+    readFileSpy.mockRestore();
   });
 
   it('admits exactly one contender when reclaiming the same stale lock', async () => {
@@ -530,6 +550,9 @@ describe('common analyze ownership lock', () => {
     });
     try {
       await paused;
+      await expect(fs.open(`${lockPath}.reclaim`, 'wx', 0o600)).rejects.toMatchObject({
+        code: 'EEXIST',
+      });
       await expect(withAnalyzeOwnershipLock(root, async () => undefined)).rejects.toThrow(
         /recovery is active/i,
       );
@@ -541,7 +564,28 @@ describe('common analyze ownership lock', () => {
     await reclaimer;
     expect(entered).toBe(1);
     await expect(fs.access(lockPath)).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(fs.access(`${lockPath}.reclaim`)).rejects.toMatchObject({ code: 'ENOENT' });
     expect(await recoveryEntries(lockPath)).toEqual([]);
+  });
+
+  it('uses a timezone-independent claimant identity on macOS', async () => {
+    if (process.platform !== 'darwin') return;
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-stage-lock-timezone-'));
+    tempDirs.push(root);
+    const lockPath = path.join(root, 'analyze-staged.lock');
+    await writeDeadAnalyzeLock(lockPath);
+    const startIdentity = execFileSync('ps', ['-o', 'lstart=', '-p', String(process.pid)], {
+      encoding: 'utf8',
+      env: { ...process.env, LC_ALL: 'C', LANG: 'C', TZ: 'UTC' },
+    }).trim();
+    const token = createHash('sha256').update(`darwin:${startIdentity}`).digest('hex').slice(0, 24);
+    await fs.link(lockPath, `${lockPath}.reclaim.${process.pid}.${token}.deadca11`);
+    await fs.rm(lockPath);
+    vi.stubEnv('TZ', 'America/New_York');
+
+    await expect(withAnalyzeOwnershipLock(root, async () => undefined)).rejects.toThrow(
+      /recovery is active/i,
+    );
   });
 
   it('recovers a dead hard-link claim left before stale-main removal', async () => {
