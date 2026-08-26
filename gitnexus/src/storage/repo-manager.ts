@@ -1519,6 +1519,8 @@ export const registerRepo = async (
         matches.length !== 1 ||
         !match ||
         match.owner.name !== expected.name ||
+        match.owner.path !== expected.path ||
+        match.owner.storagePath !== expected.storagePath ||
         normalizeRepositoryRemote(match.owner.remoteUrl) !==
           normalizeRepositoryRemote(expected.remoteUrl) ||
         match.owner.branch !== expected.branch ||

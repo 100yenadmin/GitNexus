@@ -1306,6 +1306,37 @@ describe('registerRepo expected owner CAS (#264)', () => {
     expect(saved).not.toHaveProperty('canonicalStoragePath');
   });
 
+  it('rejects same-target raw path or storage drift without changing registry bytes', async () => {
+    const target = path.join(tmpHome.dbPath, 'raw-owner-target');
+    const aliasA = path.join(tmpHome.dbPath, 'raw-owner-a');
+    const aliasB = path.join(tmpHome.dbPath, 'raw-owner-b');
+    await fs.mkdir(path.join(target, '.gitnexus'), { recursive: true });
+    await fs.symlink(target, aliasA, 'dir');
+    await fs.symlink(target, aliasB, 'dir');
+    const expected: RegistryEntry = {
+      ...owner(),
+      path: aliasA,
+      storagePath: path.join(aliasA, '.gitnexus'),
+    };
+    const registryPath = path.join(tmpHome.dbPath, 'registry.json');
+
+    for (const changed of [
+      { ...expected, path: aliasB },
+      { ...expected, storagePath: path.join(aliasB, '.gitnexus') },
+    ]) {
+      const before = JSON.stringify([changed], null, 2);
+      await fs.writeFile(registryPath, before);
+      await expect(
+        registerRepo(
+          aliasA,
+          { ...meta('new'), repoPath: aliasA },
+          { expectedOwner: frozenOwner(expected) },
+        ),
+      ).rejects.toThrow(casError);
+      expect(await fs.readFile(registryPath, 'utf8')).toBe(before);
+    }
+  });
+
   it('rejects a preserved display path that retargets away from its frozen root', async () => {
     const targetA = path.join(tmpHome.dbPath, 'display-a');
     const targetB = path.join(tmpHome.dbPath, 'display-b');
