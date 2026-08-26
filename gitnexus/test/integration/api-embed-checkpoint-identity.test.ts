@@ -7,6 +7,7 @@ import type { EmbeddingIntegrityReport } from '../../src/core/lbug/lbug-adapter.
 import {
   canonicalizePath,
   canonicalRepoLockKey,
+  canonicalRepoRootLockKey,
   type RegistryEntry,
   type RepoMeta,
 } from '../../src/storage/repo-manager.js';
@@ -194,20 +195,27 @@ vi.doMock('../../src/server/mcp-http.js', () => ({
 vi.doMock('../../src/server/analyze-launch.js', () => ({
   createLaunchAnalysisWorker:
     (deps: {
-      acquireRepoLock: (key: string) => string | null;
-      releaseRepoLock: (key: string) => void;
+      acquireRepoLock: (...keys: string[]) => string | null;
+      releaseRepoLock: (...keys: string[]) => void;
       jobManager: JobManager;
     }) =>
     (job: { id: string }, targetPath: string): void => {
-      const key = canonicalRepoLockKey(targetPath);
-      const lockError = deps.acquireRepoLock(key);
-      if (lockError) {
-        deps.jobManager.updateJob(job.id, { status: 'failed', error: lockError });
+      const rootKey = canonicalRepoRootLockKey(targetPath);
+      const rootLockError = deps.acquireRepoLock(rootKey);
+      if (rootLockError) {
+        deps.jobManager.updateJob(job.id, { status: 'failed', error: rootLockError });
+        return;
+      }
+      const storageKey = canonicalRepoLockKey(targetPath);
+      const storageLockError = deps.acquireRepoLock(storageKey);
+      if (storageLockError) {
+        deps.releaseRepoLock(rootKey);
+        deps.jobManager.updateJob(job.id, { status: 'failed', error: storageLockError });
         return;
       }
       deps.jobManager.updateJob(job.id, { status: 'analyzing' });
       state.releaseAnalyzeLock = () => {
-        deps.releaseRepoLock(key);
+        deps.releaseRepoLock(storageKey, rootKey);
         deps.jobManager.updateJob(job.id, { status: 'failed', error: 'test cleanup' });
       };
     },
@@ -381,7 +389,8 @@ describe('POST /api/embed completed-checkpoint identity', () => {
       },
     );
     state.rollbackRegistryCommit.mockClear();
-    state.unregisterRepo.mockClear();
+    state.unregisterRepo.mockReset();
+    state.unregisterRepo.mockResolvedValue(undefined);
     state.saveMeta.mockClear();
     state.loadMeta.mockReset();
     state.loadMeta.mockImplementation(async () => state.currentMeta);
@@ -809,6 +818,58 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     }
   });
 
+  it('refuses reverse-order analyze after delete detaches symlinked storage', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-delete-first-analyze-'));
+    const repoRoot = path.join(root, 'repo');
+    const externalStorage = path.join(root, 'external-storage');
+    const sentinel = path.join(externalStorage, 'sentinel.txt');
+    await fs.mkdir(repoRoot);
+    await fs.mkdir(externalStorage);
+    await fs.writeFile(sentinel, 'preserve');
+    await fs.symlink(externalStorage, path.join(repoRoot, '.gitnexus'), 'dir');
+    const entry = {
+      ...REPO,
+      path: repoRoot,
+      storagePath: path.join(repoRoot, '.gitnexus'),
+    };
+    state.listRegisteredRepos.mockResolvedValue([entry]);
+    let finishUnregister!: () => void;
+    const unregisterGate = new Promise<void>((resolve) => {
+      finishUnregister = resolve;
+    });
+    state.unregisterRepo.mockImplementationOnce(async () => unregisterGate);
+
+    try {
+      const removeResponse = fetch(`${baseUrl}/api/repo?repo=${encodeURIComponent(entry.name)}`, {
+        method: 'DELETE',
+      });
+      await vi.waitFor(() => expect(state.unregisterRepo).toHaveBeenCalledOnce());
+      await expect(fs.lstat(entry.storagePath)).rejects.toMatchObject({ code: 'ENOENT' });
+
+      const analyze = await fetch(`${baseUrl}/api/analyze`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ path: repoRoot }),
+      });
+      expect(analyze.status).toBe(202);
+      const { jobId } = (await analyze.json()) as { jobId: string };
+      const job = (await (await fetch(`${baseUrl}/api/analyze/${jobId}`)).json()) as {
+        status: string;
+        error?: string;
+      };
+      expect(job.status).toBe('failed');
+      expect(job.error).toMatch(/another job is already active/i);
+      await expect(fs.lstat(entry.storagePath)).rejects.toMatchObject({ code: 'ENOENT' });
+
+      finishUnregister();
+      expect((await removeResponse).status).toBe(200);
+      await expect(fs.readFile(sentinel, 'utf8')).resolves.toBe('preserve');
+    } finally {
+      finishUnregister?.();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it('deletes only the lexical storage link while retaining its external target', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-issue269-delete-link-'));
     const repoRoot = path.join(root, 'repo');
@@ -840,6 +901,43 @@ describe('POST /api/embed completed-checkpoint identity', () => {
         }),
       });
     } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('returns an actionable failure when detached storage cleanup is preserved', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-delete-cleanup-failure-'));
+    const repoRoot = path.join(root, 'repo');
+    const storagePath = path.join(repoRoot, '.gitnexus');
+    await fs.mkdir(storagePath, { recursive: true });
+    await fs.writeFile(path.join(storagePath, 'sentinel.txt'), 'preserve');
+    const entry = { ...REPO, path: repoRoot, storagePath };
+    state.listRegisteredRepos.mockResolvedValue([entry]);
+    const realRm = fs.rm.bind(fs);
+    const rmSpy = vi.spyOn(fs, 'rm').mockImplementation(async (target, options) => {
+      if (String(target).includes('.gitnexus.delete-')) {
+        throw Object.assign(new Error('busy'), { code: 'EBUSY' });
+      }
+      return realRm(target, options);
+    });
+
+    try {
+      const response = await fetch(`${baseUrl}/api/repo?repo=${encodeURIComponent(entry.name)}`, {
+        method: 'DELETE',
+      });
+      const body = (await response.json()) as { error?: string };
+
+      expect(response.status).toBe(500);
+      expect(body.error).toMatch(/could not remove detached storage/i);
+      expect(body.error).toMatch(/preserved .*\.gitnexus\.delete-/i);
+      expect(state.unregisterRepo).toHaveBeenCalledOnce();
+      const preservedPath = body.error?.match(/preserved (.+?)\. Resolve/)?.[1];
+      expect(preservedPath).toBeTruthy();
+      await expect(fs.readFile(path.join(preservedPath!, 'sentinel.txt'), 'utf8')).resolves.toBe(
+        'preserve',
+      );
+    } finally {
+      rmSpy.mockRestore();
       await fs.rm(root, { recursive: true, force: true });
     }
   });

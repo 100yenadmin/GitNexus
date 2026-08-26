@@ -12,6 +12,7 @@ import { _captureLogger } from '../../src/core/logger.js';
 import {
   getStoragePath,
   canonicalRepoLockKey,
+  canonicalRepoRootLockKey,
   getStoragePaths,
   branchSlug,
   resolveBranchPlacement,
@@ -68,6 +69,18 @@ describe('getStoragePath', () => {
     await fs.symlink(storage, path.join(repo, '.gitnexus'), 'dir');
     try {
       expect(canonicalRepoLockKey(repo)).toBe(await fs.realpath(storage));
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps the canonical repository-root lock distinct from its storage key', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-root-lock-'));
+    const repo = path.join(root, 'repo');
+    await fs.mkdir(repo);
+    try {
+      expect(canonicalRepoRootLockKey(repo)).toBe(`repo-root:${await fs.realpath(repo)}`);
+      expect(canonicalRepoRootLockKey(repo)).not.toBe(canonicalRepoLockKey(repo));
     } finally {
       await fs.rm(root, { recursive: true, force: true });
     }

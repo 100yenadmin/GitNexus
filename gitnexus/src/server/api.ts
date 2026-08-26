@@ -17,6 +17,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import {
   canonicalizePath,
   canonicalRepoLockKey,
+  canonicalRepoRootLockKey,
   cloneDirBelongsToEntry,
   loadMeta,
   saveMeta,
@@ -1170,16 +1171,17 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
   // which would corrupt LadybugDB (analyze calls closeLbug + initLbug while embed has queries in flight).
   const activeRepoPaths = new Set<string>();
 
-  const acquireRepoLock = (repoPath: string): string | null => {
-    if (activeRepoPaths.has(repoPath)) {
+  const acquireRepoLock = (...repoPaths: string[]): string | null => {
+    const keys = [...new Set(repoPaths)];
+    if (keys.some((repoPath) => activeRepoPaths.has(repoPath))) {
       return `Another job is already active for this repository`;
     }
-    activeRepoPaths.add(repoPath);
+    for (const repoPath of keys) activeRepoPaths.add(repoPath);
     return null;
   };
 
-  const releaseRepoLock = (repoPath: string): void => {
-    activeRepoPaths.delete(repoPath);
+  const releaseRepoLock = (...repoPaths: string[]): void => {
+    for (const repoPath of new Set(repoPaths)) activeRepoPaths.delete(repoPath);
   };
 
   // Launch the analyze worker for an already-resolved repo directory. Shared by
@@ -1392,10 +1394,11 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
       // final `.gitnexus` component may itself be a symlink to unrelated data.
       assertSafeStoragePath(entry);
       const lockedRepoRoot = canonicalizePath(entry.path);
-      const lockKey = canonicalRepoLockKey(lockedRepoRoot);
+      const storageLockKey = canonicalRepoLockKey(lockedRepoRoot);
+      const rootLockKey = canonicalRepoRootLockKey(lockedRepoRoot);
       const storagePath = getStoragePath(lockedRepoRoot);
       const observedStorageIdentity = await readStorageObjectIdentity(storagePath);
-      const lockErr = acquireRepoLock(lockKey);
+      const lockErr = acquireRepoLock(storageLockKey, rootLockKey);
       if (lockErr) {
         res.status(409).json({ error: lockErr });
         return;
@@ -1426,7 +1429,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
             expectedOwner: {
               ...entry,
               canonicalPath: lockedRepoRoot,
-              canonicalStoragePath: lockKey,
+              canonicalStoragePath: storageLockKey,
             },
           });
         } catch (error) {
@@ -1444,7 +1447,21 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         }
 
         if (detachedStoragePath) {
-          await fs.rm(detachedStoragePath, { recursive: true, force: true }).catch(() => {});
+          try {
+            await fs.rm(detachedStoragePath, {
+              recursive: true,
+              force: true,
+              maxRetries: 2,
+              retryDelay: 100,
+            });
+          } catch (error) {
+            throw new Error(
+              `GitNexus unregistered the repository but could not remove detached storage; ` +
+                `preserved ${detachedStoragePath}. Resolve the filesystem error and remove ` +
+                `that exact path before retrying.`,
+              { cause: error },
+            );
+          }
         }
 
         // 3. Delete the cloned repo dir if it lives under ~/.gitnexus/repos/.
@@ -1485,7 +1502,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
 
         res.json({ deleted: entry.name });
       } finally {
-        releaseRepoLock(lockKey);
+        releaseRepoLock(storageLockKey, rootLockKey);
       }
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'Failed to delete repo' });
@@ -2187,9 +2204,10 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         // lock ownership and every embedding read/write. A second path
         // canonicalization here would reopen the symlink-retarget window.
         const repoLockPath = frozenOwner.canonicalStoragePath;
+        const repoRootLockPath = canonicalRepoRootLockKey(frozenOwner.canonicalPath);
 
         // Check shared repo lock — prevent concurrent analyze + embed on same repo
-        const lockErr = acquireRepoLock(repoLockPath);
+        const lockErr = acquireRepoLock(repoLockPath, repoRootLockPath);
         if (lockErr) {
           res.status(409).json({ error: lockErr });
           return;
@@ -2199,7 +2217,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         try {
           job = embedJobManager.createJob({ repoPath: repoLockPath });
         } catch (err) {
-          releaseRepoLock(repoLockPath);
+          releaseRepoLock(repoLockPath, repoRootLockPath);
           throw err;
         }
         embedJobManager.updateJob(job.id, {
@@ -2551,7 +2569,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
             clearTimeout(embedTimeout);
             embedBarriers.delete(job.id);
             embedAborters.delete(job.id);
-            releaseRepoLock(repoLockPath);
+            releaseRepoLock(repoLockPath, repoRootLockPath);
           }
         })();
 

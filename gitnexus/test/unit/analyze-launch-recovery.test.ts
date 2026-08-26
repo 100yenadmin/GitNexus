@@ -15,6 +15,7 @@ import {
   completionUpdateForWorkerResult,
   createLaunchAnalysisWorker,
 } from '../../src/server/analyze-launch.js';
+import { canonicalRepoRootLockKey } from '../../src/storage/repo-manager.js';
 import type { AnalyzeResultIpc } from '../../src/server/analyze-worker-ipc.js';
 
 const result = (recoveredPromotionOnly?: boolean): AnalyzeResultIpc => ({
@@ -27,6 +28,7 @@ const result = (recoveredPromotionOnly?: boolean): AnalyzeResultIpc => ({
   ftsSkipped: undefined,
 });
 const virtualStoragePath = path.resolve('/virtual/demo', '.gitnexus');
+const virtualRootLockKey = canonicalRepoRootLockKey('/virtual/demo');
 
 type Listener = (...args: unknown[]) => void;
 
@@ -118,7 +120,7 @@ describe('analyze worker shared lock ownership', () => {
     await vi.waitFor(() => expect(job.status).toBe('failed'));
 
     expect(releaseRepoLock).toHaveBeenCalledOnce();
-    expect(releaseRepoLock).toHaveBeenCalledWith(virtualStoragePath);
+    expect(releaseRepoLock).toHaveBeenCalledWith(virtualStoragePath, virtualRootLockKey);
   });
 
   it('keeps the lock until a cancelled worker exits', async () => {
@@ -136,7 +138,7 @@ describe('analyze worker shared lock ownership', () => {
 
     await vi.waitFor(() => expect(releaseRepoLock).toHaveBeenCalledOnce());
     expect(releaseRepoLock).toHaveBeenCalledOnce();
-    expect(releaseRepoLock).toHaveBeenCalledWith(virtualStoragePath);
+    expect(releaseRepoLock).toHaveBeenCalledWith(virtualStoragePath, virtualRootLockKey);
   });
 
   it('releases when terminal cleanup finishes before the worker exits', async () => {
@@ -155,7 +157,7 @@ describe('analyze worker shared lock ownership', () => {
     child.emit('close', 1);
 
     expect(releaseRepoLock).toHaveBeenCalledOnce();
-    expect(releaseRepoLock).toHaveBeenCalledWith(virtualStoragePath);
+    expect(releaseRepoLock).toHaveBeenCalledWith(virtualStoragePath, virtualRootLockKey);
   });
 
   it('sends the frozen storage target when the repository storage link retargets', async () => {
@@ -182,7 +184,8 @@ describe('analyze worker shared lock ownership', () => {
       await fs.unlink(path.join(target, '.gitnexus'));
       await fs.symlink(retargetedStorage, path.join(target, '.gitnexus'), 'dir');
 
-      expect(deps.acquireRepoLock).toHaveBeenCalledWith(canonicalStorage);
+      expect(deps.acquireRepoLock).toHaveBeenNthCalledWith(1, canonicalRepoRootLockKey(alias));
+      expect(deps.acquireRepoLock).toHaveBeenNthCalledWith(2, canonicalStorage);
       expect(child.child.send).toHaveBeenCalledWith(
         expect.objectContaining({
           repoPath: canonicalTarget,
@@ -204,6 +207,7 @@ describe('analyze worker shared lock ownership', () => {
     const repoRoot = path.join(root, 'repo');
     await fs.mkdir(repoRoot);
     try {
+      launcherState.fork.mockReset();
       const { job, manager } = fakeJobManager();
       const child = fakeChild();
       launcherState.fork.mockReset().mockReturnValue(child.child);
@@ -215,7 +219,8 @@ describe('analyze worker shared lock ownership', () => {
       const storagePath = path.join(repoRoot, '.gitnexus');
       expect((await fs.stat(storagePath)).isDirectory()).toBe(true);
       const canonicalStorage = await fs.realpath(storagePath);
-      expect(deps.acquireRepoLock).toHaveBeenCalledWith(canonicalStorage);
+      expect(deps.acquireRepoLock).toHaveBeenNthCalledWith(1, canonicalRepoRootLockKey(repoRoot));
+      expect(deps.acquireRepoLock).toHaveBeenNthCalledWith(2, canonicalStorage);
       expect(child.child.send).toHaveBeenCalledWith(
         expect.objectContaining({
           options: expect.objectContaining({ analyzeStoragePath: canonicalStorage }),
@@ -223,6 +228,34 @@ describe('analyze worker shared lock ownership', () => {
       );
       child.emit('message', { type: 'error', message: 'test cleanup' });
       child.emit('close', 0);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses a delete-held root key before materializing first-analysis storage', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-delete-first-lock-'));
+    const repoRoot = path.join(root, 'repo');
+    await fs.mkdir(repoRoot);
+    try {
+      launcherState.fork.mockReset();
+      const { job, manager } = fakeJobManager();
+      const releaseRepoLock = vi.fn();
+      const deps = launchDeps(manager, releaseRepoLock);
+      deps.acquireRepoLock.mockImplementationOnce(
+        () => 'Another job is already active for this repository',
+      );
+
+      createLaunchAnalysisWorker(deps)(job, repoRoot, {});
+
+      expect(deps.acquireRepoLock).toHaveBeenCalledOnce();
+      expect(deps.acquireRepoLock).toHaveBeenCalledWith(canonicalRepoRootLockKey(repoRoot));
+      await expect(fs.lstat(path.join(repoRoot, '.gitnexus'))).rejects.toMatchObject({
+        code: 'ENOENT',
+      });
+      expect(job.status).toBe('failed');
+      expect(launcherState.fork).not.toHaveBeenCalled();
+      expect(releaseRepoLock).not.toHaveBeenCalled();
     } finally {
       await fs.rm(root, { recursive: true, force: true });
     }
@@ -277,7 +310,7 @@ describe('analyze worker shared lock ownership', () => {
     } else {
       expect(releaseRepoLock).toHaveBeenCalledOnce();
     }
-    expect(releaseRepoLock).toHaveBeenCalledWith(virtualStoragePath);
+    expect(releaseRepoLock).toHaveBeenCalledWith(virtualStoragePath, virtualRootLockKey);
     expect(job.status).toBe('failed');
     if (_label === 'send') expect(child.child.kill).toHaveBeenCalledWith('SIGTERM');
   });
@@ -307,7 +340,7 @@ describe('analyze worker shared lock ownership', () => {
       await Promise.resolve();
 
       expect(releaseRepoLock).toHaveBeenCalledOnce();
-      expect(releaseRepoLock).toHaveBeenCalledWith(virtualStoragePath);
+      expect(releaseRepoLock).toHaveBeenCalledWith(virtualStoragePath, virtualRootLockKey);
       expect(job.status).toBe('failed');
     } finally {
       vi.useRealTimers();

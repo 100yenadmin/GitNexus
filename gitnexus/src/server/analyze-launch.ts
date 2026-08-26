@@ -18,6 +18,7 @@ import { createRequire } from 'node:module';
 import {
   canonicalizePath,
   canonicalRepoLockKey,
+  canonicalRepoRootLockKey,
   getStoragePath,
   INDEX_METADATA_FILE,
 } from '../storage/repo-manager.js';
@@ -31,8 +32,8 @@ const _require = createRequire(import.meta.url);
 export interface LaunchDeps {
   jobManager: JobManager;
   backend: { init: () => Promise<unknown> };
-  acquireRepoLock: (key: string) => string | null;
-  releaseRepoLock: (key: string) => void;
+  acquireRepoLock: (...keys: string[]) => string | null;
+  releaseRepoLock: (...keys: string[]) => void;
   /**
    * Drops the server's cached LadybugDB handle (closeLbug). The worker
    * process rewrites the repo's DB files on disk, so a connection opened
@@ -142,17 +143,35 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
     // the repository root. The same physical root is sent to every retry so a
     // later symlink retarget cannot move the worker outside the held lock.
     const lockedRepoPath = canonicalizePath(targetPath);
-    const lexicalStoragePath = getStoragePath(lockedRepoPath);
-    if (existsSync(lockedRepoPath) && !existsSync(lexicalStoragePath)) {
-      // A first analysis has no physical storage object to canonicalize. Make
-      // the directory exist before deriving the shared key so another writer
-      // cannot insert a storage symlink between key capture and worker mkdir.
-      mkdirSync(lexicalStoragePath, { recursive: true });
+    const analyzeRootLockKey = canonicalRepoRootLockKey(lockedRepoPath);
+    const rootLockErr = acquireRepoLock(analyzeRootLockKey);
+    if (rootLockErr) {
+      jobManager.updateJob(job.id, { status: 'failed', error: rootLockErr });
+      return;
     }
-    const analyzeLockKey = canonicalRepoLockKey(lockedRepoPath);
-    const lockErr = acquireRepoLock(analyzeLockKey);
-    if (lockErr) {
-      jobManager.updateJob(job.id, { status: 'failed', error: lockErr });
+    const lexicalStoragePath = getStoragePath(lockedRepoPath);
+    let analyzeStorageLockKey: string;
+    try {
+      if (existsSync(lockedRepoPath) && !existsSync(lexicalStoragePath)) {
+        // Hold the stable root key before materializing first-analysis storage.
+        // A delete that detached the old storage therefore excludes this mkdir
+        // even though the new lexical path would canonicalize to another key.
+        mkdirSync(lexicalStoragePath, { recursive: true });
+      }
+      analyzeStorageLockKey = canonicalRepoLockKey(lockedRepoPath);
+      const storageLockErr = acquireRepoLock(analyzeStorageLockKey);
+      if (storageLockErr) {
+        releaseRepoLock(analyzeRootLockKey);
+        jobManager.updateJob(job.id, { status: 'failed', error: storageLockErr });
+        return;
+      }
+    } catch (err) {
+      releaseRepoLock(analyzeRootLockKey);
+      const message = err instanceof Error ? err.message : String(err);
+      jobManager.updateJob(job.id, {
+        status: 'failed',
+        error: `Worker process error: ${message}`,
+      });
       return;
     }
 
@@ -160,7 +179,7 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
     const releaseLock = (): void => {
       if (lockReleased) return;
       lockReleased = true;
-      releaseRepoLock(analyzeLockKey);
+      releaseRepoLock(analyzeStorageLockKey, analyzeRootLockKey);
     };
     let terminalMessageReceived = false;
 
@@ -256,7 +275,7 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
           // then fail the analyze request with explicit retry guidance.
           const settle = msg.result.recoveredPromotionOnly
             ? Promise.resolve()
-            : waitForSettledIndex(analyzeLockKey, jobStartMs);
+            : waitForSettledIndex(analyzeStorageLockKey, jobStartMs);
           finishTerminalCleanup(
             settle
               .then(() => closeDbHandle())
@@ -373,7 +392,7 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
             // Keep every analyzer filesystem write on the same physical
             // storage target whose shared repository lock is held. The repo's
             // lexical `.gitnexus` path may be retargeted after acquisition.
-            analyzeStoragePath: analyzeLockKey,
+            analyzeStoragePath: analyzeStorageLockKey,
             force: !!opts.force,
             embeddings: !!opts.embeddings,
             dropEmbeddings: !!opts.dropEmbeddings,

@@ -435,6 +435,17 @@ export const canonicalRepoLockKey = (repoRoot: string): string =>
   canonicalizePath(getStoragePath(canonicalizePath(repoRoot)));
 
 /**
+ * Return the repository-stable half of the server writer lock identity.
+ *
+ * The prefix keeps a repository root distinct from a physical storage key.
+ * Server jobs hold both: the root key survives storage detach/materialization,
+ * while {@link canonicalRepoLockKey} still excludes distinct roots that share
+ * one physical storage target.
+ */
+export const canonicalRepoRootLockKey = (repoRoot: string): string =>
+  `repo-root:${canonicalizePath(repoRoot)}`;
+
+/**
  * Get paths to key storage files.
  *
  * `storagePath` is ALWAYS the flat `<repo>/.gitnexus` — content-addressed
