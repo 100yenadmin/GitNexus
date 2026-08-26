@@ -2,7 +2,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { closeLbug, withLbugDb } from '../../src/core/lbug/lbug-adapter.js';
+import { acquireLbugOwnership, closeLbug, withLbugDb } from '../../src/core/lbug/lbug-adapter.js';
 import { withAnalyzeOwnershipLock } from '../../src/core/staged-promotion.js';
 
 const roots: string[] = [];
@@ -22,6 +22,22 @@ const makePaths = async () => {
 };
 
 describe('Ladybug writable ownership admission', () => {
+  it('holds one real analyze ownership lease across separately sequenced preflight work', async () => {
+    const { repoRoot, storagePath } = await makePaths();
+    const lease = await acquireLbugOwnership(storagePath, repoRoot);
+
+    await expect(
+      withAnalyzeOwnershipLock(storagePath, async () => undefined, { repoRoot }),
+    ).rejects.toThrow(/another analyze is active/i);
+
+    await lease.release();
+    await lease.release();
+
+    await expect(
+      withAnalyzeOwnershipLock(storagePath, async () => 'released', { repoRoot }),
+    ).resolves.toBe('released');
+  });
+
   it('refuses a writable session while the real analyzer owner is active', async () => {
     const { repoRoot, storagePath, lbugPath } = await makePaths();
     let markOwned!: () => void;

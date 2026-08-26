@@ -72,6 +72,12 @@ const state = {
   openOwnershipPaths: [] as Array<string | undefined>,
   openOwnershipRepoRoots: [] as Array<string | undefined>,
   ownershipGate: undefined as Promise<void> | undefined,
+  releaseOwnershipLease: vi.fn(async () => undefined),
+  acquireLbugOwnership: vi.fn(async (storagePath: string, repoRoot: string) => {
+    state.openOwnershipPaths.push(storagePath);
+    state.openOwnershipRepoRoots.push(repoRoot);
+    return { release: state.releaseOwnershipLease };
+  }),
   closeLbug: vi.fn(async () => undefined),
   withLbugReadOnlyNonRecovering: vi.fn((_dbPath: string, operation: () => Promise<unknown>) => {
     state.openModes.push(true);
@@ -88,9 +94,11 @@ const state = {
       },
     ) => {
       state.openModes.push(options?.readOnly);
-      state.openOwnershipPaths.push(options?.ownershipStoragePath);
-      state.openOwnershipRepoRoots.push(options?.ownershipRepoRoot);
-      if (options?.ownershipStoragePath) await state.ownershipGate;
+      if (options?.ownershipStoragePath) {
+        state.openOwnershipPaths.push(options.ownershipStoragePath);
+        state.openOwnershipRepoRoots.push(options.ownershipRepoRoot);
+      }
+      if (state.ownershipGate) await state.ownershipGate;
       return operation();
     },
   ),
@@ -187,6 +195,7 @@ vi.doMock('../../src/core/lbug/lbug-adapter.js', async () => ({
   streamQuery: vi.fn(async () => undefined),
   flushWAL: vi.fn(async () => undefined),
   closeLbug: state.closeLbug,
+  acquireLbugOwnership: state.acquireLbugOwnership,
   withLbugReadOnlyNonRecovering: state.withLbugReadOnlyNonRecovering,
   withLbugDb: state.withLbugDb,
   isReadOnlyDbError: vi.fn(() => false),
@@ -389,6 +398,8 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     state.openOwnershipPaths.length = 0;
     state.openOwnershipRepoRoots.length = 0;
     state.ownershipGate = undefined;
+    state.releaseOwnershipLease.mockClear();
+    state.acquireLbugOwnership.mockClear();
     state.closeLbug.mockClear();
     state.withLbugReadOnlyNonRecovering.mockClear();
     state.withLbugDb.mockClear();
@@ -473,15 +484,42 @@ describe('POST /api/embed completed-checkpoint identity', () => {
       body: JSON.stringify({ repo: REPO.name }),
     });
     const { jobId } = (await response.json()) as { jobId: string };
-    await vi.waitFor(() => expect(state.openOwnershipPaths).toHaveLength(1));
+    await vi.waitFor(() => expect(state.openModes).toHaveLength(1));
 
     expect(state.openOwnershipPaths).toEqual([canonicalizePath(REPO.storagePath)]);
     expect(state.openOwnershipRepoRoots).toEqual([canonicalizePath(REPO.path)]);
     expect(state.loadMeta).toHaveBeenCalledOnce();
     expect(state.saveMeta).not.toHaveBeenCalled();
+    expect(state.releaseOwnershipLease).not.toHaveBeenCalled();
 
     releaseOwnership();
     await expect(waitForTerminalJob(baseUrl, jobId)).resolves.toMatchObject({ status: 'complete' });
+    expect(state.releaseOwnershipLease).toHaveBeenCalledOnce();
+  });
+
+  it('acquires cross-process ownership before legacy metadata and database preflight', async () => {
+    state.currentMeta = makeMeta(LIVE_DIGEST, REPO.path, true);
+    state.liveIntegrity = makeIntegrity(LIVE_DIGEST, 0);
+    state.graphNodes = [];
+
+    const response = await fetch(`${baseUrl}/api/embed`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ repo: REPO.name }),
+    });
+    expect(response.status).toBe(202);
+    const { jobId } = (await response.json()) as { jobId: string };
+    await expect(waitForTerminalJob(baseUrl, jobId)).resolves.toMatchObject({ status: 'complete' });
+
+    expect(state.acquireLbugOwnership).toHaveBeenCalledOnce();
+    expect(state.withLbugReadOnlyNonRecovering).toHaveBeenCalledOnce();
+    expect(state.acquireLbugOwnership.mock.invocationCallOrder[0]).toBeLessThan(
+      state.withLbugReadOnlyNonRecovering.mock.invocationCallOrder[0],
+    );
+    expect(state.releaseOwnershipLease).toHaveBeenCalledOnce();
+    expect(state.withLbugReadOnlyNonRecovering.mock.invocationCallOrder[0]).toBeLessThan(
+      state.releaseOwnershipLease.mock.invocationCallOrder[0],
+    );
   });
 
   it('rejects an equal-count different-digest completed window before the pipeline', async () => {

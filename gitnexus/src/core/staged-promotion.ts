@@ -1057,6 +1057,28 @@ export interface AnalyzeOwnershipLockOptions {
   createStoragePath?: boolean;
 }
 
+const releaseOwnedOwnershipLock = async (
+  lockPath: string,
+  record: StageLockRecord,
+): Promise<void> => {
+  const transientCodes = new Set(['EBUSY', 'EPERM']);
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const current = await readJson<StageLockRecord>(lockPath).catch((error) => {
+      if (isMissingFilesystemError(error)) return undefined;
+      throw error;
+    });
+    if (!current || !validStageLockRecord(current) || !sameStageLockRecord(current, record)) return;
+    try {
+      await fs.rm(lockPath, { force: true });
+      return;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (!code || !transientCodes.has(code) || attempt === 2) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 25 * 2 ** attempt));
+    }
+  }
+};
+
 const withOwnershipFileLock = async <T>(
   lockPath: string,
   operation: () => Promise<T>,
@@ -1143,8 +1165,7 @@ const withOwnershipFileLock = async <T>(
       await fs.rm(publicationSourcePath, { force: true }).catch(() => {});
     }
     if (ownsLock) {
-      const current = await readJson<StageLockRecord>(lockPath).catch(() => undefined);
-      if (current?.nonce === record.nonce) await fs.rm(lockPath, { force: true });
+      await releaseOwnedOwnershipLock(lockPath, record);
     }
   }
 };

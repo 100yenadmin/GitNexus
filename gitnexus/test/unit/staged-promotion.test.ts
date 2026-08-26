@@ -467,6 +467,38 @@ describe('staged promotion journal', () => {
 });
 
 describe('common analyze ownership lock', () => {
+  it('retries a transient failure while releasing the exact locally owned main lock', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-stage-lock-release-'));
+    tempDirs.push(root);
+    const lockPath = path.join(root, 'analyze-staged.lock');
+    const originalRm = fs.rm.bind(fs);
+    const rmSpy = vi.spyOn(fs, 'rm');
+    let operationEntered = false;
+    let failedOnce = false;
+
+    rmSpy.mockImplementation(async (target, options) => {
+      if (operationEntered && String(target) === lockPath && !failedOnce) {
+        failedOnce = true;
+        throw Object.assign(new Error('transient owned lock release failure'), { code: 'EPERM' });
+      }
+      return originalRm(target, options);
+    });
+
+    try {
+      await expect(
+        withAnalyzeOwnershipLock(root, async () => {
+          operationEntered = true;
+          return 'released';
+        }),
+      ).resolves.toBe('released');
+      expect(failedOnce).toBe(true);
+      await expect(fs.access(lockPath)).rejects.toMatchObject({ code: 'ENOENT' });
+      expect(await recoveryEntries(lockPath)).toEqual([]);
+    } finally {
+      rmSpy.mockRestore();
+    }
+  });
+
   it('refuses a concurrent ordinary or staged writer', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-stage-lock-'));
     tempDirs.push(root);

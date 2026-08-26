@@ -38,9 +38,11 @@ import {
   flushWAL,
   getStrictLbugStats,
   closeLbug,
+  acquireLbugOwnership,
   withLbugReadOnlyNonRecovering,
   withLbugDb,
   isReadOnlyDbError,
+  type LbugOwnershipLease,
 } from '../core/lbug/lbug-adapter.js';
 import { isValidQueryParams } from '../core/lbug/query-params.js';
 import { NODE_TABLES, type GraphNode, type GraphRelationship } from 'gitnexus-shared';
@@ -2282,7 +2284,12 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
 
         // Run embedding pipeline asynchronously
         (async () => {
+          let ownershipLease: LbugOwnershipLease | undefined;
           try {
+            ownershipLease = await acquireLbugOwnership(
+              frozenOwner.canonicalStoragePath,
+              frozenOwner.canonicalPath,
+            );
             const lbugPath = path.join(frozenOwner.canonicalStoragePath, 'lbug');
             const { inspectEmbeddingIntegrity } = await import('../core/lbug/lbug-adapter.js');
             const tentativeMeta = await loadMeta(frozenOwner.canonicalStoragePath);
@@ -2338,10 +2345,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
               });
             }
             const withOwnedLbugDb = <T>(operation: () => Promise<T>): Promise<T> =>
-              withLbugDb(lbugPath, operation, {
-                ownershipStoragePath: frozenOwner.canonicalStoragePath,
-                ownershipRepoRoot: frozenOwner.canonicalPath,
-              });
+              withLbugDb(lbugPath, operation);
             await withOwnedLbugDb(async () => {
               let embeddingMeta = await loadMeta(frozenOwner.canonicalStoragePath);
               const authoritativeLegacy = isEmptyLegacyCheckpoint(
@@ -2582,6 +2586,9 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
               await assertZeroClearRegistryOwner(frozenOwner, terminalOwnerMeta);
             }
 
+            await ownershipLease.release();
+            ownershipLease = undefined;
+
             // Don't overwrite 'failed' if the job was cancelled while the pipeline was running
             const current = embedJobManager.getJob(job.id);
             if (!current || current.status !== 'failed') {
@@ -2600,6 +2607,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
             }
             barrier.publishTerminalOutcome();
           } finally {
+            await ownershipLease?.release().catch(() => {});
             clearTimeout(embedTimeout);
             embedBarriers.delete(job.id);
             embedAborters.delete(job.id);
