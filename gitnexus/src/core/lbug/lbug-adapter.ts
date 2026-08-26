@@ -805,6 +805,47 @@ export const withLbugReadOnlyNonRecovering = async <T>(
   operation: () => Promise<T>,
 ): Promise<T> => runLbugReadOnlyNonRecovering(dbPath, operation);
 
+export interface LbugOwnershipLease {
+  release(): Promise<void>;
+}
+
+export const acquireLbugOwnership = async (
+  storagePath: string,
+  repoRoot: string,
+): Promise<LbugOwnershipLease> => {
+  let releaseGate!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    releaseGate = resolve;
+  });
+  let markEntered!: () => void;
+  let markFailed!: (reason?: unknown) => void;
+  const entered = new Promise<void>((resolve, reject) => {
+    markEntered = resolve;
+    markFailed = reject;
+  });
+  const { withAnalyzeOwnershipLock } = await import('../staged-promotion.js');
+  const ownership = withAnalyzeOwnershipLock(
+    storagePath,
+    async () => {
+      markEntered();
+      await gate;
+    },
+    { repoRoot, createStoragePath: false },
+  );
+  void ownership.catch(markFailed);
+  await entered;
+  let released = false;
+  return {
+    release: async () => {
+      if (!released) {
+        released = true;
+        releaseGate();
+      }
+      await ownership;
+    },
+  };
+};
+
 /**
  * Execute multiple queries against one repo DB atomically.
  * While the callback runs, no other request can switch the active DB.
@@ -816,12 +857,18 @@ export const withLbugReadOnlyNonRecovering = async <T>(
 export const withLbugDb = async <T>(
   dbPath: string,
   operation: () => Promise<T>,
-  options: { readOnly?: boolean; ownershipStoragePath?: string } = {},
+  options: {
+    readOnly?: boolean;
+    ownershipStoragePath?: string;
+    ownershipRepoRoot?: string;
+  } = {},
 ): Promise<T> => {
   if (options.ownershipStoragePath) {
     const { withAnalyzeOwnershipLock } = await import('../staged-promotion.js');
-    return withAnalyzeOwnershipLock(options.ownershipStoragePath, () =>
-      withLbugDb(dbPath, operation, { readOnly: options.readOnly }),
+    return withAnalyzeOwnershipLock(
+      options.ownershipStoragePath,
+      () => withLbugDb(dbPath, operation, { readOnly: options.readOnly }),
+      { repoRoot: options.ownershipRepoRoot },
     );
   }
   let lastError: unknown;

@@ -20,6 +20,7 @@ import { boundedCheckpointBeforeExit } from '../core/lbug/shutdown-helpers.js';
 interface StartMessage {
   type: 'start';
   repoPath: string;
+  parentAnalyzeOwnershipHeld?: boolean;
   options: AnalyzeOptions;
 }
 
@@ -115,12 +116,17 @@ process.on('message', async (msg: StartMessage) => {
     // analyze-worker-core seam (unit-testable without this entry module's
     // process.on side effects). It reports exactly one terminal message and
     // never throws.
-    await runWorkerAnalysis(msg.repoPath, msg.options, {
-      runFullAnalysis,
-      assertAnalysisFinalized,
-      send,
-      claimTerminal,
-    });
+    await runWorkerAnalysis(
+      msg.repoPath,
+      msg.options,
+      {
+        runFullAnalysis,
+        assertAnalysisFinalized,
+        send,
+        claimTerminal,
+      },
+      { parentAnalyzeOwnershipHeld: msg.parentAnalyzeOwnershipHeld === true },
+    );
   } finally {
     // LadybugDB's native module prevents clean exit — force it (same reason the
     // CLI uses process.exit(0)). In `finally` so the exit still fires even if the

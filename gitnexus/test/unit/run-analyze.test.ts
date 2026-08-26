@@ -34,6 +34,15 @@ describe('run-analyze module', () => {
     expect(typeof mod.runFullAnalysis).toBe('function');
   });
 
+  it('rejects parent-held ownership without both frozen worker paths', async () => {
+    const { runFullAnalysis } = await import('../../src/core/run-analyze.js');
+    await expect(
+      runFullAnalysis('/repo', {}, {}, { parentAnalyzeOwnershipHeld: true }),
+    ).rejects.toThrow(
+      'Parent-held analyze ownership requires frozen analyzeStoragePath and registryPath.',
+    );
+  });
+
   it('exports PHASE_LABELS', async () => {
     const mod = await import('../../src/core/run-analyze.js');
     expect(mod.PHASE_LABELS).toBeDefined();

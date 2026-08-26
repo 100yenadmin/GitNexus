@@ -774,6 +774,7 @@ describe('runFullAnalysis --staged', () => {
   it('serializes supported ordinary and staged analyzers under branch-summary ownership', async () => {
     const repo = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-common-lock-'));
     tempDirs.push(repo);
+    process.env.GITNEXUS_HOME = path.join(repo, '.registry-home');
     const storage = getStoragePaths(repo).storagePath;
     let release!: () => void;
     const owner = withAnalyzeOwnershipLock(

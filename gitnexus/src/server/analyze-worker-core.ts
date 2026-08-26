@@ -39,6 +39,7 @@ export async function runWorkerAnalysis(
   repoPath: string,
   options: AnalyzeOptions,
   deps: WorkerAnalysisDeps,
+  internal: { parentAnalyzeOwnershipHeld?: boolean } = {},
 ): Promise<void> {
   let terminal: WorkerMessage;
   try {
@@ -53,6 +54,7 @@ export async function runWorkerAnalysis(
           deps.send({ type: 'progress', phase, percent, message }),
         onLog: (message) => deps.send({ type: 'progress', phase: 'log', percent: -1, message }),
       },
+      internal,
     );
     // P2 (#2264): a half-finalized repo — meta.json written but the global
     // registry entry missing (e.g. a prior collision-aborted run, or a wiped

@@ -14,6 +14,7 @@ import {
 } from '../../src/storage/repo-manager.js';
 import { escapeCypherString } from '../../src/core/lbug/cypher-escape.js';
 import { JobManager } from '../../src/server/analyze-job.js';
+import { withAnalyzeOwnershipLock } from '../../src/core/staged-promotion.js';
 
 const MODEL = 'api-checkpoint-test-model';
 const LIVE_DIGEST = 'a'.repeat(64);
@@ -69,7 +70,14 @@ const state = {
   executeQuery: vi.fn(async () => state.graphNodes),
   openModes: [] as Array<boolean | undefined>,
   openOwnershipPaths: [] as Array<string | undefined>,
+  openOwnershipRepoRoots: [] as Array<string | undefined>,
   ownershipGate: undefined as Promise<void> | undefined,
+  releaseOwnershipLease: vi.fn(async () => undefined),
+  acquireLbugOwnership: vi.fn(async (storagePath: string, repoRoot: string) => {
+    state.openOwnershipPaths.push(storagePath);
+    state.openOwnershipRepoRoots.push(repoRoot);
+    return { release: state.releaseOwnershipLease };
+  }),
   closeLbug: vi.fn(async () => undefined),
   withLbugReadOnlyNonRecovering: vi.fn((_dbPath: string, operation: () => Promise<unknown>) => {
     state.openModes.push(true);
@@ -79,11 +87,18 @@ const state = {
     async (
       _dbPath: string,
       operation: () => Promise<unknown>,
-      options?: { readOnly?: boolean; ownershipStoragePath?: string },
+      options?: {
+        readOnly?: boolean;
+        ownershipStoragePath?: string;
+        ownershipRepoRoot?: string;
+      },
     ) => {
       state.openModes.push(options?.readOnly);
-      state.openOwnershipPaths.push(options?.ownershipStoragePath);
-      if (options?.ownershipStoragePath) await state.ownershipGate;
+      if (options?.ownershipStoragePath) {
+        state.openOwnershipPaths.push(options.ownershipStoragePath);
+        state.openOwnershipRepoRoots.push(options.ownershipRepoRoot);
+      }
+      if (state.ownershipGate) await state.ownershipGate;
       return operation();
     },
   ),
@@ -180,6 +195,7 @@ vi.doMock('../../src/core/lbug/lbug-adapter.js', async () => ({
   streamQuery: vi.fn(async () => undefined),
   flushWAL: vi.fn(async () => undefined),
   closeLbug: state.closeLbug,
+  acquireLbugOwnership: state.acquireLbugOwnership,
   withLbugReadOnlyNonRecovering: state.withLbugReadOnlyNonRecovering,
   withLbugDb: state.withLbugDb,
   isReadOnlyDbError: vi.fn(() => false),
@@ -338,8 +354,13 @@ describe('POST /api/embed completed-checkpoint identity', () => {
   let exitSpy: ReturnType<typeof vi.spyOn>;
   let onceSpy: ReturnType<typeof vi.spyOn>;
   let getJobSpy: ReturnType<typeof vi.spyOn>;
+  let priorGitNexusHome: string | undefined;
+  let isolatedGitNexusHomeRoot = '';
 
   beforeAll(async () => {
+    priorGitNexusHome = process.env.GITNEXUS_HOME;
+    isolatedGitNexusHomeRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-api-owner-home-'));
+    process.env.GITNEXUS_HOME = path.join(isolatedGitNexusHomeRoot, 'home');
     exitSpy = vi.spyOn(process, 'exit').mockImplementation(() => undefined as never);
     const originalOnce = process.once.bind(process);
     onceSpy = vi.spyOn(process, 'once').mockImplementation(((event: string, listener: Function) => {
@@ -375,7 +396,11 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     state.executeQuery.mockImplementation(async () => state.graphNodes);
     state.openModes.length = 0;
     state.openOwnershipPaths.length = 0;
+    state.openOwnershipRepoRoots.length = 0;
     state.ownershipGate = undefined;
+    state.releaseOwnershipLease.mockReset();
+    state.releaseOwnershipLease.mockResolvedValue(undefined);
+    state.acquireLbugOwnership.mockClear();
     state.closeLbug.mockClear();
     state.withLbugReadOnlyNonRecovering.mockClear();
     state.withLbugDb.mockClear();
@@ -420,6 +445,9 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     getJobSpy.mockRestore();
     await shutdown?.();
     exitSpy.mockRestore();
+    if (priorGitNexusHome === undefined) delete process.env.GITNEXUS_HOME;
+    else process.env.GITNEXUS_HOME = priorGitNexusHome;
+    await fs.rm(isolatedGitNexusHomeRoot, { recursive: true, force: true });
   });
 
   it('releases the repository lock when embedding job admission throws', async () => {
@@ -457,14 +485,197 @@ describe('POST /api/embed completed-checkpoint identity', () => {
       body: JSON.stringify({ repo: REPO.name }),
     });
     const { jobId } = (await response.json()) as { jobId: string };
-    await vi.waitFor(() => expect(state.openOwnershipPaths).toHaveLength(1));
+    await vi.waitFor(() => expect(state.openModes).toHaveLength(1));
 
     expect(state.openOwnershipPaths).toEqual([canonicalizePath(REPO.storagePath)]);
+    expect(state.openOwnershipRepoRoots).toEqual([canonicalizePath(REPO.path)]);
     expect(state.loadMeta).toHaveBeenCalledOnce();
     expect(state.saveMeta).not.toHaveBeenCalled();
+    expect(state.releaseOwnershipLease).not.toHaveBeenCalled();
 
     releaseOwnership();
+    await expect(waitForTerminalJob(baseUrl, jobId)).resolves.toMatchObject({
+      status: 'complete',
+      progress: { phase: 'complete', percent: 100 },
+    });
+    expect(state.releaseOwnershipLease).toHaveBeenCalledOnce();
+  });
+
+  it('acquires cross-process ownership before legacy metadata and database preflight', async () => {
+    state.currentMeta = makeMeta(LIVE_DIGEST, REPO.path, true);
+    state.liveIntegrity = makeIntegrity(LIVE_DIGEST, 0);
+    state.graphNodes = [];
+
+    const response = await fetch(`${baseUrl}/api/embed`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ repo: REPO.name }),
+    });
+    expect(response.status).toBe(202);
+    const { jobId } = (await response.json()) as { jobId: string };
     await expect(waitForTerminalJob(baseUrl, jobId)).resolves.toMatchObject({ status: 'complete' });
+
+    expect(state.acquireLbugOwnership).toHaveBeenCalledOnce();
+    expect(state.withLbugReadOnlyNonRecovering).toHaveBeenCalledOnce();
+    expect(state.acquireLbugOwnership.mock.invocationCallOrder[0]).toBeLessThan(
+      state.withLbugReadOnlyNonRecovering.mock.invocationCallOrder[0],
+    );
+    expect(state.releaseOwnershipLease).toHaveBeenCalledOnce();
+    expect(state.withLbugReadOnlyNonRecovering.mock.invocationCallOrder[0]).toBeLessThan(
+      state.releaseOwnershipLease.mock.invocationCallOrder[0],
+    );
+  });
+
+  it('reports ownership cleanup failure together with the embedding failure', async () => {
+    state.loadMeta.mockRejectedValueOnce(new Error('preflight failed'));
+    state.releaseOwnershipLease.mockRejectedValue(new Error('release retries exhausted'));
+
+    const response = await fetch(`${baseUrl}/api/embed`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ repo: REPO.name }),
+    });
+    expect(response.status).toBe(202);
+    const { jobId } = (await response.json()) as { jobId: string };
+    const job = await waitForTerminalJob(baseUrl, jobId);
+
+    expect(job).toMatchObject({
+      status: 'failed',
+      progress: { phase: 'failed' },
+    });
+    expect(job.error).toMatch(/preflight failed/);
+    expect(job.error).toMatch(/ownership lock release failed: release retries exhausted/i);
+    expect(state.releaseOwnershipLease).toHaveBeenCalledOnce();
+  });
+
+  it('terminalizes an empty embedding error with the fallback message', async () => {
+    state.loadMeta.mockRejectedValueOnce(new Error(''));
+
+    const response = await fetch(`${baseUrl}/api/embed`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ repo: REPO.name }),
+    });
+    expect(response.status).toBe(202);
+    const { jobId } = (await response.json()) as { jobId: string };
+
+    await expect(waitForTerminalJob(baseUrl, jobId)).resolves.toMatchObject({
+      status: 'failed',
+      error: 'Embedding generation failed',
+    });
+  });
+
+  it('publishes cancellation and ownership cleanup failures together after release', async () => {
+    state.currentMeta = makeMeta(LIVE_DIGEST);
+    let pipelineStarted!: () => void;
+    const pipelineRunning = new Promise<void>((resolve) => {
+      pipelineStarted = resolve;
+    });
+    state.runEmbeddingPipeline.mockImplementation(async (...args: unknown[]) => {
+      const reportProgress = args[2] as (progress: { phase: string; percent: number }) => void;
+      const options = args[6] as { signal: AbortSignal };
+      pipelineStarted();
+      await new Promise<void>((_resolve, reject) => {
+        const rejectWithWrappedAbort = () => {
+          reportProgress({ phase: 'error', percent: 0 });
+          const wrapped = new Error('Embedding request cancelled (redacted endpoint)', {
+            cause: new DOMException('pipeline cancelled', 'AbortError'),
+          });
+          wrapped.name = 'HttpEmbeddingError';
+          reject(wrapped);
+        };
+        if (options.signal.aborted) {
+          rejectWithWrappedAbort();
+          return;
+        }
+        options.signal.addEventListener('abort', rejectWithWrappedAbort, { once: true });
+      });
+    });
+    let cleanupStarted!: () => void;
+    const cleanupRunning = new Promise<void>((resolve) => {
+      cleanupStarted = resolve;
+    });
+    let failCleanup!: () => void;
+    const cleanupRelease = new Promise<void>((_resolve, reject) => {
+      failCleanup = () => reject(new Error('release retries exhausted'));
+    });
+    state.releaseOwnershipLease.mockImplementation(async () => {
+      cleanupStarted();
+      return cleanupRelease;
+    });
+
+    const response = await fetch(`${baseUrl}/api/embed`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ repo: REPO.name }),
+    });
+    expect(response.status).toBe(202);
+    const { jobId } = (await response.json()) as { jobId: string };
+    await pipelineRunning;
+
+    const progressResponse = await fetch(`${baseUrl}/api/embed/${jobId}/progress`);
+    expect(progressResponse.status).toBe(200);
+    let progressSettled = false;
+    const progressText = progressResponse.text().then((text) => {
+      progressSettled = true;
+      return text;
+    });
+
+    const cancelled = await fetch(`${baseUrl}/api/embed/${jobId}`, { method: 'DELETE' });
+    expect(cancelled.status).toBe(200);
+    await cleanupRunning;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(progressSettled).toBe(false);
+
+    failCleanup();
+    const job = await waitForTerminalJob(baseUrl, jobId);
+    const events = await progressText;
+
+    expect(job).toMatchObject({ status: 'failed' });
+    expect(job.error).toMatch(/cancelled by user/i);
+    expect(job.error).toMatch(/ownership lock release failed: release retries exhausted/i);
+    expect(events).toMatch(/event: failed/);
+    expect(events).toMatch(/cancelled by user/i);
+    expect(events).toMatch(/ownership lock release failed: release retries exhausted/i);
+    expect(state.releaseOwnershipLease).toHaveBeenCalledOnce();
+  });
+
+  it('keeps cancellation failed when accepted during successful ownership release', async () => {
+    state.currentMeta = makeMeta(LIVE_DIGEST);
+    let releaseStarted!: () => void;
+    const releaseRunning = new Promise<void>((resolve) => {
+      releaseStarted = resolve;
+    });
+    let finishRelease!: () => void;
+    const releaseGate = new Promise<void>((resolve) => {
+      finishRelease = resolve;
+    });
+    state.releaseOwnershipLease.mockImplementationOnce(async () => {
+      releaseStarted();
+      await releaseGate;
+    });
+
+    const response = await fetch(`${baseUrl}/api/embed`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ repo: REPO.name }),
+    });
+    expect(response.status).toBe(202);
+    const { jobId } = (await response.json()) as { jobId: string };
+    await releaseRunning;
+
+    const deleteHandlerStarted = armDeleteHandlerSignal();
+    const cancellationResponse = fetch(`${baseUrl}/api/embed/${jobId}`, { method: 'DELETE' });
+    await deleteHandlerStarted;
+    const cancelled = await cancellationResponse;
+    expect(cancelled.status).toBe(200);
+    finishRelease();
+
+    await expect(waitForTerminalJob(baseUrl, jobId)).resolves.toMatchObject({
+      status: 'failed',
+      error: 'Cancelled by user',
+    });
+    expect(state.releaseOwnershipLease).toHaveBeenCalledOnce();
   });
 
   it('rejects an equal-count different-digest completed window before the pipeline', async () => {
@@ -857,6 +1068,92 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     }
   });
 
+  it('refuses delete while the production analyze ownership lock is held and releases cleanly', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-delete-analyze-owner-'));
+    const repoRoot = path.join(root, 'repo');
+    const storagePath = path.join(repoRoot, '.gitnexus');
+    const sentinel = path.join(storagePath, 'sentinel.txt');
+    await fs.mkdir(storagePath, { recursive: true });
+    await fs.writeFile(sentinel, 'preserve');
+    const entry = { ...REPO, path: repoRoot, storagePath };
+    state.listRegisteredRepos.mockResolvedValue([entry]);
+    expect(canonicalRepoLockKey(repoRoot)).toBe(canonicalizePath(storagePath));
+
+    try {
+      await withAnalyzeOwnershipLock(
+        canonicalizePath(storagePath),
+        async () => {
+          const blocked = await fetch(
+            `${baseUrl}/api/repo?repo=${encodeURIComponent(entry.name)}`,
+            { method: 'DELETE' },
+          );
+          const body = (await blocked.json()) as { error?: string };
+
+          expect(blocked.status).toBe(409);
+          expect(body.error).toMatch(/another analyze is active/i);
+          await expect(fs.readFile(sentinel, 'utf8')).resolves.toBe('preserve');
+          expect(state.unregisterRepo).not.toHaveBeenCalled();
+        },
+        { repoRoot },
+      );
+
+      const removed = await fetch(`${baseUrl}/api/repo?repo=${encodeURIComponent(entry.name)}`, {
+        method: 'DELETE',
+      });
+      expect(removed.status).toBe(200);
+      expect(state.unregisterRepo).toHaveBeenCalledOnce();
+      await expect(fs.lstat(storagePath)).rejects.toMatchObject({ code: 'ENOENT' });
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('reports ownership-release failure before publishing delete success', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-delete-release-failure-'));
+    const repoRoot = path.join(root, 'repo');
+    const storagePath = path.join(repoRoot, '.gitnexus');
+    await fs.mkdir(storagePath, { recursive: true });
+    const entry = { ...REPO, path: repoRoot, storagePath };
+    state.listRegisteredRepos.mockResolvedValue([entry]);
+    const originalRm = fs.rm.bind(fs);
+    const rmSpy = vi.spyOn(fs, 'rm');
+    let releaseAttempts = 0;
+
+    rmSpy.mockImplementation(async (target, options) => {
+      const targetPath = String(target);
+      const targetName = path.basename(targetPath);
+      if (
+        state.unregisterRepo.mock.calls.length > 0 &&
+        targetName.startsWith('analyze-') &&
+        targetName !== 'analyze-staged.lock' &&
+        targetPath.endsWith('.lock')
+      ) {
+        releaseAttempts++;
+        throw Object.assign(new Error('delete ownership release failed'), { code: 'EPERM' });
+      }
+      return originalRm(target, options);
+    });
+
+    try {
+      const response = await fetch(`${baseUrl}/api/repo?repo=${encodeURIComponent(entry.name)}`, {
+        method: 'DELETE',
+      });
+      const body = (await response.json()) as { error?: string; deleted?: string };
+
+      expect(response.status).toBe(500);
+      expect(body.deleted).toBeUndefined();
+      expect(body.error).toMatch(/delete ownership release failed/i);
+      expect(releaseAttempts).toBe(3);
+    } finally {
+      rmSpy.mockRestore();
+      await fs.rm(root, { recursive: true, force: true });
+      const gitnexusHome = process.env.GITNEXUS_HOME;
+      if (gitnexusHome) {
+        await fs.rm(path.join(gitnexusHome, 'locks'), { recursive: true, force: true });
+      }
+    }
+  });
+
   it('refuses reverse-order analyze after delete detaches symlinked storage', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-delete-first-analyze-'));
     const repoRoot = path.join(root, 'repo');
@@ -885,6 +1182,14 @@ describe('POST /api/embed completed-checkpoint identity', () => {
       await vi.waitFor(() => expect(state.unregisterRepo).toHaveBeenCalledOnce());
       await expect(fs.lstat(entry.storagePath)).rejects.toMatchObject({ code: 'ENOENT' });
 
+      await expect(
+        withAnalyzeOwnershipLock(canonicalizePath(entry.storagePath), async () => undefined, {
+          repoRoot,
+          createStoragePath: false,
+        }),
+      ).rejects.toThrow(/another analyze is active/i);
+      await expect(fs.lstat(entry.storagePath)).rejects.toMatchObject({ code: 'ENOENT' });
+
       const analyze = await fetch(`${baseUrl}/api/analyze`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
@@ -905,6 +1210,29 @@ describe('POST /api/embed completed-checkpoint identity', () => {
       await expect(fs.readFile(sentinel, 'utf8')).resolves.toBe('preserve');
     } finally {
       finishUnregister?.();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('deletes an absent registered index without materializing storage', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-delete-absent-storage-'));
+    const repoRoot = path.join(root, 'repo');
+    const storagePath = path.join(repoRoot, '.gitnexus');
+    await fs.mkdir(repoRoot, { recursive: true });
+    const entry = { ...REPO, path: repoRoot, storagePath };
+    state.listRegisteredRepos.mockResolvedValue([entry]);
+
+    try {
+      const response = await fetch(`${baseUrl}/api/repo?repo=${encodeURIComponent(entry.name)}`, {
+        method: 'DELETE',
+      });
+
+      const responseBody = (await response.clone().json()) as { error?: string };
+      expect(response.status, responseBody.error).toBe(200);
+      await expect(response.json()).resolves.toEqual({ deleted: entry.name });
+      expect(state.unregisterRepo).toHaveBeenCalledOnce();
+      await expect(fs.lstat(storagePath)).rejects.toMatchObject({ code: 'ENOENT' });
+    } finally {
       await fs.rm(root, { recursive: true, force: true });
     }
   });
