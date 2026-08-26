@@ -1617,6 +1617,54 @@ const registryEntryProjection = (entry: RegistryEntry): RegistryEntry => ({
   ...(entry.branches !== undefined ? { branches: entry.branches } : {}),
 });
 
+const assertExpectedUnregisterOwner = (
+  repoPath: string,
+  expected: NonNullable<UnregisterRepoOptions['expectedOwner']>,
+): void => {
+  if (!registryPathEquals(canonicalizePath(repoPath), expected.canonicalPath)) {
+    throw new Error('GitNexus: expected registry owner changed before unregister');
+  }
+  let storageExists = true;
+  try {
+    lstatSync(expected.storagePath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') storageExists = false;
+    else throw error;
+  }
+  if (
+    storageExists &&
+    !registryPathEquals(canonicalizePath(expected.storagePath), expected.canonicalStoragePath)
+  ) {
+    throw new Error('GitNexus: expected registry storage changed before unregister');
+  }
+};
+
+type RegistryRemovalReceipt = {
+  removedOwner: RegistryEntry;
+  removedIndex: number;
+};
+
+const rollbackRegistryRemoval = async (receipt: RegistryRemovalReceipt): Promise<void> => {
+  await withRegistryMutationLock(async () => {
+    const fresh = await readRegistry();
+    const removedJson = JSON.stringify(registryEntryProjection(receipt.removedOwner));
+    if (fresh.some((entry) => JSON.stringify(registryEntryProjection(entry)) === removedJson)) {
+      return;
+    }
+    if (
+      fresh.some(
+        (entry) =>
+          entry.path === receipt.removedOwner.path ||
+          entry.storagePath === receipt.removedOwner.storagePath,
+      )
+    ) {
+      throw new Error('GitNexus: registry owner changed after unregister; rollback refused');
+    }
+    fresh.splice(Math.min(receipt.removedIndex, fresh.length), 0, receipt.removedOwner);
+    await writeRegistry(fresh);
+  });
+};
+
 export const unregisterRepo = async (
   repoPath: string,
   opts?: UnregisterRepoOptions,
@@ -1626,26 +1674,10 @@ export const unregisterRepo = async (
   // written with the realpath form (`/private/var/folders/.../repo`),
   // and vice versa. Matches the semantics of `registerRepo` and
   // `resolveRegistryEntry` post-#1003 review.
-  const resolved = canonicalizePath(repoPath);
   const expected = opts?.expectedOwner;
-  if (expected && !registryPathEquals(resolved, expected.canonicalPath)) {
-    throw new Error('GitNexus: expected registry owner changed before unregister');
-  }
-  if (expected) {
-    let storageExists = true;
-    try {
-      lstatSync(expected.storagePath);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') storageExists = false;
-      else throw error;
-    }
-    if (
-      storageExists &&
-      !registryPathEquals(canonicalizePath(expected.storagePath), expected.canonicalStoragePath)
-    ) {
-      throw new Error('GitNexus: expected registry storage changed before unregister');
-    }
-  }
+  const resolved = canonicalizePath(repoPath);
+  if (expected) assertExpectedUnregisterOwner(repoPath, expected);
+  let removalReceipt: RegistryRemovalReceipt | undefined;
   await withRegistryMutationLock(async () => {
     const entries = await readRegistry();
     if (!expected) {
@@ -1664,9 +1696,25 @@ export const unregisterRepo = async (
     if (matches.length !== 1) {
       throw new Error('GitNexus: expected registry owner changed before unregister');
     }
-    entries.splice(matches[0].index, 1);
+    const [{ entry: removedOwner, index: removedIndex }] = matches;
+    entries.splice(removedIndex, 1);
     await writeRegistry(entries);
+    removalReceipt = { removedOwner, removedIndex };
   });
+  if (!expected || !removalReceipt) return;
+  try {
+    assertExpectedUnregisterOwner(repoPath, expected);
+  } catch (error) {
+    try {
+      await rollbackRegistryRemoval(removalReceipt);
+    } catch (rollbackError) {
+      throw new AggregateError(
+        [error, rollbackError],
+        'GitNexus: unregister owner validation failed and registry rollback was incomplete',
+      );
+    }
+    throw error;
+  }
 };
 
 /**

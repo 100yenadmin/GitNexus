@@ -1209,7 +1209,7 @@ describe('registerRepo expected owner CAS (#264)', () => {
     };
     const registryPath = path.join(tmpHome.dbPath, 'registry.json');
     const lockPath = `${registryPath}.lock`;
-    const before = JSON.stringify([expected], null, 2);
+    const before = JSON.stringify([expected]);
     await fs.writeFile(registryPath, before);
     await fs.writeFile(
       lockPath,
@@ -1504,6 +1504,45 @@ describe('registerRepo expected owner CAS (#264)', () => {
       'GitNexus: expected registry storage changed before unregister',
     );
     expect(await fs.readFile(registryPath, 'utf8')).toBe(before);
+  });
+
+  it('restores the removed generation when storage is recreated during registry commit', async () => {
+    const repoRoot = path.join(tmpHome.dbPath, 'unregister-postwrite-root');
+    const storageA = path.join(tmpHome.dbPath, 'unregister-postwrite-a');
+    const storageB = path.join(tmpHome.dbPath, 'unregister-postwrite-b');
+    await fs.mkdir(repoRoot);
+    await fs.mkdir(storageA);
+    await fs.mkdir(storageB);
+    const storageLink = path.join(repoRoot, '.gitnexus');
+    await fs.symlink(storageA, storageLink, 'dir');
+    const expected: RegistryEntry = {
+      ...owner(),
+      path: repoRoot,
+      storagePath: storageLink,
+    };
+    const frozen = frozenOwner(expected);
+    const registryPath = path.join(tmpHome.dbPath, 'registry.json');
+    const before = JSON.stringify([expected], null, 2);
+    await fs.writeFile(registryPath, before);
+    await fs.unlink(storageLink);
+    const realRename = fs.rename.bind(fs);
+    let registryWrites = 0;
+    const renameSpy = vi.spyOn(fs, 'rename').mockImplementation(async (source, target) => {
+      await realRename(source, target);
+      if (path.resolve(String(target)) === path.resolve(registryPath) && ++registryWrites === 1) {
+        await fs.symlink(storageB, storageLink, 'dir');
+      }
+    });
+
+    try {
+      await expect(unregisterRepo(repoRoot, { expectedOwner: frozen })).rejects.toThrow(
+        'GitNexus: expected registry storage changed before unregister',
+      );
+      expect(registryWrites).toBe(2);
+      expect(await fs.readFile(registryPath, 'utf8')).toBe(before);
+    } finally {
+      renameSpy.mockRestore();
+    }
   });
 
   it('refuses unregister after the observed registry generation changes', async () => {

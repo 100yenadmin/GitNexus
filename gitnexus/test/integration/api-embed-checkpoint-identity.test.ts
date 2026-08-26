@@ -822,6 +822,44 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     }
   });
 
+  it('refuses delete when the captured storage link is replaced by a directory', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-issue269-delete-replace-'));
+    const repoRoot = path.join(root, 'repo');
+    const externalStorage = path.join(root, 'external-storage');
+    const externalSentinel = path.join(externalStorage, 'preserved.txt');
+    const replacementSentinel = path.join(repoRoot, '.gitnexus', 'replacement.txt');
+    await fs.mkdir(repoRoot);
+    await fs.mkdir(externalStorage);
+    await fs.writeFile(externalSentinel, 'preserve external');
+    await fs.symlink(externalStorage, path.join(repoRoot, '.gitnexus'), 'dir');
+    const entry = {
+      ...REPO,
+      path: repoRoot,
+      storagePath: path.join(repoRoot, '.gitnexus'),
+    };
+    state.listRegisteredRepos.mockResolvedValue([entry]);
+    state.closeLbug.mockImplementationOnce(async () => {
+      await fs.unlink(entry.storagePath);
+      await fs.mkdir(entry.storagePath);
+      await fs.writeFile(replacementSentinel, 'preserve replacement');
+    });
+
+    try {
+      const response = await fetch(`${baseUrl}/api/repo?repo=${encodeURIComponent(entry.name)}`, {
+        method: 'DELETE',
+      });
+      const body = (await response.json()) as { error?: string };
+
+      expect(response.status).toBe(500);
+      expect(body.error).toMatch(/storage identity changed before deletion/i);
+      await expect(fs.readFile(externalSentinel, 'utf8')).resolves.toBe('preserve external');
+      await expect(fs.readFile(replacementSentinel, 'utf8')).resolves.toBe('preserve replacement');
+      expect(state.unregisterRepo).not.toHaveBeenCalled();
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it('rejects a symlink retarget during zero-checkpoint preflight before registerRepo', async () => {
     const fixture = await prepareSymlinkRace('gitnexus-issue269-preflight-');
     let registryReads = 0;

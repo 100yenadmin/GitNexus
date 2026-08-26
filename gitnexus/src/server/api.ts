@@ -13,7 +13,7 @@ import cors from 'cors';
 import path from 'path';
 import fs from 'fs/promises';
 import { createRequire } from 'node:module';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import {
   canonicalizePath,
   canonicalRepoLockKey,
@@ -94,6 +94,74 @@ type FrozenRegistryOwner = RegistryEntry & {
   canonicalPath: string;
   /** Captured synchronously before the registry read; never persisted. */
   canonicalStoragePath: string;
+};
+
+type StorageObjectIdentity = { dev: number; ino: number; mode: number };
+
+const readStorageObjectIdentity = async (
+  storagePath: string,
+): Promise<StorageObjectIdentity | undefined> => {
+  try {
+    const stats = await fs.lstat(storagePath);
+    return {
+      dev: stats.dev,
+      ino: stats.ino,
+      mode: stats.mode,
+    };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    throw error;
+  }
+};
+
+const storageObjectMatches = (
+  left: StorageObjectIdentity | undefined,
+  right: StorageObjectIdentity | undefined,
+): boolean =>
+  left === undefined || right === undefined
+    ? left === right
+    : left.dev === right.dev && left.ino === right.ino && left.mode === right.mode;
+
+const restoreDetachedStorage = async (detachedPath: string, storagePath: string): Promise<void> => {
+  if ((await readStorageObjectIdentity(storagePath)) !== undefined) {
+    throw new Error(
+      `Cannot restore detached GitNexus storage because the original path is occupied: ${storagePath}`,
+    );
+  }
+  await fs.rename(detachedPath, storagePath);
+};
+
+const detachStorageForDeletion = async (
+  storagePath: string,
+  expected: StorageObjectIdentity | undefined,
+): Promise<string | undefined> => {
+  const current = await readStorageObjectIdentity(storagePath);
+  if (!storageObjectMatches(current, expected)) {
+    throw new Error('GitNexus storage identity changed before deletion; delete refused');
+  }
+  if (!expected) return undefined;
+
+  const detachedPath = path.join(
+    path.dirname(storagePath),
+    `${path.basename(storagePath)}.delete-${randomUUID()}`,
+  );
+  await fs.rename(storagePath, detachedPath);
+  const detached = await readStorageObjectIdentity(detachedPath);
+  if (!storageObjectMatches(detached, expected)) {
+    try {
+      await restoreDetachedStorage(detachedPath, storagePath);
+    } catch (rollbackError) {
+      throw new AggregateError(
+        [
+          new Error('GitNexus detached a replacement storage object; delete refused'),
+          rollbackError,
+        ],
+        `GitNexus storage detach identity failed and rollback was incomplete; preserved ${detachedPath}`,
+      );
+    }
+    throw new Error('GitNexus detached a replacement storage object; delete refused');
+  }
+  return detachedPath;
 };
 
 const freezeZeroClearRegistryOwner = (entry: RegistryEntry): FrozenRegistryOwner => {
@@ -1316,6 +1384,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
       const lockedRepoRoot = canonicalizePath(entry.path);
       const lockKey = canonicalRepoLockKey(lockedRepoRoot);
       const storagePath = getStoragePath(lockedRepoRoot);
+      const observedStorageIdentity = await readStorageObjectIdentity(storagePath);
       const lockErr = acquireRepoLock(lockKey);
       if (lockErr) {
         res.status(409).json({ error: lockErr });
@@ -1323,15 +1392,52 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
       }
 
       try {
+        if (
+          !storageObjectMatches(
+            await readStorageObjectIdentity(storagePath),
+            observedStorageIdentity,
+          )
+        ) {
+          throw new Error('GitNexus storage identity changed during lock acquisition');
+        }
         // Close any open LadybugDB handle before deleting files
         try {
           await closeLbug();
         } catch {}
 
-        // 1. Delete the .gitnexus index/storage directory
-        await fs.rm(storagePath, { recursive: true, force: true }).catch(() => {});
+        const detachedStoragePath = await detachStorageForDeletion(
+          storagePath,
+          observedStorageIdentity,
+        );
 
-        // 2. Delete the cloned repo dir if it lives under ~/.gitnexus/repos/.
+        const { unregisterRepo } = await import('../storage/repo-manager.js');
+        try {
+          await unregisterRepo(entry.path, {
+            expectedOwner: {
+              ...entry,
+              canonicalPath: lockedRepoRoot,
+              canonicalStoragePath: lockKey,
+            },
+          });
+        } catch (error) {
+          if (detachedStoragePath) {
+            try {
+              await restoreDetachedStorage(detachedStoragePath, storagePath);
+            } catch (rollbackError) {
+              throw new AggregateError(
+                [error, rollbackError],
+                `GitNexus unregister failed and detached storage rollback was incomplete; preserved ${detachedStoragePath}`,
+              );
+            }
+          }
+          throw error;
+        }
+
+        if (detachedStoragePath) {
+          await fs.rm(detachedStoragePath, { recursive: true, force: true }).catch(() => {});
+        }
+
+        // 3. Delete the cloned repo dir if it lives under ~/.gitnexus/repos/.
         // getCloneDir now throws on names that are not filesystem-safe (e.g.
         // local repos registered with names like "my project" or "org/repo").
         // Such repos legitimately have no clone dir, so treat the rejection as
@@ -1356,23 +1462,13 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
           }
         }
 
-        // 2b. Delete the uploaded repo dir if entry.path lives under
+        // 3b. Delete the uploaded repo dir if entry.path lives under
         // UPLOAD_ROOT. Drive this off entry.path (not a name-rederived dir) so
         // a same-named clone is never affected.
         const resolvedEntry = path.resolve(entry.path);
         if (resolvedEntry === UPLOAD_ROOT || resolvedEntry.startsWith(UPLOAD_ROOT + path.sep)) {
           await fs.rm(resolvedEntry, { recursive: true, force: true }).catch(() => {});
         }
-
-        // 3. Unregister from the global registry
-        const { unregisterRepo } = await import('../storage/repo-manager.js');
-        await unregisterRepo(entry.path, {
-          expectedOwner: {
-            ...entry,
-            canonicalPath: lockedRepoRoot,
-            canonicalStoragePath: lockKey,
-          },
-        });
 
         // 4. Reinitialize backend to reflect the removal
         await backend.init().catch(() => {});
