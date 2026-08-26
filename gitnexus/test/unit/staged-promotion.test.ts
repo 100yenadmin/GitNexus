@@ -21,6 +21,17 @@ const recoveryEntries = async (lockPath: string): Promise<string[]> => {
   return (await fs.readdir(path.dirname(lockPath))).filter((entry) => entry.startsWith(prefix));
 };
 
+const writeDeadAnalyzeLock = (lockPath: string): Promise<void> =>
+  fs.writeFile(
+    lockPath,
+    `${JSON.stringify({
+      schema: 'gitnexus.staged-analyze-lock/v1',
+      pid: 2_147_483_647,
+      nonce: 'dead-owner',
+      startedAt: '2026-07-20T00:00:00.000Z',
+    })}\n`,
+  );
+
 const makeMeta = (generation: string): RepoMeta => ({
   repoPath: '/repo',
   lastCommit: generation,
@@ -436,15 +447,7 @@ describe('common analyze ownership lock', () => {
   it('reclaims a lock whose owner process is gone', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-stage-lock-'));
     tempDirs.push(root);
-    await fs.writeFile(
-      path.join(root, 'analyze-staged.lock'),
-      `${JSON.stringify({
-        schema: 'gitnexus.staged-analyze-lock/v1',
-        pid: 2_147_483_647,
-        nonce: 'dead-owner',
-        startedAt: '2026-07-20T00:00:00.000Z',
-      })}\n`,
-    );
+    await writeDeadAnalyzeLock(path.join(root, 'analyze-staged.lock'));
 
     await expect(withAnalyzeOwnershipLock(root, async () => 'ok')).resolves.toBe('ok');
     await expect(fs.access(path.join(root, 'analyze-staged.lock'))).rejects.toMatchObject({
@@ -457,15 +460,7 @@ describe('common analyze ownership lock', () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-stage-lock-race-'));
     tempDirs.push(root);
     const lockPath = path.join(root, 'analyze-staged.lock');
-    await fs.writeFile(
-      lockPath,
-      `${JSON.stringify({
-        schema: 'gitnexus.staged-analyze-lock/v1',
-        pid: 2_147_483_647,
-        nonce: 'dead-owner',
-        startedAt: '2026-07-20T00:00:00.000Z',
-      })}\n`,
-    );
+    await writeDeadAnalyzeLock(lockPath);
 
     let release!: () => void;
     const releaseGate = new Promise<void>((resolve) => {
@@ -504,20 +499,57 @@ describe('common analyze ownership lock', () => {
     expect(await recoveryEntries(lockPath)).toEqual([]);
   });
 
+  it('does not clear an active reclaimer after its final identity check', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-stage-lock-paused-reclaim-'));
+    tempDirs.push(root);
+    const lockPath = path.join(root, 'analyze-staged.lock');
+    await writeDeadAnalyzeLock(lockPath);
+
+    let markPaused!: () => void;
+    const paused = new Promise<void>((resolve) => {
+      markPaused = resolve;
+    });
+    let resume!: () => void;
+    const resumeGate = new Promise<void>((resolve) => {
+      resume = resolve;
+    });
+    const originalRm = fs.rm.bind(fs);
+    let pausedMainRemoval = false;
+    const rmSpy = vi.spyOn(fs, 'rm').mockImplementation(async (target, options) => {
+      if (String(target) === lockPath && !pausedMainRemoval) {
+        pausedMainRemoval = true;
+        markPaused();
+        await resumeGate;
+      }
+      return originalRm(target, options);
+    });
+
+    let entered = 0;
+    const reclaimer = withAnalyzeOwnershipLock(root, async () => {
+      entered += 1;
+    });
+    try {
+      await paused;
+      await expect(withAnalyzeOwnershipLock(root, async () => undefined)).rejects.toThrow(
+        /recovery is active/i,
+      );
+      expect(entered).toBe(0);
+    } finally {
+      resume();
+      rmSpy.mockRestore();
+    }
+    await reclaimer;
+    expect(entered).toBe(1);
+    await expect(fs.access(lockPath)).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(await recoveryEntries(lockPath)).toEqual([]);
+  });
+
   it('recovers a dead hard-link claim left before stale-main removal', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-stage-lock-claim-before-'));
     tempDirs.push(root);
     const lockPath = path.join(root, 'analyze-staged.lock');
-    await fs.writeFile(
-      lockPath,
-      `${JSON.stringify({
-        schema: 'gitnexus.staged-analyze-lock/v1',
-        pid: 2_147_483_647,
-        nonce: 'dead-owner',
-        startedAt: '2026-07-20T00:00:00.000Z',
-      })}\n`,
-    );
-    await fs.link(lockPath, `${lockPath}.reclaim.2147483646.deadca11`);
+    await writeDeadAnalyzeLock(lockPath);
+    await fs.link(lockPath, `${lockPath}.reclaim.2147483646.deadbeef.deadca11`);
 
     await expect(withAnalyzeOwnershipLock(root, async () => 'recovered')).resolves.toBe(
       'recovered',
@@ -530,16 +562,8 @@ describe('common analyze ownership lock', () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-stage-lock-claim-after-'));
     tempDirs.push(root);
     const lockPath = path.join(root, 'analyze-staged.lock');
-    await fs.writeFile(
-      lockPath,
-      `${JSON.stringify({
-        schema: 'gitnexus.staged-analyze-lock/v1',
-        pid: 2_147_483_647,
-        nonce: 'dead-owner',
-        startedAt: '2026-07-20T00:00:00.000Z',
-      })}\n`,
-    );
-    await fs.link(lockPath, `${lockPath}.reclaim.2147483646.deadca11`);
+    await writeDeadAnalyzeLock(lockPath);
+    await fs.link(lockPath, `${lockPath}.reclaim.2147483646.deadbeef.deadca11`);
     await fs.rm(lockPath);
 
     await expect(withAnalyzeOwnershipLock(root, async () => 'recovered')).resolves.toBe(
@@ -553,16 +577,8 @@ describe('common analyze ownership lock', () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-stage-lock-claim-reused-'));
     tempDirs.push(root);
     const lockPath = path.join(root, 'analyze-staged.lock');
-    await fs.writeFile(
-      lockPath,
-      `${JSON.stringify({
-        schema: 'gitnexus.staged-analyze-lock/v1',
-        pid: 2_147_483_647,
-        nonce: 'dead-owner',
-        startedAt: '2026-07-20T00:00:00.000Z',
-      })}\n`,
-    );
-    await fs.link(lockPath, `${lockPath}.reclaim.${process.pid}.deadca11`);
+    await writeDeadAnalyzeLock(lockPath);
+    await fs.link(lockPath, `${lockPath}.reclaim.${process.pid}.deadbeef.deadca11`);
     await fs.rm(lockPath);
 
     await expect(withAnalyzeOwnershipLock(root, async () => 'recovered')).resolves.toBe(
@@ -596,16 +612,8 @@ describe('common analyze ownership lock', () => {
       startedAt: '2026-07-20T00:00:01.000Z',
     };
     await fs.writeFile(lockPath, `${JSON.stringify(liveOwner)}\n`);
-    await fs.writeFile(
-      unrelated,
-      `${JSON.stringify({
-        schema: 'gitnexus.staged-analyze-lock/v1',
-        pid: 2_147_483_647,
-        nonce: 'dead-owner',
-        startedAt: '2026-07-20T00:00:00.000Z',
-      })}\n`,
-    );
-    const claimPath = `${lockPath}.reclaim.2147483646.deadca11`;
+    await writeDeadAnalyzeLock(unrelated);
+    const claimPath = `${lockPath}.reclaim.2147483646.deadbeef.deadca11`;
     await fs.link(unrelated, claimPath);
 
     await expect(withAnalyzeOwnershipLock(root, async () => undefined)).rejects.toThrow(

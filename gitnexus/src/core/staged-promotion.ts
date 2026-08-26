@@ -1,6 +1,8 @@
 import { createHash, randomBytes } from 'crypto';
+import { execFile } from 'child_process';
 import path from 'path';
 import fs from 'fs/promises';
+import { promisify } from 'util';
 import { retryRename } from '../storage/fs-atomic.js';
 import {
   canonicalizePath,
@@ -339,6 +341,72 @@ const processIsAlive = (pid: number): boolean => {
   }
 };
 
+const execFileAsync = promisify(execFile);
+
+const readProcessStartIdentity = async (pid: number): Promise<string | undefined> => {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return undefined;
+  if (process.platform === 'linux') {
+    const stat = await fs.readFile(`/proc/${pid}/stat`, 'utf8').catch((error) => {
+      if (isMissingFilesystemError(error)) return undefined;
+      throw error;
+    });
+    if (!stat) return undefined;
+    const fields = stat
+      .slice(stat.lastIndexOf(')') + 2)
+      .trim()
+      .split(/\s+/);
+    const startTicks = fields[19];
+    if (!startTicks) throw new Error(`Could not read process start identity for pid ${pid}`);
+    return `linux:${startTicks}`;
+  }
+
+  if (process.platform === 'win32') {
+    const script =
+      `$p = Get-Process -Id ${pid} -ErrorAction SilentlyContinue; ` +
+      'if ($null -eq $p) { exit 3 }; ' +
+      '[Console]::Out.Write($p.StartTime.ToUniversalTime().Ticks)';
+    try {
+      const { stdout } = await execFileAsync('powershell.exe', [
+        '-NoProfile',
+        '-NonInteractive',
+        '-Command',
+        script,
+      ]);
+      const value = stdout.trim();
+      if (!value) throw new Error(`Could not read process start identity for pid ${pid}`);
+      return `win32:${value}`;
+    } catch (error) {
+      const code = (error as { code?: unknown }).code;
+      if (code === 3 || code === '3') return undefined;
+      throw error;
+    }
+  }
+
+  try {
+    const { stdout } = await execFileAsync('ps', ['-o', 'lstart=', '-p', String(pid)]);
+    const value = stdout.trim();
+    return value ? `${process.platform}:${value}` : undefined;
+  } catch (error) {
+    const code = (error as { code?: unknown }).code;
+    if (code === 1 || code === '1') return undefined;
+    throw error;
+  }
+};
+
+const processStartToken = async (pid: number): Promise<string | undefined> => {
+  const identity = await readProcessStartIdentity(pid);
+  return identity ? createHash('sha256').update(identity).digest('hex').slice(0, 24) : undefined;
+};
+
+let currentProcessStartToken: Promise<string> | undefined;
+const getCurrentProcessStartToken = (): Promise<string> => {
+  currentProcessStartToken ??= processStartToken(process.pid).then((token) => {
+    if (!token) throw new Error('Could not establish the current process start identity');
+    return token;
+  });
+  return currentProcessStartToken;
+};
+
 const validStageLockRecord = (value: unknown): value is StageLockRecord => {
   const candidate = value as Partial<StageLockRecord> | null;
   return (
@@ -364,13 +432,19 @@ const sameFileObject = (left: FileIdentity, right: FileIdentity): boolean =>
 interface RecoveryClaim {
   path: string;
   pid: number;
+  processStartToken: string;
   nonce: string;
 }
 
+const activeRecoveryPaths = new Set<string>();
+
 const recoveryClaimPrefix = (lockPath: string): string => `${path.basename(lockPath)}.reclaim.`;
 
-const recoveryClaimPath = (lockPath: string, claimant: StageLockRecord): string =>
-  `${lockPath}.reclaim.${claimant.pid}.${claimant.nonce}`;
+const recoveryClaimPath = (
+  lockPath: string,
+  claimant: StageLockRecord,
+  claimantStartToken: string,
+): string => `${lockPath}.reclaim.${claimant.pid}.${claimantStartToken}.${claimant.nonce}`;
 
 const assertNoLegacyRecoveryMarker = async (lockPath: string): Promise<void> => {
   const legacyPath = `${lockPath}.reclaim`;
@@ -398,7 +472,7 @@ const listRecoveryClaims = async (lockPath: string): Promise<RecoveryClaim[]> =>
   const claims: RecoveryClaim[] = [];
   for (const entry of entries) {
     if (!entry.name.startsWith(prefix)) continue;
-    const match = entry.name.slice(prefix.length).match(/^(\d+)\.([0-9a-f]+)$/);
+    const match = entry.name.slice(prefix.length).match(/^(\d+)\.([0-9a-f]+)\.([0-9a-f]+)$/);
     if (!entry.isFile() || !match) {
       throw new AnalyzeOwnershipConflictError(
         `Analyze recovery state is malformed at ${path.join(directory, entry.name)}; ` +
@@ -412,7 +486,12 @@ const listRecoveryClaims = async (lockPath: string): Promise<RecoveryClaim[]> =>
           'verify no writer is active before removing it.',
       );
     }
-    claims.push({ path: path.join(directory, entry.name), pid, nonce: match[2] });
+    claims.push({
+      path: path.join(directory, entry.name),
+      pid,
+      processStartToken: match[2],
+      nonce: match[3],
+    });
   }
   return claims;
 };
@@ -420,6 +499,11 @@ const listRecoveryClaims = async (lockPath: string): Promise<RecoveryClaim[]> =>
 const clearRecoveryClaims = async (lockPath: string): Promise<void> => {
   await assertNoLegacyRecoveryMarker(lockPath);
   for (const claim of await listRecoveryClaims(lockPath)) {
+    if ((await processStartToken(claim.pid)) === claim.processStartToken) {
+      throw new AnalyzeOwnershipConflictError(
+        `Analyze lock recovery is active (pid ${claim.pid}); retry after it completes.`,
+      );
+    }
     const claimOwner = await readJson<StageLockRecord>(claim.path).catch(() => undefined);
     const claimIdentity = await statRegularFile(claim.path);
     if (!claimOwner || !validStageLockRecord(claimOwner) || !claimIdentity) {
@@ -445,10 +529,9 @@ const clearRecoveryClaims = async (lockPath: string): Promise<void> => {
         );
       }
     }
-    // A claim is only a hard link to the observed stale owner. Removing it is
-    // safe even if its PID has been reused or its original reclaimer is paused:
-    // the reclaimer must still revalidate the main inode before unlinking it,
-    // and every writer rechecks the claim namespace before entering.
+    // The process-start token distinguishes a reused PID. Reaching this point
+    // proves the original reclaimer is gone, so only its unique hard link is
+    // removed; ambiguous or active claims remain fail-closed above.
     await fs.rm(claim.path, { force: true });
   }
 };
@@ -457,49 +540,58 @@ const reclaimStaleOwnershipLock = async (
   lockPath: string,
   observedOwner: StageLockRecord,
   claimant: StageLockRecord,
+  claimantStartToken: string,
 ): Promise<boolean> => {
-  const claimPath = recoveryClaimPath(lockPath, claimant);
-  try {
-    await fs.link(lockPath, claimPath);
-  } catch (error) {
-    if (isMissingFilesystemError(error)) return true;
-    throw error;
+  if (activeRecoveryPaths.has(lockPath)) {
+    throw new AnalyzeOwnershipConflictError('Analyze lock recovery is already active; retry.');
   }
-
+  activeRecoveryPaths.add(lockPath);
+  const claimPath = recoveryClaimPath(lockPath, claimant, claimantStartToken);
   try {
-    const claimOwner = await readJson<StageLockRecord>(claimPath).catch(() => undefined);
-    const claimIdentity = await statRegularFile(claimPath);
-    if (
-      !claimOwner ||
-      !validStageLockRecord(claimOwner) ||
-      !claimIdentity ||
-      !sameStageLockRecord(claimOwner, observedOwner) ||
-      processIsAlive(claimOwner.pid)
-    ) {
-      return false;
+    try {
+      await fs.link(lockPath, claimPath);
+    } catch (error) {
+      if (isMissingFilesystemError(error)) return true;
+      throw error;
     }
-    const current = await readJson<StageLockRecord>(lockPath).catch(() => undefined);
-    const currentIdentity = await statRegularFile(lockPath);
-    if (current || currentIdentity) {
+
+    try {
+      const claimOwner = await readJson<StageLockRecord>(claimPath).catch(() => undefined);
+      const claimIdentity = await statRegularFile(claimPath);
       if (
-        !current ||
-        !validStageLockRecord(current) ||
-        !currentIdentity ||
-        !sameStageLockRecord(current, observedOwner) ||
-        !sameFileObject(currentIdentity, claimIdentity) ||
-        processIsAlive(current.pid)
+        !claimOwner ||
+        !validStageLockRecord(claimOwner) ||
+        !claimIdentity ||
+        !sameStageLockRecord(claimOwner, observedOwner) ||
+        processIsAlive(claimOwner.pid)
       ) {
         return false;
       }
-      try {
-        await fs.rm(lockPath);
-      } catch (error) {
-        if (!isMissingFilesystemError(error)) throw error;
+      const current = await readJson<StageLockRecord>(lockPath).catch(() => undefined);
+      const currentIdentity = await statRegularFile(lockPath);
+      if (current || currentIdentity) {
+        if (
+          !current ||
+          !validStageLockRecord(current) ||
+          !currentIdentity ||
+          !sameStageLockRecord(current, observedOwner) ||
+          !sameFileObject(currentIdentity, claimIdentity) ||
+          processIsAlive(current.pid)
+        ) {
+          return false;
+        }
+        try {
+          await fs.rm(lockPath);
+        } catch (error) {
+          if (!isMissingFilesystemError(error)) throw error;
+        }
       }
+      return true;
+    } finally {
+      await fs.rm(claimPath, { force: true });
     }
-    return true;
   } finally {
-    await fs.rm(claimPath, { force: true });
+    activeRecoveryPaths.delete(lockPath);
   }
 };
 
@@ -520,6 +612,7 @@ const withOwnershipFileLock = async <T>(
     nonce: randomBytes(16).toString('hex'),
     startedAt: new Date().toISOString(),
   };
+  const claimantStartToken = await getCurrentProcessStartToken();
   let handle: Awaited<ReturnType<typeof fs.open>> | undefined;
   for (let attempt = 0; attempt < 2; attempt++) {
     await clearRecoveryClaims(lockPath);
@@ -542,7 +635,7 @@ const withOwnershipFileLock = async <T>(
       if (attempt === 1) {
         throw new AnalyzeOwnershipConflictError('Could not acquire the reclaimed analyze lock');
       }
-      if (!(await reclaimStaleOwnershipLock(lockPath, owner, record))) {
+      if (!(await reclaimStaleOwnershipLock(lockPath, owner, record, claimantStartToken))) {
         throw new AnalyzeOwnershipConflictError(
           'Analyze ownership changed during stale-lock recovery; retry.',
         );
