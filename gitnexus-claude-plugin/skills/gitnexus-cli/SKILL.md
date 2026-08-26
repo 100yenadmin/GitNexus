@@ -108,3 +108,5 @@ source actually changed. Refresh at most once per merge or batch.
 Deep refresh discipline (worker counts, staged embedding rebuilds, heap
 envelope, lock rules) lives in the codex-operating-kit runbook
 `runbooks/gitnexus-index-refresh.md` — read it before any non-routine refresh.
+
+(If this section and the codex-operating-kit runbook `runbooks/gitnexus-index-refresh.md` §Routine post-merge reconciliation ever differ, the runbook is canonical.)
