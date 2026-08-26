@@ -499,6 +499,42 @@ describe('common analyze ownership lock', () => {
     }
   });
 
+  it('preserves the operation failure when owned-lock release also exhausts its retries', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-stage-lock-dual-failure-'));
+    tempDirs.push(root);
+    const lockPath = path.join(root, 'analyze-staged.lock');
+    const originalRm = fs.rm.bind(fs);
+    const rmSpy = vi.spyOn(fs, 'rm');
+    let operationEntered = false;
+    let releaseAttempts = 0;
+
+    rmSpy.mockImplementation(async (target, options) => {
+      if (operationEntered && String(target) === lockPath) {
+        releaseAttempts++;
+        throw Object.assign(new Error('release retries exhausted'), { code: 'EPERM' });
+      }
+      return originalRm(target, options);
+    });
+
+    try {
+      const failure = await withAnalyzeOwnershipLock(root, async () => {
+        operationEntered = true;
+        throw new Error('analysis failed first');
+      }).catch((error) => error);
+
+      expect(failure).toBeInstanceOf(AggregateError);
+      expect((failure as AggregateError).errors).toEqual([
+        expect.objectContaining({ message: 'analysis failed first' }),
+        expect.objectContaining({ message: 'release retries exhausted' }),
+      ]);
+      expect((failure as Error).message).toMatch(/analysis failed first/);
+      expect((failure as Error).message).toMatch(/release retries exhausted/);
+      expect(releaseAttempts).toBe(3);
+    } finally {
+      rmSpy.mockRestore();
+    }
+  });
+
   it('retries a wrapped transient read failure while releasing the owned main lock', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-stage-lock-read-release-'));
     tempDirs.push(root);

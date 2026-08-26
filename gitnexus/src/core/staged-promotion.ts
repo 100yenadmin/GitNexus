@@ -1102,6 +1102,8 @@ const withOwnershipFileLock = async <T>(
   let ownsLock = false;
   let publicationSourcePath: string | undefined;
   let legacyLease: LegacyRecoveryLease | undefined;
+  let operationFailed = false;
+  let operationFailure: unknown;
   let claimantStartToken: string | undefined = ownerProcessStartToken;
   const requireClaimantStartToken = async (): Promise<string> => {
     claimantStartToken ??= await getCurrentProcessStartToken().catch(() => {
@@ -1167,13 +1169,31 @@ const withOwnershipFileLock = async <T>(
       await clearRecoveryClaims(lockPath, record, await requireClaimantStartToken());
     }
     return await operation();
+  } catch (error) {
+    operationFailed = true;
+    operationFailure = error;
+    throw error;
   } finally {
     if (legacyLease) await releaseLegacyRecoveryLease(legacyLease);
     if (publicationSourcePath) {
       await fs.rm(publicationSourcePath, { force: true }).catch(() => {});
     }
     if (ownsLock) {
-      await releaseOwnedOwnershipLock(lockPath, record);
+      try {
+        await releaseOwnedOwnershipLock(lockPath, record);
+      } catch (releaseError) {
+        if (operationFailed) {
+          const operationMessage =
+            operationFailure instanceof Error ? operationFailure.message : String(operationFailure);
+          const releaseMessage =
+            releaseError instanceof Error ? releaseError.message : String(releaseError);
+          throw new AggregateError(
+            [operationFailure, releaseError],
+            `Analyze ownership operation failed: ${operationMessage}; ownership lock release also failed: ${releaseMessage}`,
+          );
+        }
+        throw releaseError;
+      }
     }
   }
 };
