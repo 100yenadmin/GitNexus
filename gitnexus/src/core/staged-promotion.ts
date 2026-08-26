@@ -372,6 +372,22 @@ const recoveryClaimPrefix = (lockPath: string): string => `${path.basename(lockP
 const recoveryClaimPath = (lockPath: string, claimant: StageLockRecord): string =>
   `${lockPath}.reclaim.${claimant.pid}.${claimant.nonce}`;
 
+const assertNoLegacyRecoveryMarker = async (lockPath: string): Promise<void> => {
+  const legacyPath = `${lockPath}.reclaim`;
+  const exists = await fs
+    .lstat(legacyPath)
+    .then(() => true)
+    .catch((error) => {
+      if (isMissingFilesystemError(error)) return false;
+      throw error;
+    });
+  if (exists) {
+    throw new AnalyzeOwnershipConflictError(
+      `A legacy analyze recovery is active at ${legacyPath}; retry after it completes.`,
+    );
+  }
+};
+
 const listRecoveryClaims = async (lockPath: string): Promise<RecoveryClaim[]> => {
   const directory = path.dirname(lockPath);
   const prefix = recoveryClaimPrefix(lockPath);
@@ -401,13 +417,9 @@ const listRecoveryClaims = async (lockPath: string): Promise<RecoveryClaim[]> =>
   return claims;
 };
 
-const clearDeadRecoveryClaims = async (lockPath: string): Promise<void> => {
+const clearRecoveryClaims = async (lockPath: string): Promise<void> => {
+  await assertNoLegacyRecoveryMarker(lockPath);
   for (const claim of await listRecoveryClaims(lockPath)) {
-    if (processIsAlive(claim.pid)) {
-      throw new AnalyzeOwnershipConflictError(
-        `Analyze lock recovery is active (pid ${claim.pid}); retry after it completes.`,
-      );
-    }
     const claimOwner = await readJson<StageLockRecord>(claim.path).catch(() => undefined);
     const claimIdentity = await statRegularFile(claim.path);
     if (!claimOwner || !validStageLockRecord(claimOwner) || !claimIdentity) {
@@ -433,8 +445,10 @@ const clearDeadRecoveryClaims = async (lockPath: string): Promise<void> => {
         );
       }
     }
-    // The claimant path includes a never-reused nonce, so removing a dead
-    // claimant cannot unlink a later process's recovery entry or main lock.
+    // A claim is only a hard link to the observed stale owner. Removing it is
+    // safe even if its PID has been reused or its original reclaimer is paused:
+    // the reclaimer must still revalidate the main inode before unlinking it,
+    // and every writer rechecks the claim namespace before entering.
     await fs.rm(claim.path, { force: true });
   }
 };
@@ -508,7 +522,7 @@ const withOwnershipFileLock = async <T>(
   };
   let handle: Awaited<ReturnType<typeof fs.open>> | undefined;
   for (let attempt = 0; attempt < 2; attempt++) {
-    await clearDeadRecoveryClaims(lockPath);
+    await clearRecoveryClaims(lockPath);
     try {
       handle = await fs.open(lockPath, 'wx', 0o600);
       break;
@@ -540,9 +554,9 @@ const withOwnershipFileLock = async <T>(
     await handle.writeFile(`${JSON.stringify(record)}\n`, 'utf8');
     await handle.sync();
     // A contender that observed the prior stale owner may have linked it just
-    // before this owner replaced the main path. Never enter while any live or
-    // ambiguous recovery claim exists.
-    await clearDeadRecoveryClaims(lockPath);
+    // before this owner replaced the main path. Clear only safe stale claims;
+    // any ambiguous claim keeps this owner out of the callback.
+    await clearRecoveryClaims(lockPath);
     return await operation();
   } finally {
     await handle.close().catch(() => {});

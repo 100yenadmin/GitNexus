@@ -549,6 +549,41 @@ describe('common analyze ownership lock', () => {
     expect(await recoveryEntries(lockPath)).toEqual([]);
   });
 
+  it('recovers an orphaned claim after its claimant PID is reused', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-stage-lock-claim-reused-'));
+    tempDirs.push(root);
+    const lockPath = path.join(root, 'analyze-staged.lock');
+    await fs.writeFile(
+      lockPath,
+      `${JSON.stringify({
+        schema: 'gitnexus.staged-analyze-lock/v1',
+        pid: 2_147_483_647,
+        nonce: 'dead-owner',
+        startedAt: '2026-07-20T00:00:00.000Z',
+      })}\n`,
+    );
+    await fs.link(lockPath, `${lockPath}.reclaim.${process.pid}.deadca11`);
+    await fs.rm(lockPath);
+
+    await expect(withAnalyzeOwnershipLock(root, async () => 'recovered')).resolves.toBe(
+      'recovered',
+    );
+    expect(await recoveryEntries(lockPath)).toEqual([]);
+  });
+
+  it('fails closed while a legacy recovery marker exists', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-stage-lock-legacy-'));
+    tempDirs.push(root);
+    const lockPath = path.join(root, 'analyze-staged.lock');
+    const markerPath = `${lockPath}.reclaim`;
+    await fs.writeFile(markerPath, 'legacy-recovery');
+
+    await expect(withAnalyzeOwnershipLock(root, async () => undefined)).rejects.toThrow(
+      /legacy analyze recovery is active/i,
+    );
+    await expect(fs.readFile(markerPath, 'utf8')).resolves.toBe('legacy-recovery');
+  });
+
   it('preserves mismatched live ownership when a dead recovery claim is ambiguous', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-stage-lock-claim-mismatch-'));
     tempDirs.push(root);
