@@ -1083,9 +1083,11 @@ describe('POST /api/embed completed-checkpoint identity', () => {
 
     rmSpy.mockImplementation(async (target, options) => {
       const targetPath = String(target);
+      const targetName = path.basename(targetPath);
       if (
         state.unregisterRepo.mock.calls.length > 0 &&
-        path.basename(targetPath).startsWith('analyze-') &&
+        targetName.startsWith('analyze-') &&
+        targetName !== 'analyze-staged.lock' &&
         targetPath.endsWith('.lock')
       ) {
         releaseAttempts++;
