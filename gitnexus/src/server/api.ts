@@ -70,6 +70,7 @@ import { assertCompletedCheckpointIdentity } from '../core/embeddings/checkpoint
 import type { EmbeddingIdentity } from '../core/embeddings/embedding-identity.js';
 import { EMBEDDABLE_LABELS } from '../core/embeddings/types.js';
 import { escapeCypherString } from '../core/lbug/cypher-escape.js';
+import { withAnalyzeOwnershipLock } from '../core/staged-promotion.js';
 
 const _require = createRequire(import.meta.url);
 const pkg = _require('../../package.json');
@@ -1413,102 +1414,104 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
       }
 
       try {
-        if (
-          !storageObjectMatches(
-            await readStorageObjectIdentity(storagePath),
+        await withAnalyzeOwnershipLock(storageLockKey, async () => {
+          if (
+            !storageObjectMatches(
+              await readStorageObjectIdentity(storagePath),
+              observedStorageIdentity,
+            )
+          ) {
+            throw new Error('GitNexus storage identity changed during lock acquisition');
+          }
+          // Close any open LadybugDB handle before deleting files
+          try {
+            await closeLbug();
+          } catch {}
+
+          const detachedStoragePath = await detachStorageForDeletion(
+            storagePath,
             observedStorageIdentity,
-          )
-        ) {
-          throw new Error('GitNexus storage identity changed during lock acquisition');
-        }
-        // Close any open LadybugDB handle before deleting files
-        try {
-          await closeLbug();
-        } catch {}
+          );
 
-        const detachedStoragePath = await detachStorageForDeletion(
-          storagePath,
-          observedStorageIdentity,
-        );
+          const { unregisterRepo } = await import('../storage/repo-manager.js');
+          try {
+            await unregisterRepo(entry.path, {
+              expectedOwner: {
+                ...entry,
+                canonicalPath: lockedRepoRoot,
+                canonicalStoragePath: storageLockKey,
+              },
+            });
+          } catch (error) {
+            if (detachedStoragePath) {
+              try {
+                await restoreDetachedStorage(detachedStoragePath, storagePath);
+              } catch (rollbackError) {
+                throw new AggregateError(
+                  [error, rollbackError],
+                  `GitNexus unregister failed and detached storage rollback was incomplete; preserved ${detachedStoragePath}`,
+                );
+              }
+            }
+            throw error;
+          }
 
-        const { unregisterRepo } = await import('../storage/repo-manager.js');
-        try {
-          await unregisterRepo(entry.path, {
-            expectedOwner: {
-              ...entry,
-              canonicalPath: lockedRepoRoot,
-              canonicalStoragePath: storageLockKey,
-            },
-          });
-        } catch (error) {
           if (detachedStoragePath) {
             try {
-              await restoreDetachedStorage(detachedStoragePath, storagePath);
-            } catch (rollbackError) {
-              throw new AggregateError(
-                [error, rollbackError],
-                `GitNexus unregister failed and detached storage rollback was incomplete; preserved ${detachedStoragePath}`,
+              await fs.rm(detachedStoragePath, {
+                recursive: true,
+                force: true,
+                maxRetries: 2,
+                retryDelay: 100,
+              });
+            } catch (error) {
+              throw new Error(
+                `GitNexus unregistered the repository but could not remove detached storage; ` +
+                  `preserved ${detachedStoragePath}. Resolve the filesystem error and remove ` +
+                  `that exact path before retrying.`,
+                { cause: error },
               );
             }
           }
-          throw error;
-        }
 
-        if (detachedStoragePath) {
+          // 3. Delete the cloned repo dir if it lives under ~/.gitnexus/repos/.
+          // getCloneDir now throws on names that are not filesystem-safe (e.g.
+          // local repos registered with names like "my project" or "org/repo").
+          // Such repos legitimately have no clone dir, so treat the rejection as
+          // "nothing to clean up" rather than letting it fail the delete handler.
+          let cloneDir: string | null = null;
           try {
-            await fs.rm(detachedStoragePath, {
-              recursive: true,
-              force: true,
-              maxRetries: 2,
-              retryDelay: 100,
-            });
-          } catch (error) {
-            throw new Error(
-              `GitNexus unregistered the repository but could not remove detached storage; ` +
-                `preserved ${detachedStoragePath}. Resolve the filesystem error and remove ` +
-                `that exact path before retrying.`,
-              { cause: error },
-            );
-          }
-        }
-
-        // 3. Delete the cloned repo dir if it lives under ~/.gitnexus/repos/.
-        // getCloneDir now throws on names that are not filesystem-safe (e.g.
-        // local repos registered with names like "my project" or "org/repo").
-        // Such repos legitimately have no clone dir, so treat the rejection as
-        // "nothing to clean up" rather than letting it fail the delete handler.
-        let cloneDir: string | null = null;
-        try {
-          cloneDir = getCloneDir(entry.name);
-        } catch {
-          /* repo name not eligible for a clone dir (local repo) */
-        }
-        // Only remove the clone dir when it is *this* entry's path — a local
-        // repo registered under the same name would otherwise take a cloned
-        // sibling's checkout down with it (see cloneDirBelongsToEntry).
-        if (cloneDir && cloneDirBelongsToEntry(cloneDir, entry.path)) {
-          try {
-            const stat = await fs.stat(cloneDir);
-            if (stat.isDirectory()) {
-              await fs.rm(cloneDir, { recursive: true, force: true });
-            }
+            cloneDir = getCloneDir(entry.name);
           } catch {
-            /* clone dir may not exist */
+            /* repo name not eligible for a clone dir (local repo) */
           }
-        }
+          // Only remove the clone dir when it is *this* entry's path — a local
+          // repo registered under the same name would otherwise take a cloned
+          // sibling's checkout down with it (see cloneDirBelongsToEntry).
+          if (cloneDir && cloneDirBelongsToEntry(cloneDir, entry.path)) {
+            try {
+              const stat = await fs.stat(cloneDir);
+              if (stat.isDirectory()) {
+                await fs.rm(cloneDir, { recursive: true, force: true });
+              }
+            } catch {
+              /* clone dir may not exist */
+            }
+          }
 
-        // 3b. Delete the uploaded repo dir if entry.path lives under
-        // UPLOAD_ROOT. Drive this off entry.path (not a name-rederived dir) so
-        // a same-named clone is never affected.
-        const resolvedEntry = path.resolve(entry.path);
-        if (resolvedEntry === UPLOAD_ROOT || resolvedEntry.startsWith(UPLOAD_ROOT + path.sep)) {
-          await fs.rm(resolvedEntry, { recursive: true, force: true }).catch(() => {});
-        }
+          // 3b. Delete the uploaded repo dir if entry.path lives under
+          // UPLOAD_ROOT. Drive this off entry.path (not a name-rederived dir) so
+          // a same-named clone is never affected.
+          const resolvedEntry = path.resolve(entry.path);
+          if (resolvedEntry === UPLOAD_ROOT || resolvedEntry.startsWith(UPLOAD_ROOT + path.sep)) {
+            await fs.rm(resolvedEntry, { recursive: true, force: true }).catch(() => {});
+          }
 
-        // 4. Reinitialize backend to reflect the removal
-        await backend.init().catch(() => {});
+          // 4. Reinitialize backend to reflect the removal
+          await backend.init().catch(() => {});
 
-        res.json({ deleted: entry.name });
+          res.json({ deleted: entry.name });
+        });
       } finally {
         releaseRepoLock(storageLockKey, rootLockKey);
       }

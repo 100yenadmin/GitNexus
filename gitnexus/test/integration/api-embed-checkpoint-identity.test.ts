@@ -14,6 +14,7 @@ import {
 } from '../../src/storage/repo-manager.js';
 import { escapeCypherString } from '../../src/core/lbug/cypher-escape.js';
 import { JobManager } from '../../src/server/analyze-job.js';
+import { withAnalyzeOwnershipLock } from '../../src/core/staged-promotion.js';
 
 const MODEL = 'api-checkpoint-test-model';
 const LIVE_DIGEST = 'a'.repeat(64);
@@ -854,6 +855,40 @@ describe('POST /api/embed completed-checkpoint identity', () => {
       state.releaseAnalyzeLock?.();
       state.releaseAnalyzeLock = undefined;
       await fs.rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses delete while the production analyze ownership lock is held and releases cleanly', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-delete-analyze-owner-'));
+    const repoRoot = path.join(root, 'repo');
+    const storagePath = path.join(repoRoot, '.gitnexus');
+    const sentinel = path.join(storagePath, 'sentinel.txt');
+    await fs.mkdir(storagePath, { recursive: true });
+    await fs.writeFile(sentinel, 'preserve');
+    const entry = { ...REPO, path: repoRoot, storagePath };
+    state.listRegisteredRepos.mockResolvedValue([entry]);
+
+    try {
+      await withAnalyzeOwnershipLock(canonicalizePath(storagePath), async () => {
+        const blocked = await fetch(`${baseUrl}/api/repo?repo=${encodeURIComponent(entry.name)}`, {
+          method: 'DELETE',
+        });
+        const body = (await blocked.json()) as { error?: string };
+
+        expect(blocked.status).toBe(500);
+        expect(body.error).toMatch(/another analyze is active/i);
+        await expect(fs.readFile(sentinel, 'utf8')).resolves.toBe('preserve');
+        expect(state.unregisterRepo).not.toHaveBeenCalled();
+      });
+
+      const removed = await fetch(`${baseUrl}/api/repo?repo=${encodeURIComponent(entry.name)}`, {
+        method: 'DELETE',
+      });
+      expect(removed.status).toBe(200);
+      expect(state.unregisterRepo).toHaveBeenCalledOnce();
+      await expect(fs.lstat(storagePath)).rejects.toMatchObject({ code: 'ENOENT' });
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 
