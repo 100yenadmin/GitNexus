@@ -77,6 +77,8 @@ import {
   cleanupOldKuzuFiles,
   reconcileMetadataFiles,
   isMissingFilesystemError,
+  canonicalizePath,
+  registryPathEquals,
   INDEX_METADATA_FILE,
   INCREMENTAL_SCHEMA_VERSION,
   type RepoMeta,
@@ -177,6 +179,12 @@ export interface AnalyzeCallbacks {
 }
 
 export interface AnalyzeOptions {
+  /**
+   * Internal server-only display path. Filesystem work stays bound to the
+   * canonical `repoPath` argument while metadata and registry projections keep
+   * the stable path the operator registered.
+   */
+  registryPath?: string;
   /**
    * Force a full re-index of the pipeline. Callers may OR this with
    * other flags that imply re-analysis (e.g. `--skills`), so the value
@@ -769,6 +777,8 @@ const runFullAnalysisImpl = async (
     callbacks.onProgress(phase, percent, message);
 
   const { repoHasGit, remoteUrl: repositoryRemoteUrl } = repositoryIdentity;
+  const persistedRepoPath = options.registryPath ?? repoPath;
+  const expectedPersistedCanonicalPath = canonicalizePath(repoPath);
 
   // Resolve + validate operator-provided FTS config once, before the expensive
   // parse/load phases. A typo fails here in ms; createSearchFTSIndexes reuses
@@ -920,10 +930,11 @@ const runFullAnalysisImpl = async (
       ? markPendingImplicitFlatAdoption(meta)
       : preservePreAdoptionBranch(meta);
     await saveMeta(canonicalMetaDir, protectedMeta);
-    return registerRepo(repoPath, protectedMeta, {
+    return registerRepo(persistedRepoPath, protectedMeta, {
       name: options.registryName,
       allowDuplicateName: options.allowDuplicateName,
       branch: placement.branch,
+      expectedCanonicalPath: expectedPersistedCanonicalPath,
     });
   };
 
@@ -1171,7 +1182,7 @@ const runFullAnalysisImpl = async (
         // the stale marker, or the next repair/resume re-enters recovery.
         embeddingCheckpoint: undefined,
         incrementalInProgress: undefined,
-        repoPath,
+        repoPath: persistedRepoPath,
         remoteUrl: repositoryRemoteUrl ?? existingMeta.remoteUrl,
         stats: {
           ...existingMeta.stats,
@@ -1194,9 +1205,10 @@ const runFullAnalysisImpl = async (
       };
       repairedMeta = preservePreAdoptionBranch(repairedMeta);
       await saveMeta(canonicalMetaDir, repairedMeta);
-      projectName = await registerRepo(repoPath, repairedMeta, {
+      projectName = await registerRepo(persistedRepoPath, repairedMeta, {
         name: options.registryName,
         allowDuplicateName: options.allowDuplicateName,
+        expectedCanonicalPath: expectedPersistedCanonicalPath,
       });
     } finally {
       await closeLbug().catch(() => {});
@@ -3140,7 +3152,7 @@ const runFullAnalysisImpl = async (
         for (const [key, value] of newFileHashes) fileHashes[key] = value;
         await savePreAdoptionMeta(metaDir, {
           ...(existingMeta ?? {}),
-          repoPath,
+          repoPath: persistedRepoPath,
           lastCommit: currentCommit,
           indexedAt: new Date().toISOString(),
           branch: branchLabel ?? existingMeta?.branch,
@@ -3274,7 +3286,7 @@ const runFullAnalysisImpl = async (
     // literal widens the vectorSearch.status ternary to `string` and the
     // honesty contract silently decays to "whatever interpolates".
     const meta: RepoMeta = preservePreAdoptionBranch({
-      repoPath,
+      repoPath: persistedRepoPath,
       lastCommit: currentCommit,
       indexedAt: new Date().toISOString(),
       // Branch identity this index represents (#2106). Recorded for the flat
@@ -3439,10 +3451,11 @@ const runFullAnalysisImpl = async (
     } else {
       // Forward the --name alias and registry-collision bypass only after the
       // canonical DB is finalized. In staged mode this same commit is journaled.
-      projectName = await registerRepo(repoPath, metadataToCommit, {
+      projectName = await registerRepo(persistedRepoPath, metadataToCommit, {
         name: options.registryName,
         allowDuplicateName: options.allowDuplicateName,
         branch: placement.branch,
+        expectedCanonicalPath: expectedPersistedCanonicalPath,
       });
     }
 
@@ -3539,6 +3552,12 @@ export async function runFullAnalysis(
   options: AnalyzeOptions,
   callbacks: AnalyzeCallbacks,
 ): Promise<AnalyzeResult> {
+  if (
+    options.registryPath !== undefined &&
+    !registryPathEquals(canonicalizePath(options.registryPath), canonicalizePath(repoPath))
+  ) {
+    throw new Error('GitNexus: analyze display path changed before worker start');
+  }
   if (options.incrementalOnly && options.dropEmbeddings) {
     throw new Error(
       'Cannot combine `--incremental-only` with `--drop-embeddings`. ' +

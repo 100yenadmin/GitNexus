@@ -300,19 +300,29 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
           return;
         }
         terminalMessageReceived = true;
-        childExited = true;
         finishTerminalCleanup(closeDbHandle());
         jobManager.updateJob(job.id, {
           status: 'failed',
           error: `Worker process error: ${err.message}`,
         });
+        // An error event does not prove process exit (IPC and kill failures can
+        // emit it while the child is still alive). Retain the repository lock
+        // until `close`, and request termination so no analyzer survives the
+        // failed parent-side channel.
+        try {
+          child.kill('SIGTERM');
+        } catch {}
       });
 
-      child.on('exit', (code) => {
+      // `close` follows actual process termination (and also a failed spawn)
+      // after the stdio handles are closed. It is the sole event allowed to
+      // prove the child can no longer touch repository storage.
+      child.on('close', (code) => {
         const j = jobManager.getJob(job.id);
         childExited = true;
         if (!j || j.status === 'complete' || j.status === 'failed') {
           finishTerminalCleanup(closeDbHandle());
+          maybeReleaseAfterTerminalCleanup();
           return;
         }
         if (terminalMessageReceived) {
@@ -365,6 +375,7 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
           type: 'start',
           repoPath: lockedRepoPath,
           options: {
+            registryPath: targetPath,
             force: !!opts.force,
             embeddings: !!opts.embeddings,
             dropEmbeddings: !!opts.dropEmbeddings,
@@ -373,11 +384,18 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
         });
       } catch (err) {
         // A child may exist even when IPC setup/send fails synchronously. Do
-        // not let it analyze after the shared repository lock is released.
+        // not release the shared repository lock until `close` proves it can
+        // no longer analyze.
+        terminalMessageReceived = true;
+        finishTerminalCleanup(closeDbHandle());
+        const message = err instanceof Error ? err.message : String(err);
+        jobManager.updateJob(job.id, {
+          status: 'failed',
+          error: `Worker process error: ${message}`,
+        });
         try {
           child.kill('SIGTERM');
         } catch {}
-        throw err;
       }
     };
 

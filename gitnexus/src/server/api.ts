@@ -21,6 +21,7 @@ import {
   loadMeta,
   saveMeta,
   registerRepo,
+  rollbackRegistryCommit,
   listRegisteredRepos,
   getStoragePath,
   registryPathEquals,
@@ -2210,16 +2211,33 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                   };
                   await commitEmbedMetadata(barrier, 'COMMITTING_TERMINAL', async () => {
                     const owner = await assertZeroClearRegistryOwner(frozenOwner, clearedMeta);
+                    const commitReceipt: import('../storage/repo-manager.js').RegistryCommitReceiptRef =
+                      {};
                     await registerRepo(owner.path, clearedMeta, {
                       name: owner.name,
                       allowDuplicateName: true,
                       expectedOwner: owner,
+                      commitReceipt,
                     });
-                    const provenStoragePath = assertFrozenZeroClearRegistryOwner(
-                      owner,
-                      clearedMeta,
-                    );
-                    await saveMeta(provenStoragePath, clearedMeta);
+                    try {
+                      const provenStoragePath = assertFrozenZeroClearRegistryOwner(
+                        owner,
+                        clearedMeta,
+                      );
+                      await saveMeta(provenStoragePath, clearedMeta);
+                    } catch (error) {
+                      if (commitReceipt.value) {
+                        try {
+                          await rollbackRegistryCommit(commitReceipt.value);
+                        } catch (rollbackError) {
+                          throw new AggregateError(
+                            [error, rollbackError],
+                            'Embedding metadata commit failed and registry rollback was refused',
+                          );
+                        }
+                      }
+                      throw error;
+                    }
                   });
                   embeddingMeta = clearedMeta;
                   return;

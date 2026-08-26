@@ -11,6 +11,7 @@ import fs from 'fs/promises';
 import { _captureLogger } from '../../src/core/logger.js';
 import {
   getStoragePath,
+  canonicalRepoLockKey,
   getStoragePaths,
   branchSlug,
   resolveBranchPlacement,
@@ -23,6 +24,7 @@ import {
   readRegistry,
   loadCLIConfig,
   registerRepo,
+  rollbackRegistryCommit,
   removeBranchIndex,
   adoptFlatBranchLabel,
   listRegisteredRepos,
@@ -54,6 +56,20 @@ describe('getStoragePath', () => {
     const result = getStoragePath('.');
     // Should be an absolute path
     expect(path.isAbsolute(result)).toBe(true);
+  });
+
+  it('canonicalizes a symlinked storage directory for the shared writer lock', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-storage-lock-'));
+    const repo = path.join(root, 'repo');
+    const storage = path.join(root, 'storage');
+    await fs.mkdir(repo);
+    await fs.mkdir(storage);
+    await fs.symlink(storage, path.join(repo, '.gitnexus'), 'dir');
+    try {
+      expect(canonicalRepoLockKey(repo)).toBe(await fs.realpath(storage));
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
   });
 });
 
@@ -1096,6 +1112,34 @@ describe('registerRepo expected owner CAS (#264)', () => {
     expect(entries[1]).toEqual(unrelated);
   });
 
+  it('rolls back a post-commit rejection with registry and metadata byte-identical', async () => {
+    const expected = owner();
+    const unrelated = {
+      ...owner(),
+      name: 'other',
+      path: '/virtual/other',
+      storagePath: '/virtual/other/.gitnexus',
+    };
+    const registryPath = path.join(tmpHome.dbPath, 'registry.json');
+    const before = JSON.stringify([expected, unrelated], null, 2);
+    await fs.writeFile(registryPath, before);
+    await saveMeta(expected.storagePath, meta('old'));
+    const metadataPath = path.join(expected.storagePath, INDEX_METADATA_FILE);
+    const metadataBefore = await fs.readFile(metadataPath, 'utf8');
+    const commitReceipt: import('../../src/storage/repo-manager.js').RegistryCommitReceiptRef = {};
+
+    await registerRepo(tmpRepo.dbPath, meta('new'), {
+      name: expected.name,
+      expectedOwner: frozenOwner(expected),
+      commitReceipt,
+    });
+    expect((await readRegistry())[0].lastCommit).toBe('new');
+
+    await rollbackRegistryCommit(commitReceipt.value!);
+    expect(await fs.readFile(registryPath, 'utf8')).toBe(before);
+    expect(await fs.readFile(metadataPath, 'utf8')).toBe(metadataBefore);
+  });
+
   it.each([
     ['missing', () => []],
     ['duplicate', (entry: RegistryEntry) => [entry, { ...entry }]],
@@ -1239,6 +1283,7 @@ describe('registerRepo expected owner CAS (#264)', () => {
         { ...meta('new'), repoPath: alias },
         {
           expectedOwner: frozenOwner(expected),
+          expectedCanonicalPath: canonicalizePath(target),
         },
       ),
     ).resolves.toBe(expected.name);
@@ -1249,6 +1294,26 @@ describe('registerRepo expected owner CAS (#264)', () => {
     expect(canonicalizePath(saved.path)).toBe(canonicalizePath(target));
     expect(saved).not.toHaveProperty('canonicalPath');
     expect(saved).not.toHaveProperty('canonicalStoragePath');
+  });
+
+  it('rejects a preserved display path that retargets away from its frozen root', async () => {
+    const targetA = path.join(tmpHome.dbPath, 'display-a');
+    const targetB = path.join(tmpHome.dbPath, 'display-b');
+    const alias = path.join(tmpHome.dbPath, 'display-alias');
+    await fs.mkdir(path.join(targetA, '.gitnexus'), { recursive: true });
+    await fs.mkdir(path.join(targetB, '.gitnexus'), { recursive: true });
+    await fs.symlink(targetA, alias, 'dir');
+    const expectedCanonicalPath = canonicalizePath(alias);
+    const registryPath = path.join(tmpHome.dbPath, 'registry.json');
+    const before = '[]';
+    await fs.writeFile(registryPath, before);
+    await fs.unlink(alias);
+    await fs.symlink(targetB, alias, 'dir');
+
+    await expect(
+      registerRepo(alias, { ...meta('new'), repoPath: alias }, { expectedCanonicalPath }),
+    ).rejects.toThrow('GitNexus: expected registry path changed during locked commit');
+    expect(await fs.readFile(registryPath, 'utf8')).toBe(before);
   });
 });
 

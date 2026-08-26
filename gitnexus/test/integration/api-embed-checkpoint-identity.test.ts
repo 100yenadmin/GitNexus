@@ -84,7 +84,23 @@ const state = {
   getActiveEmbeddingIdentity: vi.fn(() => identity),
   inspectEmbeddingIntegrity: vi.fn(async () => state.liveIntegrity),
   getStrictLbugStats: vi.fn(async () => ({ nodes: 4, edges: 5 })),
-  registerRepo: vi.fn(async () => REPO.name),
+  registerRepo: vi.fn(
+    async (
+      _repoPath?: string,
+      _meta?: RepoMeta,
+      options?: {
+        commitReceipt?: {
+          value?: { previousOwner: RegistryEntry | null; committedOwner: RegistryEntry };
+        };
+      },
+    ) => {
+      if (options?.commitReceipt) {
+        options.commitReceipt.value = { previousOwner: REPO, committedOwner: REPO };
+      }
+      return REPO.name;
+    },
+  ),
+  rollbackRegistryCommit: vi.fn(async () => undefined),
   saveMeta: vi.fn(async (_storagePath: string, next: RepoMeta) => {
     state.currentMeta = next;
   }),
@@ -133,6 +149,7 @@ vi.doMock('../../src/storage/repo-manager.js', async () => ({
   listRegisteredRepos: state.listRegisteredRepos,
   loadMeta: state.loadMeta,
   registerRepo: state.registerRepo,
+  rollbackRegistryCommit: state.rollbackRegistryCommit,
   saveMeta: state.saveMeta,
 }));
 
@@ -344,7 +361,23 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     state.runEmbeddingPipeline.mockReset();
     state.runEmbeddingPipeline.mockResolvedValue(undefined);
     state.registerRepo.mockReset();
-    state.registerRepo.mockResolvedValue(REPO.name);
+    state.registerRepo.mockImplementation(
+      async (
+        _repoPath?: string,
+        _meta?: RepoMeta,
+        options?: {
+          commitReceipt?: {
+            value?: { previousOwner: RegistryEntry | null; committedOwner: RegistryEntry };
+          };
+        },
+      ) => {
+        if (options?.commitReceipt) {
+          options.commitReceipt.value = { previousOwner: REPO, committedOwner: REPO };
+        }
+        return REPO.name;
+      },
+    );
+    state.rollbackRegistryCommit.mockClear();
     state.saveMeta.mockClear();
     state.loadMeta.mockReset();
     state.loadMeta.mockImplementation(async () => state.currentMeta);
@@ -616,6 +649,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
       {
         name: REPO.name,
         allowDuplicateName: true,
+        commitReceipt: expect.objectContaining({ value: expect.anything() }),
         expectedOwner: expect.objectContaining({
           ...enrichedRepo,
           canonicalPath: enrichedRepo.path,
@@ -632,7 +666,13 @@ describe('POST /api/embed completed-checkpoint identity', () => {
   it('retains the checkpoint when the owner symlink retargets after registry commit', async () => {
     const fixture = await prepareSymlinkRace('gitnexus-issue269-');
     state.listRegisteredRepos.mockResolvedValue([fixture.raceRepo]);
-    state.registerRepo.mockImplementation(async () => {
+    state.registerRepo.mockImplementation(async (_repoPath, _meta, options) => {
+      if (options?.commitReceipt) {
+        options.commitReceipt.value = {
+          previousOwner: fixture.raceRepo,
+          committedOwner: fixture.raceRepo,
+        };
+      }
       await fixture.retarget();
       return fixture.raceRepo.name;
     });
@@ -643,6 +683,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
       /path\/storage identity is non-absolute or mismatched/i,
       () => {
         expect(state.registerRepo).toHaveBeenCalledOnce();
+        expect(state.rollbackRegistryCommit).toHaveBeenCalledOnce();
       },
     );
   });

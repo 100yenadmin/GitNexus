@@ -111,7 +111,7 @@ describe('analyze worker shared lock ownership', () => {
     child.emit('message', { type: 'complete', result: result(true) });
     child.emit('error', new Error('late error'));
     expect(releaseRepoLock).not.toHaveBeenCalled();
-    child.emit('exit', 0);
+    child.emit('close', 0);
     expect(releaseRepoLock).not.toHaveBeenCalled();
     finishClose();
     await vi.waitFor(() => expect(job.status).toBe('failed'));
@@ -131,9 +131,28 @@ describe('analyze worker shared lock ownership', () => {
     job.status = 'failed';
     child.emit('message', { type: 'error', message: 'cancelled' });
     expect(releaseRepoLock).not.toHaveBeenCalled();
-    child.emit('exit', 0);
+    child.emit('close', 0);
 
     await vi.waitFor(() => expect(releaseRepoLock).toHaveBeenCalledOnce());
+    expect(releaseRepoLock).toHaveBeenCalledOnce();
+    expect(releaseRepoLock).toHaveBeenCalledWith('/virtual/demo/.gitnexus');
+  });
+
+  it('releases when terminal cleanup finishes before the worker exits', async () => {
+    const { job, manager } = fakeJobManager();
+    const child = fakeChild();
+    launcherState.fork.mockReset().mockReturnValue(child.child);
+    const releaseRepoLock = vi.fn();
+    const launch = createLaunchAnalysisWorker(launchDeps(manager, releaseRepoLock));
+
+    launch(job, '/virtual/demo', {});
+    child.emit('message', { type: 'error', message: 'worker failed' });
+    await vi.waitFor(() => expect(job.status).toBe('failed'));
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(releaseRepoLock).not.toHaveBeenCalled();
+    child.emit('close', 1);
+
     expect(releaseRepoLock).toHaveBeenCalledOnce();
     expect(releaseRepoLock).toHaveBeenCalledWith('/virtual/demo/.gitnexus');
   });
@@ -141,11 +160,15 @@ describe('analyze worker shared lock ownership', () => {
   it('sends the same canonical repository root whose storage key is locked', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-analyze-lock-'));
     const target = path.join(root, 'target');
+    const storage = path.join(root, 'physical-storage');
     const alias = path.join(root, 'alias');
     await fs.mkdir(target);
+    await fs.mkdir(storage);
+    await fs.symlink(storage, path.join(target, '.gitnexus'), 'dir');
     await fs.symlink(target, alias, 'dir');
     try {
       const canonicalTarget = await fs.realpath(target);
+      const canonicalStorage = await fs.realpath(storage);
       const { job, manager } = fakeJobManager();
       const child = fakeChild();
       launcherState.fork.mockReset().mockReturnValue(child.child);
@@ -154,15 +177,35 @@ describe('analyze worker shared lock ownership', () => {
 
       createLaunchAnalysisWorker(deps)(job, alias, {});
 
-      expect(deps.acquireRepoLock).toHaveBeenCalledWith(path.join(canonicalTarget, '.gitnexus'));
+      expect(deps.acquireRepoLock).toHaveBeenCalledWith(canonicalStorage);
       expect(child.child.send).toHaveBeenCalledWith(
-        expect.objectContaining({ repoPath: canonicalTarget }),
+        expect.objectContaining({
+          repoPath: canonicalTarget,
+          options: expect.objectContaining({ registryPath: alias }),
+        }),
       );
       child.emit('message', { type: 'error', message: 'test cleanup' });
-      child.emit('exit', 0);
+      child.emit('close', 0);
     } finally {
       await fs.rm(root, { recursive: true, force: true });
     }
+  });
+
+  it('retains the lock after a child error until close proves termination', async () => {
+    const { job, manager } = fakeJobManager();
+    const child = fakeChild();
+    launcherState.fork.mockReset().mockReturnValue(child.child);
+    const releaseRepoLock = vi.fn();
+    const launch = createLaunchAnalysisWorker(launchDeps(manager, releaseRepoLock));
+
+    launch(job, '/virtual/demo', {});
+    child.emit('error', new Error('ipc failed'));
+
+    expect(job.status).toBe('failed');
+    expect(child.child.kill).toHaveBeenCalledWith('SIGTERM');
+    expect(releaseRepoLock).not.toHaveBeenCalled();
+    child.emit('close', 1);
+    await vi.waitFor(() => expect(releaseRepoLock).toHaveBeenCalledOnce());
   });
 
   it.each([
@@ -178,7 +221,7 @@ describe('analyze worker shared lock ownership', () => {
         throw new Error('send failed');
       },
     ],
-  ])('cleans up synchronously when %s throws', (_label, failure) => {
+  ])('cleans up synchronously when %s throws', async (_label, failure) => {
     const { job, manager } = fakeJobManager();
     const releaseRepoLock = vi.fn();
     const child = fakeChild(failure);
@@ -190,7 +233,13 @@ describe('analyze worker shared lock ownership', () => {
 
     launch(job, '/virtual/demo', {});
 
-    expect(releaseRepoLock).toHaveBeenCalledOnce();
+    if (_label === 'send') {
+      expect(releaseRepoLock).not.toHaveBeenCalled();
+      child.emit('close', 1);
+      await vi.waitFor(() => expect(releaseRepoLock).toHaveBeenCalledOnce());
+    } else {
+      expect(releaseRepoLock).toHaveBeenCalledOnce();
+    }
     expect(releaseRepoLock).toHaveBeenCalledWith('/virtual/demo/.gitnexus');
     expect(job.status).toBe('failed');
     if (_label === 'send') expect(child.child.kill).toHaveBeenCalledWith('SIGTERM');
@@ -212,11 +261,11 @@ describe('analyze worker shared lock ownership', () => {
       const launch = createLaunchAnalysisWorker(launchDeps(manager, releaseRepoLock));
 
       launch(job, '/virtual/demo', {});
-      first.emit('exit', 1);
+      first.emit('close', 1);
       vi.advanceTimersByTime(1000);
-      second.emit('exit', 1);
+      second.emit('close', 1);
       vi.advanceTimersByTime(2000);
-      third.emit('exit', 1);
+      third.emit('close', 1);
       await Promise.resolve();
       await Promise.resolve();
 

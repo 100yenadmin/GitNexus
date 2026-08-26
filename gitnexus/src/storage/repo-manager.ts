@@ -432,7 +432,7 @@ export const getStoragePath = (repoPath: string): string => {
  * and would no longer identify the storage that was locked.
  */
 export const canonicalRepoLockKey = (repoRoot: string): string =>
-  getStoragePath(canonicalizePath(repoRoot));
+  canonicalizePath(getStoragePath(canonicalizePath(repoRoot)));
 
 /**
  * Get paths to key storage files.
@@ -1091,6 +1091,18 @@ type ExpectedRegistryOwner = Readonly<
   }
 >;
 
+export interface RegistryCommitReceipt {
+  /** Exact entry replaced by this commit, or null when the commit inserted. */
+  previousOwner: RegistryEntry | null;
+  /** Exact entry written by this commit. */
+  committedOwner: RegistryEntry;
+}
+
+export interface RegistryCommitReceiptRef {
+  /** Populated only after the atomic registry write succeeds. */
+  value?: RegistryCommitReceipt;
+}
+
 export interface RegisterRepoOptions {
   /**
    * User-provided alias from `analyze --name <alias>` (#829). Overrides
@@ -1126,6 +1138,10 @@ export interface RegisterRepoOptions {
   branch?: string;
   /** Internal compare-and-swap guard for a caller that just validated ownership. */
   expectedOwner?: ExpectedRegistryOwner;
+  /** Internal frozen physical identity for a separately preserved display path. */
+  expectedCanonicalPath?: string;
+  /** Internal in-memory receipt used to roll back a later coupled-store failure. */
+  commitReceipt?: RegistryCommitReceiptRef;
 }
 
 /**
@@ -1289,6 +1305,13 @@ export const registerRepo = async (
   // a retarget between the caller's preflight and this commit must reject.
   const expectedOwnerCanonicalPath = opts?.expectedOwner?.canonicalPath;
   const expectedOwnerCanonicalStorage = opts?.expectedOwner?.canonicalStoragePath;
+  const expectedCanonicalPath = opts?.expectedCanonicalPath;
+  if (
+    expectedCanonicalPath !== undefined &&
+    !registryPathEquals(canonicalInput, expectedCanonicalPath)
+  ) {
+    throw new Error('GitNexus: expected registry path changed during locked commit');
+  }
 
   // Capture a current origin when callers provide older metadata without the
   // remote fingerprint (`gitnexus index` and direct API callers). No origin
@@ -1411,8 +1434,15 @@ export const registerRepo = async (
   // R9): re-derive THIS run's delta against the FRESHEST snapshot so a
   // concurrent change to the OTHER axis (a branch upsert vs a primary refresh)
   // survives instead of being clobbered by a stale entry-time view.
+  let commitReceipt: RegistryCommitReceipt | undefined;
   await withRegistryMutationLock(async () => {
     const fresh = await readRegistry();
+    if (
+      expectedCanonicalPath !== undefined &&
+      !registryPathEquals(canonicalizePath(repoPath), expectedCanonicalPath)
+    ) {
+      throw new Error('GitNexus: expected registry path changed during locked commit');
+    }
     // Close the analyze/index TOCTOU window: another process may have registered
     // this remote after the initial read but before our atomic registry write.
     assertRemoteIdentityAvailable(fresh, resolved, remoteUrl);
@@ -1490,8 +1520,38 @@ export const registerRepo = async (
     }
 
     await writeRegistry(fresh);
+    commitReceipt = {
+      previousOwner: freshExisting ? { ...freshExisting } : null,
+      committedOwner: { ...merged },
+    };
   });
+  if (opts?.commitReceipt && commitReceipt) opts.commitReceipt.value = commitReceipt;
   return name;
+};
+
+/**
+ * Roll back exactly one successful {@link registerRepo} commit when a later
+ * coupled-store validation fails. The compare-and-swap is deliberately based
+ * on the raw committed registry projection, not fresh filesystem
+ * canonicalization: a symlink retarget is the failure this path must recover.
+ * Concurrent registry changes survive, and a changed committed projection is
+ * refused rather than overwritten.
+ */
+export const rollbackRegistryCommit = async (receipt: RegistryCommitReceipt): Promise<void> => {
+  await withRegistryMutationLock(async () => {
+    const fresh = await readRegistry();
+    const committedJson = JSON.stringify(receipt.committedOwner);
+    const matches = fresh
+      .map((owner, index) => ({ owner, index }))
+      .filter(({ owner }) => JSON.stringify(owner) === committedJson);
+    if (matches.length !== 1) {
+      throw new Error('GitNexus: registry changed after commit; rollback refused');
+    }
+    const index = matches[0].index;
+    if (receipt.previousOwner) fresh[index] = receipt.previousOwner;
+    else fresh.splice(index, 1);
+    await writeRegistry(fresh);
+  });
 };
 
 /**
