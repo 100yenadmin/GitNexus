@@ -499,6 +499,38 @@ describe('common analyze ownership lock', () => {
     }
   });
 
+  it('retries a wrapped transient read failure while releasing the owned main lock', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-stage-lock-read-release-'));
+    tempDirs.push(root);
+    const lockPath = path.join(root, 'analyze-staged.lock');
+    const originalReadFile = fs.readFile.bind(fs);
+    const readSpy = vi.spyOn(fs, 'readFile');
+    let operationEntered = false;
+    let failedOnce = false;
+
+    readSpy.mockImplementation(async (target, options) => {
+      if (operationEntered && String(target) === lockPath && !failedOnce) {
+        failedOnce = true;
+        throw Object.assign(new Error('transient owned lock read failure'), { code: 'EBUSY' });
+      }
+      return originalReadFile(target, options);
+    });
+
+    try {
+      await expect(
+        withAnalyzeOwnershipLock(root, async () => {
+          operationEntered = true;
+          return 'released';
+        }),
+      ).resolves.toBe('released');
+      expect(failedOnce).toBe(true);
+      await expect(fs.access(lockPath)).rejects.toMatchObject({ code: 'ENOENT' });
+      expect(await recoveryEntries(lockPath)).toEqual([]);
+    } finally {
+      readSpy.mockRestore();
+    }
+  });
+
   it('refuses a concurrent ordinary or staged writer', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-stage-lock-'));
     tempDirs.push(root);
