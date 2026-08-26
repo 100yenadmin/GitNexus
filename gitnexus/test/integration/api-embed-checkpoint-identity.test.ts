@@ -542,6 +542,48 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     expect(state.releaseOwnershipLease).toHaveBeenCalledOnce();
   });
 
+  it('publishes cancellation and ownership cleanup failures together after release', async () => {
+    state.currentMeta = makeMeta(LIVE_DIGEST);
+    let pipelineStarted!: () => void;
+    const pipelineRunning = new Promise<void>((resolve) => {
+      pipelineStarted = resolve;
+    });
+    state.runEmbeddingPipeline.mockImplementation(async (...args: unknown[]) => {
+      const options = args[6] as { signal: AbortSignal };
+      pipelineStarted();
+      await new Promise<void>((_resolve, reject) => {
+        if (options.signal.aborted) {
+          reject(new DOMException('pipeline cancelled', 'AbortError'));
+          return;
+        }
+        options.signal.addEventListener(
+          'abort',
+          () => reject(new DOMException('pipeline cancelled', 'AbortError')),
+          { once: true },
+        );
+      });
+    });
+    state.releaseOwnershipLease.mockRejectedValue(new Error('release retries exhausted'));
+
+    const response = await fetch(`${baseUrl}/api/embed`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ repo: REPO.name }),
+    });
+    expect(response.status).toBe(202);
+    const { jobId } = (await response.json()) as { jobId: string };
+    await pipelineRunning;
+
+    const cancelled = await fetch(`${baseUrl}/api/embed/${jobId}`, { method: 'DELETE' });
+    expect(cancelled.status).toBe(200);
+    const job = await waitForTerminalJob(baseUrl, jobId);
+
+    expect(job).toMatchObject({ status: 'failed' });
+    expect(job.error).toMatch(/cancelled by user/i);
+    expect(job.error).toMatch(/ownership lock release failed: release retries exhausted/i);
+    expect(state.releaseOwnershipLease).toHaveBeenCalledOnce();
+  });
+
   it('rejects an equal-count different-digest completed window before the pipeline', async () => {
     const checkpointBefore = JSON.stringify(state.currentMeta.embeddingCheckpoint);
     const response = await fetch(`${baseUrl}/api/embed`, {

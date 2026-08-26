@@ -1062,17 +1062,25 @@ const releaseOwnedOwnershipLock = async (
   record: StageLockRecord,
 ): Promise<void> => {
   const transientCodes = new Set(['EBUSY', 'EPERM']);
+  const filesystemErrorCode = (error: unknown): string | undefined => {
+    let current = error;
+    for (let depth = 0; depth < 4 && current instanceof Error; depth++) {
+      const code = (current as NodeJS.ErrnoException).code;
+      if (code) return code;
+      current = current.cause;
+    }
+    return undefined;
+  };
   for (let attempt = 0; attempt < 3; attempt++) {
-    const current = await readJson<StageLockRecord>(lockPath).catch((error) => {
-      if (isMissingFilesystemError(error)) return undefined;
-      throw error;
-    });
-    if (!current || !validStageLockRecord(current) || !sameStageLockRecord(current, record)) return;
     try {
+      const current = await readJson<StageLockRecord>(lockPath);
+      if (!current || !validStageLockRecord(current) || !sameStageLockRecord(current, record)) {
+        return;
+      }
       await fs.rm(lockPath, { force: true });
       return;
     } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code;
+      const code = filesystemErrorCode(error);
       if (!code || !transientCodes.has(code) || attempt === 2) throw error;
       await new Promise((resolve) => setTimeout(resolve, 25 * 2 ** attempt));
     }

@@ -2261,6 +2261,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         const barrier = createEmbedCommitBarrier();
         embedBarriers.set(job.id, barrier);
         embedAborters.set(job.id, () => embedController.abort());
+        let cancellationFailure: string | undefined;
         const cancelEmbedding = (reason: string): boolean => {
           const current = embedJobManager.getJob(job.id);
           if (!current || current.status === 'complete' || current.status === 'failed') {
@@ -2268,7 +2269,11 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
           }
           const outcome = requestEmbedCancellation(barrier, reason, () => embedController.abort());
           if (outcome === 'cancelled') {
-            embedJobManager.cancelJob(job.id, reason);
+            // Keep the durable job non-terminal until ownership cleanup has
+            // completed so a release failure can be reported with the
+            // cancellation instead of being dropped by JobManager's terminal
+            // state guard.
+            cancellationFailure ??= reason;
           }
           return true;
         };
@@ -2600,7 +2605,11 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
             if (barrier.phase !== 'COMPLETE') barrier.phase = 'FAILED';
             const current = embedJobManager.getJob(job.id);
             if (!current || current.status !== 'failed') {
-              failureMessage = err.message || 'Embedding generation failed';
+              failureMessage =
+                cancellationFailure ??
+                (err?.name === 'AbortError' && barrier.cancelReason
+                  ? barrier.cancelReason
+                  : (err.message ?? 'Embedding generation failed'));
             }
           } finally {
             let releaseMessage: string | undefined;
@@ -2700,7 +2709,9 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         res.status(400).json({ error: `Job already ${settledJob.status}` });
         return;
       }
-      if (outcome === 'cancelled') embedJobManager.cancelJob(jobId, 'Cancelled by user');
+      // An immediate cancellation response is intentionally returned before
+      // the worker finishes cleanup. The worker publishes the durable failed
+      // state only after ownership release so cleanup failures remain visible.
     } else {
       embedJobManager.cancelJob(jobId, 'Cancelled by user');
     }
