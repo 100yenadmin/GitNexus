@@ -1431,8 +1431,9 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
           createStoragePath: false,
         });
 
+      let deletedRepoName: string | undefined;
       try {
-        await withDeleteOwnership(async () => {
+        deletedRepoName = await withDeleteOwnership(async () => {
           if (
             !storageObjectMatches(
               await readStorageObjectIdentity(storagePath),
@@ -1528,11 +1529,15 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
           // 4. Reinitialize backend to reflect the removal
           await backend.init().catch(() => {});
 
-          res.json({ deleted: entry.name });
+          return entry.name;
         });
       } finally {
         releaseRepoLock(storageLockKey, rootLockKey);
       }
+      if (deletedRepoName === undefined) {
+        throw new Error('GitNexus deletion completed without a repository result');
+      }
+      res.json({ deleted: deletedRepoName });
     } catch (err: any) {
       res
         .status(err instanceof AnalyzeOwnershipConflictError ? 409 : 500)

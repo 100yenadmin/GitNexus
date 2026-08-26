@@ -1070,6 +1070,50 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     }
   });
 
+  it('reports ownership-release failure before publishing delete success', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-delete-release-failure-'));
+    const repoRoot = path.join(root, 'repo');
+    const storagePath = path.join(repoRoot, '.gitnexus');
+    await fs.mkdir(storagePath, { recursive: true });
+    const entry = { ...REPO, path: repoRoot, storagePath };
+    state.listRegisteredRepos.mockResolvedValue([entry]);
+    const originalRm = fs.rm.bind(fs);
+    const rmSpy = vi.spyOn(fs, 'rm');
+    let releaseAttempts = 0;
+
+    rmSpy.mockImplementation(async (target, options) => {
+      const targetPath = String(target);
+      if (
+        state.unregisterRepo.mock.calls.length > 0 &&
+        path.basename(targetPath).startsWith('analyze-') &&
+        targetPath.endsWith('.lock')
+      ) {
+        releaseAttempts++;
+        throw Object.assign(new Error('delete ownership release failed'), { code: 'EPERM' });
+      }
+      return originalRm(target, options);
+    });
+
+    try {
+      const response = await fetch(`${baseUrl}/api/repo?repo=${encodeURIComponent(entry.name)}`, {
+        method: 'DELETE',
+      });
+      const body = (await response.json()) as { error?: string; deleted?: string };
+
+      expect(response.status).toBe(500);
+      expect(body.deleted).toBeUndefined();
+      expect(body.error).toMatch(/delete ownership release failed/i);
+      expect(releaseAttempts).toBe(3);
+    } finally {
+      rmSpy.mockRestore();
+      await fs.rm(root, { recursive: true, force: true });
+      const gitnexusHome = process.env.GITNEXUS_HOME;
+      if (gitnexusHome) {
+        await fs.rm(path.join(gitnexusHome, 'locks'), { recursive: true, force: true });
+      }
+    }
+  });
+
   it('refuses reverse-order analyze after delete detaches symlinked storage', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-delete-first-analyze-'));
     const repoRoot = path.join(root, 'repo');
