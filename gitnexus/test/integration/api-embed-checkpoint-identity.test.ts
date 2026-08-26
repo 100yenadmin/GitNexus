@@ -72,6 +72,12 @@ const state = {
   openOwnershipPaths: [] as Array<string | undefined>,
   openOwnershipRepoRoots: [] as Array<string | undefined>,
   ownershipGate: undefined as Promise<void> | undefined,
+  releaseOwnershipLease: vi.fn(async () => undefined),
+  acquireLbugOwnership: vi.fn(async (storagePath: string, repoRoot: string) => {
+    state.openOwnershipPaths.push(storagePath);
+    state.openOwnershipRepoRoots.push(repoRoot);
+    return { release: state.releaseOwnershipLease };
+  }),
   closeLbug: vi.fn(async () => undefined),
   withLbugReadOnlyNonRecovering: vi.fn((_dbPath: string, operation: () => Promise<unknown>) => {
     state.openModes.push(true);
@@ -88,9 +94,11 @@ const state = {
       },
     ) => {
       state.openModes.push(options?.readOnly);
-      state.openOwnershipPaths.push(options?.ownershipStoragePath);
-      state.openOwnershipRepoRoots.push(options?.ownershipRepoRoot);
-      if (options?.ownershipStoragePath) await state.ownershipGate;
+      if (options?.ownershipStoragePath) {
+        state.openOwnershipPaths.push(options.ownershipStoragePath);
+        state.openOwnershipRepoRoots.push(options.ownershipRepoRoot);
+      }
+      if (state.ownershipGate) await state.ownershipGate;
       return operation();
     },
   ),
@@ -187,6 +195,7 @@ vi.doMock('../../src/core/lbug/lbug-adapter.js', async () => ({
   streamQuery: vi.fn(async () => undefined),
   flushWAL: vi.fn(async () => undefined),
   closeLbug: state.closeLbug,
+  acquireLbugOwnership: state.acquireLbugOwnership,
   withLbugReadOnlyNonRecovering: state.withLbugReadOnlyNonRecovering,
   withLbugDb: state.withLbugDb,
   isReadOnlyDbError: vi.fn(() => false),
@@ -389,6 +398,9 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     state.openOwnershipPaths.length = 0;
     state.openOwnershipRepoRoots.length = 0;
     state.ownershipGate = undefined;
+    state.releaseOwnershipLease.mockReset();
+    state.releaseOwnershipLease.mockResolvedValue(undefined);
+    state.acquireLbugOwnership.mockClear();
     state.closeLbug.mockClear();
     state.withLbugReadOnlyNonRecovering.mockClear();
     state.withLbugDb.mockClear();
@@ -473,15 +485,159 @@ describe('POST /api/embed completed-checkpoint identity', () => {
       body: JSON.stringify({ repo: REPO.name }),
     });
     const { jobId } = (await response.json()) as { jobId: string };
-    await vi.waitFor(() => expect(state.openOwnershipPaths).toHaveLength(1));
+    await vi.waitFor(() => expect(state.openModes).toHaveLength(1));
 
     expect(state.openOwnershipPaths).toEqual([canonicalizePath(REPO.storagePath)]);
     expect(state.openOwnershipRepoRoots).toEqual([canonicalizePath(REPO.path)]);
     expect(state.loadMeta).toHaveBeenCalledOnce();
     expect(state.saveMeta).not.toHaveBeenCalled();
+    expect(state.releaseOwnershipLease).not.toHaveBeenCalled();
 
     releaseOwnership();
+    await expect(waitForTerminalJob(baseUrl, jobId)).resolves.toMatchObject({
+      status: 'complete',
+      progress: { phase: 'complete', percent: 100 },
+    });
+    expect(state.releaseOwnershipLease).toHaveBeenCalledOnce();
+  });
+
+  it('acquires cross-process ownership before legacy metadata and database preflight', async () => {
+    state.currentMeta = makeMeta(LIVE_DIGEST, REPO.path, true);
+    state.liveIntegrity = makeIntegrity(LIVE_DIGEST, 0);
+    state.graphNodes = [];
+
+    const response = await fetch(`${baseUrl}/api/embed`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ repo: REPO.name }),
+    });
+    expect(response.status).toBe(202);
+    const { jobId } = (await response.json()) as { jobId: string };
     await expect(waitForTerminalJob(baseUrl, jobId)).resolves.toMatchObject({ status: 'complete' });
+
+    expect(state.acquireLbugOwnership).toHaveBeenCalledOnce();
+    expect(state.withLbugReadOnlyNonRecovering).toHaveBeenCalledOnce();
+    expect(state.acquireLbugOwnership.mock.invocationCallOrder[0]).toBeLessThan(
+      state.withLbugReadOnlyNonRecovering.mock.invocationCallOrder[0],
+    );
+    expect(state.releaseOwnershipLease).toHaveBeenCalledOnce();
+    expect(state.withLbugReadOnlyNonRecovering.mock.invocationCallOrder[0]).toBeLessThan(
+      state.releaseOwnershipLease.mock.invocationCallOrder[0],
+    );
+  });
+
+  it('reports ownership cleanup failure together with the embedding failure', async () => {
+    state.loadMeta.mockRejectedValueOnce(new Error('preflight failed'));
+    state.releaseOwnershipLease.mockRejectedValue(new Error('release retries exhausted'));
+
+    const response = await fetch(`${baseUrl}/api/embed`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ repo: REPO.name }),
+    });
+    expect(response.status).toBe(202);
+    const { jobId } = (await response.json()) as { jobId: string };
+    const job = await waitForTerminalJob(baseUrl, jobId);
+
+    expect(job).toMatchObject({
+      status: 'failed',
+      progress: { phase: 'failed' },
+    });
+    expect(job.error).toMatch(/preflight failed/);
+    expect(job.error).toMatch(/ownership lock release failed: release retries exhausted/i);
+    expect(state.releaseOwnershipLease).toHaveBeenCalledOnce();
+  });
+
+  it('terminalizes an empty embedding error with the fallback message', async () => {
+    state.loadMeta.mockRejectedValueOnce(new Error(''));
+
+    const response = await fetch(`${baseUrl}/api/embed`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ repo: REPO.name }),
+    });
+    expect(response.status).toBe(202);
+    const { jobId } = (await response.json()) as { jobId: string };
+
+    await expect(waitForTerminalJob(baseUrl, jobId)).resolves.toMatchObject({
+      status: 'failed',
+      error: 'Embedding generation failed',
+    });
+  });
+
+  it('publishes cancellation and ownership cleanup failures together after release', async () => {
+    state.currentMeta = makeMeta(LIVE_DIGEST);
+    let pipelineStarted!: () => void;
+    const pipelineRunning = new Promise<void>((resolve) => {
+      pipelineStarted = resolve;
+    });
+    state.runEmbeddingPipeline.mockImplementation(async (...args: unknown[]) => {
+      const reportProgress = args[2] as (progress: { phase: string; percent: number }) => void;
+      const options = args[6] as { signal: AbortSignal };
+      pipelineStarted();
+      await new Promise<void>((_resolve, reject) => {
+        const rejectWithWrappedAbort = () => {
+          reportProgress({ phase: 'error', percent: 0 });
+          const wrapped = new Error('Embedding request cancelled (redacted endpoint)', {
+            cause: new DOMException('pipeline cancelled', 'AbortError'),
+          });
+          wrapped.name = 'HttpEmbeddingError';
+          reject(wrapped);
+        };
+        if (options.signal.aborted) {
+          rejectWithWrappedAbort();
+          return;
+        }
+        options.signal.addEventListener('abort', rejectWithWrappedAbort, { once: true });
+      });
+    });
+    let cleanupStarted!: () => void;
+    const cleanupRunning = new Promise<void>((resolve) => {
+      cleanupStarted = resolve;
+    });
+    let failCleanup!: () => void;
+    const cleanupRelease = new Promise<void>((_resolve, reject) => {
+      failCleanup = () => reject(new Error('release retries exhausted'));
+    });
+    state.releaseOwnershipLease.mockImplementation(async () => {
+      cleanupStarted();
+      return cleanupRelease;
+    });
+
+    const response = await fetch(`${baseUrl}/api/embed`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ repo: REPO.name }),
+    });
+    expect(response.status).toBe(202);
+    const { jobId } = (await response.json()) as { jobId: string };
+    await pipelineRunning;
+
+    const progressResponse = await fetch(`${baseUrl}/api/embed/${jobId}/progress`);
+    expect(progressResponse.status).toBe(200);
+    let progressSettled = false;
+    const progressText = progressResponse.text().then((text) => {
+      progressSettled = true;
+      return text;
+    });
+
+    const cancelled = await fetch(`${baseUrl}/api/embed/${jobId}`, { method: 'DELETE' });
+    expect(cancelled.status).toBe(200);
+    await cleanupRunning;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(progressSettled).toBe(false);
+
+    failCleanup();
+    const job = await waitForTerminalJob(baseUrl, jobId);
+    const events = await progressText;
+
+    expect(job).toMatchObject({ status: 'failed' });
+    expect(job.error).toMatch(/cancelled by user/i);
+    expect(job.error).toMatch(/ownership lock release failed: release retries exhausted/i);
+    expect(events).toMatch(/event: failed/);
+    expect(events).toMatch(/cancelled by user/i);
+    expect(events).toMatch(/ownership lock release failed: release retries exhausted/i);
+    expect(state.releaseOwnershipLease).toHaveBeenCalledOnce();
   });
 
   it('rejects an equal-count different-digest completed window before the pipeline', async () => {

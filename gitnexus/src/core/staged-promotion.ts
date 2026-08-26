@@ -1057,6 +1057,36 @@ export interface AnalyzeOwnershipLockOptions {
   createStoragePath?: boolean;
 }
 
+const releaseOwnedOwnershipLock = async (
+  lockPath: string,
+  record: StageLockRecord,
+): Promise<void> => {
+  const transientCodes = new Set(['EBUSY', 'EPERM']);
+  const filesystemErrorCode = (error: unknown): string | undefined => {
+    let current = error;
+    for (let depth = 0; depth < 4 && current instanceof Error; depth++) {
+      const code = (current as NodeJS.ErrnoException).code;
+      if (code) return code;
+      current = current.cause;
+    }
+    return undefined;
+  };
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const current = await readJson<StageLockRecord>(lockPath);
+      if (!current || !validStageLockRecord(current) || !sameStageLockRecord(current, record)) {
+        return;
+      }
+      await fs.rm(lockPath, { force: true });
+      return;
+    } catch (error) {
+      const code = filesystemErrorCode(error);
+      if (!code || !transientCodes.has(code) || attempt === 2) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 25 * 2 ** attempt));
+    }
+  }
+};
+
 const withOwnershipFileLock = async <T>(
   lockPath: string,
   operation: () => Promise<T>,
@@ -1072,6 +1102,8 @@ const withOwnershipFileLock = async <T>(
   let ownsLock = false;
   let publicationSourcePath: string | undefined;
   let legacyLease: LegacyRecoveryLease | undefined;
+  let operationFailed = false;
+  let operationFailure: unknown;
   let claimantStartToken: string | undefined = ownerProcessStartToken;
   const requireClaimantStartToken = async (): Promise<string> => {
     claimantStartToken ??= await getCurrentProcessStartToken().catch(() => {
@@ -1137,14 +1169,31 @@ const withOwnershipFileLock = async <T>(
       await clearRecoveryClaims(lockPath, record, await requireClaimantStartToken());
     }
     return await operation();
+  } catch (error) {
+    operationFailed = true;
+    operationFailure = error;
+    throw error;
   } finally {
     if (legacyLease) await releaseLegacyRecoveryLease(legacyLease);
     if (publicationSourcePath) {
       await fs.rm(publicationSourcePath, { force: true }).catch(() => {});
     }
     if (ownsLock) {
-      const current = await readJson<StageLockRecord>(lockPath).catch(() => undefined);
-      if (current?.nonce === record.nonce) await fs.rm(lockPath, { force: true });
+      try {
+        await releaseOwnedOwnershipLock(lockPath, record);
+      } catch (releaseError) {
+        if (operationFailed) {
+          const operationMessage =
+            operationFailure instanceof Error ? operationFailure.message : String(operationFailure);
+          const releaseMessage =
+            releaseError instanceof Error ? releaseError.message : String(releaseError);
+          throw new AggregateError(
+            [operationFailure, releaseError],
+            `Analyze ownership operation failed: ${operationMessage}; ownership lock release also failed: ${releaseMessage}`,
+          );
+        }
+        throw releaseError;
+      }
     }
   }
 };

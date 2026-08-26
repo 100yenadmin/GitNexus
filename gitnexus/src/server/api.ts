@@ -38,9 +38,11 @@ import {
   flushWAL,
   getStrictLbugStats,
   closeLbug,
+  acquireLbugOwnership,
   withLbugReadOnlyNonRecovering,
   withLbugDb,
   isReadOnlyDbError,
+  type LbugOwnershipLease,
 } from '../core/lbug/lbug-adapter.js';
 import { isValidQueryParams } from '../core/lbug/query-params.js';
 import { NODE_TABLES, type GraphNode, type GraphRelationship } from 'gitnexus-shared';
@@ -2259,6 +2261,15 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         const barrier = createEmbedCommitBarrier();
         embedBarriers.set(job.id, barrier);
         embedAborters.set(job.id, () => embedController.abort());
+        let cancellationFailure: string | undefined;
+        const causedByAbort = (error: unknown): boolean => {
+          let current = error;
+          for (let depth = 0; depth < 4 && current instanceof Error; depth++) {
+            if (current.name === 'AbortError') return true;
+            current = current.cause;
+          }
+          return false;
+        };
         const cancelEmbedding = (reason: string): boolean => {
           const current = embedJobManager.getJob(job.id);
           if (!current || current.status === 'complete' || current.status === 'failed') {
@@ -2266,7 +2277,11 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
           }
           const outcome = requestEmbedCancellation(barrier, reason, () => embedController.abort());
           if (outcome === 'cancelled') {
-            embedJobManager.cancelJob(job.id, reason);
+            // Keep the durable job non-terminal until ownership cleanup has
+            // completed so a release failure can be reported with the
+            // cancellation instead of being dropped by JobManager's terminal
+            // state guard.
+            cancellationFailure ??= reason;
           }
           return true;
         };
@@ -2282,7 +2297,13 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
 
         // Run embedding pipeline asynchronously
         (async () => {
+          let ownershipLease: LbugOwnershipLease | undefined;
+          let failureMessage: string | undefined;
           try {
+            ownershipLease = await acquireLbugOwnership(
+              frozenOwner.canonicalStoragePath,
+              frozenOwner.canonicalPath,
+            );
             const lbugPath = path.join(frozenOwner.canonicalStoragePath, 'lbug');
             const { inspectEmbeddingIntegrity } = await import('../core/lbug/lbug-adapter.js');
             const tentativeMeta = await loadMeta(frozenOwner.canonicalStoragePath);
@@ -2338,10 +2359,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
               });
             }
             const withOwnedLbugDb = <T>(operation: () => Promise<T>): Promise<T> =>
-              withLbugDb(lbugPath, operation, {
-                ownershipStoragePath: frozenOwner.canonicalStoragePath,
-                ownershipRepoRoot: frozenOwner.canonicalPath,
-              });
+              withLbugDb(lbugPath, operation);
             await withOwnedLbugDb(async () => {
               let embeddingMeta = await loadMeta(frozenOwner.canonicalStoragePath);
               const authoritativeLegacy = isEmptyLegacyCheckpoint(
@@ -2510,8 +2528,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                 (p) => {
                   embedJobManager.updateJob(job.id, {
                     progress: {
-                      phase:
-                        p.phase === 'ready' ? 'complete' : p.phase === 'error' ? 'failed' : p.phase,
+                      phase: p.phase === 'ready' || p.phase === 'error' ? 'embedding' : p.phase,
                       percent: p.percent,
                       message:
                         p.phase === 'loading-model'
@@ -2582,24 +2599,55 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
               await assertZeroClearRegistryOwner(frozenOwner, terminalOwnerMeta);
             }
 
+            await ownershipLease.release();
+            ownershipLease = undefined;
+
             // Don't overwrite 'failed' if the job was cancelled while the pipeline was running
             const current = embedJobManager.getJob(job.id);
             if (!current || current.status !== 'failed') {
               barrier.phase = 'COMPLETE';
-              embedJobManager.updateJob(job.id, { status: 'complete' });
+              embedJobManager.updateJob(job.id, {
+                status: 'complete',
+                progress: { phase: 'complete', percent: 100, message: 'Complete' },
+              });
             }
-            barrier.publishTerminalOutcome();
           } catch (err: any) {
             if (barrier.phase !== 'COMPLETE') barrier.phase = 'FAILED';
             const current = embedJobManager.getJob(job.id);
             if (!current || current.status !== 'failed') {
+              failureMessage =
+                cancellationFailure ??
+                (causedByAbort(err) && barrier.cancelReason
+                  ? barrier.cancelReason
+                  : err.message || 'Embedding generation failed');
+            }
+          } finally {
+            let releaseMessage: string | undefined;
+            if (ownershipLease) {
+              try {
+                await ownershipLease.release();
+              } catch (releaseError) {
+                releaseMessage = `Ownership lock release failed: ${
+                  releaseError instanceof Error ? releaseError.message : String(releaseError)
+                }`;
+              }
+            }
+            const current = embedJobManager.getJob(job.id);
+            const combinedFailure = [current?.error ?? failureMessage, releaseMessage]
+              .filter((message): message is string => Boolean(message))
+              .join('; ');
+            if (combinedFailure && (!current || current.status !== 'failed' || releaseMessage)) {
               embedJobManager.updateJob(job.id, {
                 status: 'failed',
-                error: err.message || 'Embedding generation failed',
+                error: combinedFailure,
+                progress: {
+                  phase: 'failed',
+                  percent: current?.progress.percent ?? 0,
+                  message: combinedFailure,
+                },
               });
             }
             barrier.publishTerminalOutcome();
-          } finally {
             clearTimeout(embedTimeout);
             embedBarriers.delete(job.id);
             embedAborters.delete(job.id);
@@ -2679,7 +2727,9 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         res.status(400).json({ error: `Job already ${settledJob.status}` });
         return;
       }
-      if (outcome === 'cancelled') embedJobManager.cancelJob(jobId, 'Cancelled by user');
+      // An immediate cancellation response is intentionally returned before
+      // the worker finishes cleanup. The worker publishes the durable failed
+      // state only after ownership release so cleanup failures remain visible.
     } else {
       embedJobManager.cancelJob(jobId, 'Cancelled by user');
     }
