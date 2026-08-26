@@ -917,9 +917,14 @@ const clearRecoveryClaims = async (
         !validStageLockRecord(currentOwner) ||
         !currentIdentity ||
         !sameStageLockRecord(currentOwner, claimOwner) ||
-        !sameFileObject(currentIdentity, claimIdentity) ||
-        processIsAlive(currentOwner.pid)
+        !sameFileObject(currentIdentity, claimIdentity)
       ) {
+        throw new AnalyzeOwnershipConflictError(
+          `Analyze recovery state at ${claim.path} does not match the current lock; ` +
+            'verify no writer is active before removing either file.',
+        );
+      }
+      if (await primaryLockOwnerIsActive(currentOwner, 'analyze lock owner')) {
         throw new AnalyzeOwnershipConflictError(
           `Analyze recovery state at ${claim.path} does not match the current lock; ` +
             'verify no writer is active before removing either file.',

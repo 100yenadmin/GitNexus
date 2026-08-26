@@ -692,6 +692,29 @@ describe('common analyze ownership lock', () => {
     expect(await recoveryEntries(lockPath)).toEqual([]);
   });
 
+  it('recovers a pre-unlink claim when both stale owner and claimant pids are reused', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-stage-lock-claim-reused-'));
+    tempDirs.push(root);
+    const lockPath = path.join(root, 'analyze-staged.lock');
+    await fs.writeFile(
+      lockPath,
+      `${JSON.stringify({
+        schema: 'gitnexus.staged-analyze-lock/v1',
+        pid: process.pid,
+        nonce: 'stale-main-owner',
+        startedAt: '2026-07-20T00:00:00.000Z',
+        processStartToken: '000000000000000000000000',
+      })}\n`,
+    );
+    await fs.link(lockPath, `${lockPath}.reclaim.${process.pid}.111111111111111111111111.deadca11`);
+
+    await expect(withAnalyzeOwnershipLock(root, async () => 'recovered')).resolves.toBe(
+      'recovered',
+    );
+    await expect(fs.access(lockPath)).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(await recoveryEntries(lockPath)).toEqual([]);
+  });
+
   it('recovers a dead hard-link claim left after stale-main removal', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-stage-lock-claim-after-'));
     tempDirs.push(root);
