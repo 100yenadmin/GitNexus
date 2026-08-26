@@ -694,6 +694,28 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     expect(state.currentMeta.embeddingCheckpoint).toBeUndefined();
   });
 
+  it.each([
+    ['lastCommit', { lastCommit: 'newer-head' }],
+    ['indexedAt', { indexedAt: '2026-08-25T00:00:00.000Z' }],
+  ])('retains a zero-node checkpoint when only registry $field changes', async (_field, drift) => {
+    state.currentMeta = makeMeta(LIVE_DIGEST, REPO.path, true);
+    state.liveIntegrity = makeIntegrity(LIVE_DIGEST, 0);
+    state.graphNodes = [];
+    const checkpointBefore = JSON.stringify(state.currentMeta.embeddingCheckpoint);
+    state.listRegisteredRepos
+      .mockResolvedValueOnce([REPO])
+      .mockResolvedValue([{ ...REPO, ...drift }]);
+
+    const job = await runEmbedJob(baseUrl, REPO.name);
+
+    expect(job.status).toBe('failed');
+    expect(job.error).toMatch(/registry owner generation changed/i);
+    expect(job.error).toMatch(/retry after the current repository operation finishes/i);
+    expect(state.registerRepo).not.toHaveBeenCalled();
+    expect(state.saveMeta).not.toHaveBeenCalled();
+    expect(JSON.stringify(state.currentMeta.embeddingCheckpoint)).toBe(checkpointBefore);
+  });
+
   it('retains the checkpoint when the owner symlink retargets after registry commit', async () => {
     const fixture = await prepareSymlinkRace('gitnexus-issue269-');
     state.listRegisteredRepos.mockResolvedValue([fixture.raceRepo]);

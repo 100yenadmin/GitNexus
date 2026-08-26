@@ -250,6 +250,16 @@ const assertZeroClearRegistryOwner = async (
   ) {
     throw new Error('Cannot finalize zero-checkpoint embedding: registry owner identity changed');
   }
+  if (
+    owner.lastCommit !== entry.lastCommit ||
+    owner.indexedAt !== entry.indexedAt ||
+    owner.lastCommit !== clearedMeta.lastCommit ||
+    owner.indexedAt !== clearedMeta.indexedAt
+  ) {
+    throw new Error(
+      'Cannot finalize zero-checkpoint embedding: registry owner generation changed; retry after the current repository operation finishes',
+    );
+  }
   return entry;
 };
 

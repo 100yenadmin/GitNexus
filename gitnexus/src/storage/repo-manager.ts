@@ -1083,7 +1083,10 @@ const withRegistryMutationLock = async <T>(operation: () => Promise<T>): Promise
  * unchanged.
  */
 type ExpectedRegistryOwner = Readonly<
-  Pick<RegistryEntry, 'name' | 'path' | 'storagePath' | 'remoteUrl' | 'branch'> & {
+  Pick<
+    RegistryEntry,
+    'name' | 'path' | 'storagePath' | 'remoteUrl' | 'branch' | 'lastCommit' | 'indexedAt'
+  > & {
     /** Captured before an identity-sensitive read; never persisted. */
     canonicalPath: string;
     /** Captured before an identity-sensitive read; never persisted. */
@@ -1507,7 +1510,9 @@ export const registerRepo = async (
         match.owner.name !== expected.name ||
         normalizeRepositoryRemote(match.owner.remoteUrl) !==
           normalizeRepositoryRemote(expected.remoteUrl) ||
-        match.owner.branch !== expected.branch
+        match.owner.branch !== expected.branch ||
+        match.owner.lastCommit !== expected.lastCommit ||
+        match.owner.indexedAt !== expected.indexedAt
       ) {
         throw new Error('GitNexus: expected registry owner changed during locked commit');
       }
