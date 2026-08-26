@@ -398,7 +398,8 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     state.openOwnershipPaths.length = 0;
     state.openOwnershipRepoRoots.length = 0;
     state.ownershipGate = undefined;
-    state.releaseOwnershipLease.mockClear();
+    state.releaseOwnershipLease.mockReset();
+    state.releaseOwnershipLease.mockResolvedValue(undefined);
     state.acquireLbugOwnership.mockClear();
     state.closeLbug.mockClear();
     state.withLbugReadOnlyNonRecovering.mockClear();
@@ -520,6 +521,25 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     expect(state.withLbugReadOnlyNonRecovering.mock.invocationCallOrder[0]).toBeLessThan(
       state.releaseOwnershipLease.mock.invocationCallOrder[0],
     );
+  });
+
+  it('reports ownership cleanup failure together with the embedding failure', async () => {
+    state.loadMeta.mockRejectedValueOnce(new Error('preflight failed'));
+    state.releaseOwnershipLease.mockRejectedValue(new Error('release retries exhausted'));
+
+    const response = await fetch(`${baseUrl}/api/embed`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ repo: REPO.name }),
+    });
+    expect(response.status).toBe(202);
+    const { jobId } = (await response.json()) as { jobId: string };
+    const job = await waitForTerminalJob(baseUrl, jobId);
+
+    expect(job).toMatchObject({ status: 'failed' });
+    expect(job.error).toMatch(/preflight failed/);
+    expect(job.error).toMatch(/ownership lock release failed: release retries exhausted/i);
+    expect(state.releaseOwnershipLease).toHaveBeenCalledOnce();
   });
 
   it('rejects an equal-count different-digest completed window before the pipeline', async () => {

@@ -830,7 +830,7 @@ export const acquireLbugOwnership = async (
       markEntered();
       await gate;
     },
-    { repoRoot },
+    { repoRoot, createStoragePath: false },
   );
   void ownership.catch(markFailed);
   await entered;

@@ -2285,6 +2285,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         // Run embedding pipeline asynchronously
         (async () => {
           let ownershipLease: LbugOwnershipLease | undefined;
+          let failureMessage: string | undefined;
           try {
             ownershipLease = await acquireLbugOwnership(
               frozenOwner.canonicalStoragePath,
@@ -2595,19 +2596,31 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
               barrier.phase = 'COMPLETE';
               embedJobManager.updateJob(job.id, { status: 'complete' });
             }
-            barrier.publishTerminalOutcome();
           } catch (err: any) {
             if (barrier.phase !== 'COMPLETE') barrier.phase = 'FAILED';
             const current = embedJobManager.getJob(job.id);
             if (!current || current.status !== 'failed') {
-              embedJobManager.updateJob(job.id, {
-                status: 'failed',
-                error: err.message || 'Embedding generation failed',
-              });
+              failureMessage = err.message || 'Embedding generation failed';
+            }
+          } finally {
+            let releaseMessage: string | undefined;
+            if (ownershipLease) {
+              try {
+                await ownershipLease.release();
+              } catch (releaseError) {
+                releaseMessage = `Ownership lock release failed: ${
+                  releaseError instanceof Error ? releaseError.message : String(releaseError)
+                }`;
+              }
+            }
+            const current = embedJobManager.getJob(job.id);
+            const combinedFailure = [current?.error ?? failureMessage, releaseMessage]
+              .filter((message): message is string => Boolean(message))
+              .join('; ');
+            if (combinedFailure && (!current || current.status !== 'failed' || releaseMessage)) {
+              embedJobManager.updateJob(job.id, { status: 'failed', error: combinedFailure });
             }
             barrier.publishTerminalOutcome();
-          } finally {
-            await ownershipLease?.release().catch(() => {});
             clearTimeout(embedTimeout);
             embedBarriers.delete(job.id);
             embedAborters.delete(job.id);

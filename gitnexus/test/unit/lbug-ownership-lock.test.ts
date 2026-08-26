@@ -24,7 +24,9 @@ const makePaths = async () => {
 describe('Ladybug writable ownership admission', () => {
   it('holds one real analyze ownership lease across separately sequenced preflight work', async () => {
     const { repoRoot, storagePath } = await makePaths();
+    await expect(fs.access(storagePath)).rejects.toMatchObject({ code: 'ENOENT' });
     const lease = await acquireLbugOwnership(storagePath, repoRoot);
+    await expect(fs.access(storagePath)).rejects.toMatchObject({ code: 'ENOENT' });
 
     await expect(
       withAnalyzeOwnershipLock(storagePath, async () => undefined, { repoRoot }),
@@ -32,6 +34,7 @@ describe('Ladybug writable ownership admission', () => {
 
     await lease.release();
     await lease.release();
+    await expect(fs.access(storagePath)).rejects.toMatchObject({ code: 'ENOENT' });
 
     await expect(
       withAnalyzeOwnershipLock(storagePath, async () => 'released', { repoRoot }),
