@@ -19,8 +19,11 @@ const tempDirs: string[] = [];
 const sourceRepo: RepositorySourceIdentity = { head: 'source-head', branch: 'main' };
 
 const recoveryEntries = async (lockPath: string): Promise<string[]> => {
-  const prefix = `${path.basename(lockPath)}.reclaim.`;
-  return (await fs.readdir(path.dirname(lockPath))).filter((entry) => entry.startsWith(prefix));
+  const basename = path.basename(lockPath);
+  return (await fs.readdir(path.dirname(lockPath))).filter(
+    (entry) =>
+      entry.startsWith(`${basename}.reclaim.`) || entry.startsWith(`${basename}.lease-source.`),
+  );
 };
 
 const writeDeadAnalyzeLock = (lockPath: string): Promise<void> =>
@@ -33,6 +36,36 @@ const writeDeadAnalyzeLock = (lockPath: string): Promise<void> =>
       startedAt: '2026-07-20T00:00:00.000Z',
     })}\n`,
   );
+
+const deadRecoveryLeaseRecord = {
+  schema: 'gitnexus.staged-analyze-lock/v1',
+  pid: 2_147_483_646,
+  nonce: 'deadca11',
+  startedAt: '2026-07-20T00:00:02.000Z',
+  processStartToken: 'deadbeefdeadbeefdeadbeef',
+} as const;
+
+const deadRecoveryClaimPath = (lockPath: string): string =>
+  `${lockPath}.reclaim.${deadRecoveryLeaseRecord.pid}.` +
+  `${deadRecoveryLeaseRecord.processStartToken}.${deadRecoveryLeaseRecord.nonce}`;
+
+const deadRecoveryLeaseSourcePath = (lockPath: string): string =>
+  `${lockPath}.lease-source.${deadRecoveryLeaseRecord.pid}.` +
+  `${deadRecoveryLeaseRecord.processStartToken}.${deadRecoveryLeaseRecord.nonce}`;
+
+const publishDeadRecoveryLease = async (lockPath: string): Promise<void> => {
+  const sourcePath = deadRecoveryLeaseSourcePath(lockPath);
+  await fs.writeFile(sourcePath, `${JSON.stringify(deadRecoveryLeaseRecord)}\n`);
+  await fs.link(sourcePath, `${lockPath}.reclaim`);
+};
+
+const recoveryResidue = async (lockPath: string): Promise<string[]> => {
+  const basename = path.basename(lockPath);
+  return (await fs.readdir(path.dirname(lockPath))).filter(
+    (entry) =>
+      entry.startsWith(`${basename}.reclaim`) || entry.startsWith(`${basename}.lease-source`),
+  );
+};
 
 const makeMeta = (generation: string): RepoMeta => ({
   repoPath: '/repo',
@@ -642,6 +675,81 @@ describe('common analyze ownership lock', () => {
       /legacy analyze recovery is active/i,
     );
     await expect(fs.readFile(markerPath, 'utf8')).resolves.toBe('legacy-recovery');
+  });
+
+  it('recovers a valid legacy marker whose owner process is gone', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-stage-lock-dead-legacy-'));
+    tempDirs.push(root);
+    const lockPath = path.join(root, 'analyze-staged.lock');
+    await writeDeadAnalyzeLock(lockPath);
+    await writeDeadAnalyzeLock(`${lockPath}.reclaim`);
+
+    await expect(withAnalyzeOwnershipLock(root, async () => 'recovered')).resolves.toBe(
+      'recovered',
+    );
+    expect(await recoveryResidue(lockPath)).toEqual([]);
+  });
+
+  it('recovers a crash before atomic lease publication', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-stage-lock-lease-source-'));
+    tempDirs.push(root);
+    const lockPath = path.join(root, 'analyze-staged.lock');
+    await fs.writeFile(deadRecoveryLeaseSourcePath(lockPath), 'partial');
+
+    await expect(withAnalyzeOwnershipLock(root, async () => 'recovered')).resolves.toBe(
+      'recovered',
+    );
+    expect(await recoveryResidue(lockPath)).toEqual([]);
+  });
+
+  it.each([
+    {
+      phase: 'after atomic lease publication',
+      setup: async (lockPath: string) => {
+        await writeDeadAnalyzeLock(lockPath);
+        await publishDeadRecoveryLease(lockPath);
+      },
+    },
+    {
+      phase: 'after stale-inode claim publication',
+      setup: async (lockPath: string) => {
+        await writeDeadAnalyzeLock(lockPath);
+        await fs.link(lockPath, deadRecoveryClaimPath(lockPath));
+        await publishDeadRecoveryLease(lockPath);
+      },
+    },
+    {
+      phase: 'after stale-main removal',
+      setup: async (lockPath: string) => {
+        await writeDeadAnalyzeLock(lockPath);
+        await fs.link(lockPath, deadRecoveryClaimPath(lockPath));
+        await fs.rm(lockPath);
+        await publishDeadRecoveryLease(lockPath);
+      },
+    },
+    {
+      phase: 'after successor-lock durability',
+      setup: async (lockPath: string) => {
+        await fs.writeFile(lockPath, `${JSON.stringify(deadRecoveryLeaseRecord)}\n`);
+        await publishDeadRecoveryLease(lockPath);
+      },
+    },
+  ])('recovers a dead process-bound lease $phase', async ({ setup }) => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-stage-lock-dead-lease-'));
+    tempDirs.push(root);
+    const lockPath = path.join(root, 'analyze-staged.lock');
+    await setup(lockPath);
+    let entered = 0;
+
+    await expect(
+      withAnalyzeOwnershipLock(root, async () => {
+        entered += 1;
+        return 'recovered';
+      }),
+    ).resolves.toBe('recovered');
+    expect(entered).toBe(1);
+    expect(await recoveryResidue(lockPath)).toEqual([]);
+    await expect(fs.access(lockPath)).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
   it('preserves mismatched live ownership when a dead recovery claim is ambiguous', async () => {
