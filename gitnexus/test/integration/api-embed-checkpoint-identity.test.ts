@@ -486,6 +486,30 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     expect(state.currentMeta.embeddingCheckpoint).toBeUndefined();
   });
 
+  it('fails ordinary completion when the owner retargets during terminal metadata save', async () => {
+    const fixture = await prepareSymlinkRace('gitnexus-issue269-ordinary-terminal-');
+    state.currentMeta = makeMeta(LIVE_DIGEST, fixture.alias);
+    state.liveIntegrity = makeIntegrity(LIVE_DIGEST, 3);
+    state.graphNodes = [{ id: 'node-1' }];
+    state.listRegisteredRepos.mockResolvedValue([fixture.raceRepo]);
+    state.saveMeta.mockImplementationOnce(async (_storagePath, next) => {
+      state.currentMeta = next;
+      await fixture.retarget();
+    });
+
+    try {
+      const job = await runEmbedJob(baseUrl, fixture.raceRepo.name);
+
+      expect(job.status).toBe('failed');
+      expect(job.error).toMatch(/path\/storage identity is non-absolute or mismatched/i);
+      expect(state.runEmbeddingPipeline).toHaveBeenCalledOnce();
+      expect(state.saveMeta).toHaveBeenCalledOnce();
+      expect(state.currentMeta.embeddingCheckpoint).toBeUndefined();
+    } finally {
+      await fs.rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
   it('rejects a nonlegacy provider mismatch before writable Ladybug', async () => {
     state.currentMeta.embeddingCheckpoint = {
       ...state.currentMeta.embeddingCheckpoint!,

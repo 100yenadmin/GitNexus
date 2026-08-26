@@ -2134,6 +2134,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
             const tentativeCheckpoint = tentativeMeta.embeddingCheckpoint;
             const tentativeLegacy = isEmptyLegacyCheckpoint(tentativeCheckpoint);
             let embeddingIdentity: EmbeddingIdentity | undefined;
+            let terminalOwnerMeta: RepoMeta | undefined;
             if (tentativeCheckpoint && !tentativeLegacy) {
               const { getActiveEmbeddingIdentity } = await import('../core/embeddings/embedder.js');
               embeddingIdentity = getActiveEmbeddingIdentity();
@@ -2405,7 +2406,17 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                 saveMeta(frozenOwner.canonicalStoragePath, terminalMeta),
               );
               embeddingMeta = terminalMeta;
+              terminalOwnerMeta = terminalMeta;
             });
+
+            // Ordinary embedding completion must prove that the raw registry
+            // path still identifies the physical owner captured at admission.
+            // Keep this immediately before publishing success so a symlink
+            // retarget during the pipeline or terminal metadata save fails
+            // closed instead of advertising orphaned embeddings.
+            if (terminalOwnerMeta) {
+              await assertZeroClearRegistryOwner(frozenOwner, terminalOwnerMeta);
+            }
 
             // Don't overwrite 'failed' if the job was cancelled while the pipeline was running
             const current = embedJobManager.getJob(job.id);
