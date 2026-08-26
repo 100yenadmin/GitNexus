@@ -1167,7 +1167,14 @@ describe('registerRepo expected owner CAS (#264)', () => {
     expect(await fs.readFile(registryPath, 'utf8')).toBe(before);
   });
 
-  it('rejects when the owner changes after the outer read but before the locked read', async () => {
+  it.each([
+    ['removal', () => []],
+    ['lastCommit-only drift', (entry: RegistryEntry) => [{ ...entry, lastCommit: 'newer' }]],
+    [
+      'indexedAt-only drift',
+      (entry: RegistryEntry) => [{ ...entry, indexedAt: '2026-08-25T00:00:00.000Z' }],
+    ],
+  ])('rejects %s after the outer read but before the locked read', async (_label, mutate) => {
     const expected = owner();
     const registryPath = path.join(tmpHome.dbPath, 'registry.json');
     const lockPath = `${registryPath}.lock`;
@@ -1186,11 +1193,12 @@ describe('registerRepo expected owner CAS (#264)', () => {
       expectedOwner: frozenOwner(expected),
     });
     await vi.waitFor(() => expect(openSpy).toHaveBeenCalledWith(lockPath, 'wx', 0o600));
-    await fs.writeFile(registryPath, '[]');
+    const changed = JSON.stringify(mutate(expected), null, 2);
+    await fs.writeFile(registryPath, changed);
     await fs.rm(lockPath);
 
     await expect(pending).rejects.toThrow(casError);
-    expect(await fs.readFile(registryPath, 'utf8')).toBe('[]');
+    expect(await fs.readFile(registryPath, 'utf8')).toBe(changed);
     openSpy.mockRestore();
   });
 
