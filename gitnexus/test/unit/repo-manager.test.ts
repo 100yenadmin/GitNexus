@@ -1168,6 +1168,40 @@ describe('registerRepo expected owner CAS (#264)', () => {
   });
 
   it.each([
+    [
+      'dead owner',
+      JSON.stringify({
+        schema: 'gitnexus.registry-lock/v1',
+        pid: 2_147_483_647,
+        nonce: 'stale-owner',
+        startedAt: '2026-08-26T00:00:00.000Z',
+      }),
+      false,
+    ],
+    ['unreadable record', '{not-json', true],
+  ])(
+    'fails closed on a %s lock without changing lock or registry bytes',
+    async (_label, lockBytes, ageLock) => {
+      const expected = owner();
+      const registryPath = path.join(tmpHome.dbPath, 'registry.json');
+      const lockPath = `${registryPath}.lock`;
+      const registryBefore = JSON.stringify([expected], null, 2);
+      await fs.writeFile(registryPath, registryBefore);
+      await fs.writeFile(lockPath, lockBytes);
+      if (ageLock) {
+        const old = new Date(Date.now() - 10_000);
+        await fs.utimes(lockPath, old, old);
+      }
+
+      await expect(
+        registerRepo(tmpRepo.dbPath, meta('new'), { expectedOwner: frozenOwner(expected) }),
+      ).rejects.toThrow(`stale or unreadable registry mutation lock at ${lockPath}`);
+      expect(await fs.readFile(lockPath, 'utf8')).toBe(lockBytes);
+      expect(await fs.readFile(registryPath, 'utf8')).toBe(registryBefore);
+    },
+  );
+
+  it.each([
     ['removal', () => []],
     ['lastCommit-only drift', (entry: RegistryEntry) => [{ ...entry, lastCommit: 'newer' }]],
     [

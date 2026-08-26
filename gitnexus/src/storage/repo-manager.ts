@@ -1033,6 +1033,12 @@ const waitForRegistryLock = async (): Promise<void> => {
   await new Promise((resolve) => setTimeout(resolve, REGISTRY_LOCK_RETRY_DELAY_MS));
 };
 
+const registryLockRecoveryError = (lockPath: string): Error =>
+  new Error(
+    `GitNexus: stale or unreadable registry mutation lock at ${lockPath}; ` +
+      'verify no GitNexus writer is active, remove the lock manually, and retry',
+  );
+
 const withRegistryMutationLock = async <T>(operation: () => Promise<T>): Promise<T> => {
   const lockPath = `${getGlobalRegistryPath()}.lock`;
   await fs.mkdir(path.dirname(lockPath), { recursive: true });
@@ -1061,15 +1067,12 @@ const withRegistryMutationLock = async <T>(operation: () => Promise<T>): Promise
 
       const owner = await readRegistryLock(lockPath);
       if (owner && !registryProcessIsAlive(owner.pid)) {
-        const current = await readRegistryLock(lockPath);
-        if (current?.nonce === owner.nonce) await fs.rm(lockPath, { force: true });
-        continue;
+        throw registryLockRecoveryError(lockPath);
       }
       if (!owner) {
         const state = await fs.stat(lockPath).catch(() => null);
         if (state && Date.now() - state.mtimeMs > REGISTRY_LOCK_UNINITIALIZED_GRACE_MS) {
-          await fs.rm(lockPath, { force: true });
-          continue;
+          throw registryLockRecoveryError(lockPath);
         }
       }
       await waitForRegistryLock();
