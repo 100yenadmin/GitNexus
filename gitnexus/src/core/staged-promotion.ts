@@ -358,44 +358,134 @@ const sameStageLockRecord = (left: StageLockRecord, right: StageLockRecord): boo
   left.nonce === right.nonce &&
   left.startedAt === right.startedAt;
 
+const sameFileObject = (left: FileIdentity, right: FileIdentity): boolean =>
+  left.dev === right.dev && left.ino === right.ino;
+
+interface RecoveryClaim {
+  path: string;
+  pid: number;
+  nonce: string;
+}
+
+const recoveryClaimPrefix = (lockPath: string): string => `${path.basename(lockPath)}.reclaim.`;
+
+const recoveryClaimPath = (lockPath: string, claimant: StageLockRecord): string =>
+  `${lockPath}.reclaim.${claimant.pid}.${claimant.nonce}`;
+
+const listRecoveryClaims = async (lockPath: string): Promise<RecoveryClaim[]> => {
+  const directory = path.dirname(lockPath);
+  const prefix = recoveryClaimPrefix(lockPath);
+  const entries = await fs.readdir(directory, { withFileTypes: true }).catch((error) => {
+    if (isMissingFilesystemError(error)) return [];
+    throw error;
+  });
+  const claims: RecoveryClaim[] = [];
+  for (const entry of entries) {
+    if (!entry.name.startsWith(prefix)) continue;
+    const match = entry.name.slice(prefix.length).match(/^(\d+)\.([0-9a-f]+)$/);
+    if (!entry.isFile() || !match) {
+      throw new AnalyzeOwnershipConflictError(
+        `Analyze recovery state is malformed at ${path.join(directory, entry.name)}; ` +
+          'verify no writer is active before removing it.',
+      );
+    }
+    const pid = Number(match[1]);
+    if (!Number.isSafeInteger(pid) || pid <= 0) {
+      throw new AnalyzeOwnershipConflictError(
+        `Analyze recovery owner is invalid at ${path.join(directory, entry.name)}; ` +
+          'verify no writer is active before removing it.',
+      );
+    }
+    claims.push({ path: path.join(directory, entry.name), pid, nonce: match[2] });
+  }
+  return claims;
+};
+
+const clearDeadRecoveryClaims = async (lockPath: string): Promise<void> => {
+  for (const claim of await listRecoveryClaims(lockPath)) {
+    if (processIsAlive(claim.pid)) {
+      throw new AnalyzeOwnershipConflictError(
+        `Analyze lock recovery is active (pid ${claim.pid}); retry after it completes.`,
+      );
+    }
+    const claimOwner = await readJson<StageLockRecord>(claim.path).catch(() => undefined);
+    const claimIdentity = await statRegularFile(claim.path);
+    if (!claimOwner || !validStageLockRecord(claimOwner) || !claimIdentity) {
+      throw new AnalyzeOwnershipConflictError(
+        `Analyze recovery state is unreadable at ${claim.path}; ` +
+          'verify no writer is active before removing it.',
+      );
+    }
+    const currentOwner = await readJson<StageLockRecord>(lockPath).catch(() => undefined);
+    const currentIdentity = await statRegularFile(lockPath);
+    if (currentOwner || currentIdentity) {
+      if (
+        !currentOwner ||
+        !validStageLockRecord(currentOwner) ||
+        !currentIdentity ||
+        !sameStageLockRecord(currentOwner, claimOwner) ||
+        !sameFileObject(currentIdentity, claimIdentity) ||
+        processIsAlive(currentOwner.pid)
+      ) {
+        throw new AnalyzeOwnershipConflictError(
+          `Analyze recovery state at ${claim.path} does not match the current lock; ` +
+            'verify no writer is active before removing either file.',
+        );
+      }
+    }
+    // The claimant path includes a never-reused nonce, so removing a dead
+    // claimant cannot unlink a later process's recovery entry or main lock.
+    await fs.rm(claim.path, { force: true });
+  }
+};
+
 const reclaimStaleOwnershipLock = async (
   lockPath: string,
   observedOwner: StageLockRecord,
   claimant: StageLockRecord,
 ): Promise<boolean> => {
-  const recoveryPath = `${lockPath}.reclaim`;
-  let recoveryHandle: Awaited<ReturnType<typeof fs.open>> | undefined;
+  const claimPath = recoveryClaimPath(lockPath, claimant);
   try {
-    recoveryHandle = await fs.open(recoveryPath, 'wx', 0o600);
+    await fs.link(lockPath, claimPath);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
-      throw new AnalyzeOwnershipConflictError(
-        'Analyze lock recovery is already active; retry after the current owner releases it.',
-      );
-    }
+    if (isMissingFilesystemError(error)) return true;
     throw error;
   }
 
   try {
-    await recoveryHandle.writeFile(`${JSON.stringify(claimant)}\n`, 'utf8');
-    await recoveryHandle.sync();
-    const current = await readJson<StageLockRecord>(lockPath).catch(() => undefined);
+    const claimOwner = await readJson<StageLockRecord>(claimPath).catch(() => undefined);
+    const claimIdentity = await statRegularFile(claimPath);
     if (
-      !current ||
-      !validStageLockRecord(current) ||
-      !sameStageLockRecord(current, observedOwner) ||
-      processIsAlive(current.pid)
+      !claimOwner ||
+      !validStageLockRecord(claimOwner) ||
+      !claimIdentity ||
+      !sameStageLockRecord(claimOwner, observedOwner) ||
+      processIsAlive(claimOwner.pid)
     ) {
       return false;
     }
-    await fs.rm(lockPath);
+    const current = await readJson<StageLockRecord>(lockPath).catch(() => undefined);
+    const currentIdentity = await statRegularFile(lockPath);
+    if (current || currentIdentity) {
+      if (
+        !current ||
+        !validStageLockRecord(current) ||
+        !currentIdentity ||
+        !sameStageLockRecord(current, observedOwner) ||
+        !sameFileObject(currentIdentity, claimIdentity) ||
+        processIsAlive(current.pid)
+      ) {
+        return false;
+      }
+      try {
+        await fs.rm(lockPath);
+      } catch (error) {
+        if (!isMissingFilesystemError(error)) throw error;
+      }
+    }
     return true;
   } finally {
-    await recoveryHandle.close().catch(() => {});
-    const currentRecovery = await readJson<StageLockRecord>(recoveryPath).catch(() => undefined);
-    if (currentRecovery?.nonce === claimant.nonce) {
-      await fs.rm(recoveryPath, { force: true });
-    }
+    await fs.rm(claimPath, { force: true });
   }
 };
 
@@ -418,6 +508,7 @@ const withOwnershipFileLock = async <T>(
   };
   let handle: Awaited<ReturnType<typeof fs.open>> | undefined;
   for (let attempt = 0; attempt < 2; attempt++) {
+    await clearDeadRecoveryClaims(lockPath);
     try {
       handle = await fs.open(lockPath, 'wx', 0o600);
       break;
@@ -448,6 +539,10 @@ const withOwnershipFileLock = async <T>(
   try {
     await handle.writeFile(`${JSON.stringify(record)}\n`, 'utf8');
     await handle.sync();
+    // A contender that observed the prior stale owner may have linked it just
+    // before this owner replaced the main path. Never enter while any live or
+    // ambiguous recovery claim exists.
+    await clearDeadRecoveryClaims(lockPath);
     return await operation();
   } finally {
     await handle.close().catch(() => {});

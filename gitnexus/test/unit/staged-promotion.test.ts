@@ -16,6 +16,11 @@ import { loadMeta, saveMeta, type RepoMeta } from '../../src/storage/repo-manage
 const tempDirs: string[] = [];
 const sourceRepo: RepositorySourceIdentity = { head: 'source-head', branch: 'main' };
 
+const recoveryEntries = async (lockPath: string): Promise<string[]> => {
+  const prefix = `${path.basename(lockPath)}.reclaim.`;
+  return (await fs.readdir(path.dirname(lockPath))).filter((entry) => entry.startsWith(prefix));
+};
+
 const makeMeta = (generation: string): RepoMeta => ({
   repoPath: '/repo',
   lastCommit: generation,
@@ -445,9 +450,7 @@ describe('common analyze ownership lock', () => {
     await expect(fs.access(path.join(root, 'analyze-staged.lock'))).rejects.toMatchObject({
       code: 'ENOENT',
     });
-    await expect(fs.access(path.join(root, 'analyze-staged.lock.reclaim'))).rejects.toMatchObject({
-      code: 'ENOENT',
-    });
+    expect(await recoveryEntries(path.join(root, 'analyze-staged.lock'))).toEqual([]);
   });
 
   it('admits exactly one contender when reclaiming the same stale lock', async () => {
@@ -498,7 +501,83 @@ describe('common analyze ownership lock', () => {
     expect(settled.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
     expect(settled.filter((result) => result.status === 'rejected')).toHaveLength(1);
     await expect(fs.access(lockPath)).rejects.toMatchObject({ code: 'ENOENT' });
-    await expect(fs.access(`${lockPath}.reclaim`)).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(await recoveryEntries(lockPath)).toEqual([]);
+  });
+
+  it('recovers a dead hard-link claim left before stale-main removal', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-stage-lock-claim-before-'));
+    tempDirs.push(root);
+    const lockPath = path.join(root, 'analyze-staged.lock');
+    await fs.writeFile(
+      lockPath,
+      `${JSON.stringify({
+        schema: 'gitnexus.staged-analyze-lock/v1',
+        pid: 2_147_483_647,
+        nonce: 'dead-owner',
+        startedAt: '2026-07-20T00:00:00.000Z',
+      })}\n`,
+    );
+    await fs.link(lockPath, `${lockPath}.reclaim.2147483646.deadca11`);
+
+    await expect(withAnalyzeOwnershipLock(root, async () => 'recovered')).resolves.toBe(
+      'recovered',
+    );
+    await expect(fs.access(lockPath)).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(await recoveryEntries(lockPath)).toEqual([]);
+  });
+
+  it('recovers a dead hard-link claim left after stale-main removal', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-stage-lock-claim-after-'));
+    tempDirs.push(root);
+    const lockPath = path.join(root, 'analyze-staged.lock');
+    await fs.writeFile(
+      lockPath,
+      `${JSON.stringify({
+        schema: 'gitnexus.staged-analyze-lock/v1',
+        pid: 2_147_483_647,
+        nonce: 'dead-owner',
+        startedAt: '2026-07-20T00:00:00.000Z',
+      })}\n`,
+    );
+    await fs.link(lockPath, `${lockPath}.reclaim.2147483646.deadca11`);
+    await fs.rm(lockPath);
+
+    await expect(withAnalyzeOwnershipLock(root, async () => 'recovered')).resolves.toBe(
+      'recovered',
+    );
+    await expect(fs.access(lockPath)).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(await recoveryEntries(lockPath)).toEqual([]);
+  });
+
+  it('preserves mismatched live ownership when a dead recovery claim is ambiguous', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-stage-lock-claim-mismatch-'));
+    tempDirs.push(root);
+    const lockPath = path.join(root, 'analyze-staged.lock');
+    const unrelated = path.join(root, 'unrelated-stale-lock');
+    const liveOwner = {
+      schema: 'gitnexus.staged-analyze-lock/v1',
+      pid: process.pid,
+      nonce: 'live-owner',
+      startedAt: '2026-07-20T00:00:01.000Z',
+    };
+    await fs.writeFile(lockPath, `${JSON.stringify(liveOwner)}\n`);
+    await fs.writeFile(
+      unrelated,
+      `${JSON.stringify({
+        schema: 'gitnexus.staged-analyze-lock/v1',
+        pid: 2_147_483_647,
+        nonce: 'dead-owner',
+        startedAt: '2026-07-20T00:00:00.000Z',
+      })}\n`,
+    );
+    const claimPath = `${lockPath}.reclaim.2147483646.deadca11`;
+    await fs.link(unrelated, claimPath);
+
+    await expect(withAnalyzeOwnershipLock(root, async () => undefined)).rejects.toThrow(
+      /does not match the current lock/i,
+    );
+    await expect(fs.readFile(lockPath, 'utf8')).resolves.toBe(`${JSON.stringify(liveOwner)}\n`);
+    await expect(fs.access(claimPath)).resolves.toBeUndefined();
   });
 
   it('retains ownership after storage is detached without recreating absent storage', async () => {
