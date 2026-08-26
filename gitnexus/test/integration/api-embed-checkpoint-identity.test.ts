@@ -1,4 +1,5 @@
 import http from 'node:http';
+import fsSync from 'node:fs';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -111,6 +112,7 @@ const state = {
   listRegisteredRepos: vi.fn(async () => [REPO]),
   deleteHandlerStarted: undefined as (() => void) | undefined,
   releaseAnalyzeLock: undefined as (() => void) | undefined,
+  afterSafeStorageValidation: undefined as (() => void) | undefined,
 };
 
 const armDeleteHandlerSignal = (): Promise<void> =>
@@ -145,17 +147,24 @@ const prepareSymlinkRace = async (prefix: string) => {
   };
 };
 
-vi.doMock('../../src/storage/repo-manager.js', async () => ({
-  ...(await vi.importActual<typeof import('../../src/storage/repo-manager.js')>(
+vi.doMock('../../src/storage/repo-manager.js', async () => {
+  const actual = await vi.importActual<typeof import('../../src/storage/repo-manager.js')>(
     '../../src/storage/repo-manager.js',
-  )),
-  listRegisteredRepos: state.listRegisteredRepos,
-  loadMeta: state.loadMeta,
-  registerRepo: state.registerRepo,
-  rollbackRegistryCommit: state.rollbackRegistryCommit,
-  unregisterRepo: state.unregisterRepo,
-  saveMeta: state.saveMeta,
-}));
+  );
+  return {
+    ...actual,
+    listRegisteredRepos: state.listRegisteredRepos,
+    loadMeta: state.loadMeta,
+    registerRepo: state.registerRepo,
+    rollbackRegistryCommit: state.rollbackRegistryCommit,
+    unregisterRepo: state.unregisterRepo,
+    saveMeta: state.saveMeta,
+    assertSafeStoragePath: (entry: RegistryEntry) => {
+      actual.assertSafeStoragePath(entry);
+      state.afterSafeStorageValidation?.();
+    },
+  };
+});
 
 vi.doMock('../../src/core/lbug/lbug-adapter.js', async () => ({
   ...(await vi.importActual<typeof import('../../src/core/lbug/lbug-adapter.js')>(
@@ -397,6 +406,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     state.listRegisteredRepos.mockReset();
     state.listRegisteredRepos.mockResolvedValue([REPO]);
     state.deleteHandlerStarted = undefined;
+    state.afterSafeStorageValidation = undefined;
   });
 
   afterAll(async () => {
@@ -901,6 +911,47 @@ describe('POST /api/embed completed-checkpoint identity', () => {
         }),
       });
     } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses delete when the repository symlink retargets after owner freeze', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-delete-root-retarget-'));
+    const targetA = path.join(root, 'repo-a');
+    const targetB = path.join(root, 'repo-b');
+    const alias = path.join(root, 'repo-alias');
+    const sentinelA = path.join(targetA, '.gitnexus', 'sentinel-a.txt');
+    const sentinelB = path.join(targetB, '.gitnexus', 'sentinel-b.txt');
+    await Promise.all([
+      fs.mkdir(path.join(targetA, '.gitnexus'), { recursive: true }),
+      fs.mkdir(path.join(targetB, '.gitnexus'), { recursive: true }),
+    ]);
+    await Promise.all([
+      fs.writeFile(sentinelA, 'preserve a'),
+      fs.writeFile(sentinelB, 'preserve b'),
+    ]);
+    await fs.symlink(targetA, alias, 'dir');
+    const entry = { ...REPO, path: alias, storagePath: path.join(alias, '.gitnexus') };
+    state.listRegisteredRepos.mockResolvedValue([entry]);
+    state.afterSafeStorageValidation = () => {
+      state.afterSafeStorageValidation = undefined;
+      fsSync.unlinkSync(alias);
+      fsSync.symlinkSync(targetB, alias, 'dir');
+    };
+
+    try {
+      const response = await fetch(`${baseUrl}/api/repo?repo=${encodeURIComponent(entry.name)}`, {
+        method: 'DELETE',
+      });
+      const body = (await response.json()) as { error?: string };
+
+      expect(response.status).toBe(500);
+      expect(body.error).toMatch(/repository owner changed before deletion/i);
+      await expect(fs.readFile(sentinelA, 'utf8')).resolves.toBe('preserve a');
+      await expect(fs.readFile(sentinelB, 'utf8')).resolves.toBe('preserve b');
+      expect(state.unregisterRepo).not.toHaveBeenCalled();
+    } finally {
+      state.afterSafeStorageValidation = undefined;
       await fs.rm(root, { recursive: true, force: true });
     }
   });

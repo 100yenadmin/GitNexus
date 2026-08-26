@@ -1392,11 +1392,19 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
       //   - lexical `<physical-root>/.gitnexus` entry for recursive removal.
       // `fs.rm` must never receive the realpath-derived lock key because the
       // final `.gitnexus` component may itself be a symlink to unrelated data.
-      assertSafeStoragePath(entry);
       const lockedRepoRoot = canonicalizePath(entry.path);
       const storageLockKey = canonicalRepoLockKey(lockedRepoRoot);
       const rootLockKey = canonicalRepoRootLockKey(lockedRepoRoot);
       const storagePath = getStoragePath(lockedRepoRoot);
+      const registeredStorageLockKey = canonicalizePath(entry.storagePath);
+      assertSafeStoragePath(entry);
+      if (
+        !registryPathEquals(registeredStorageLockKey, storageLockKey) ||
+        !registryPathEquals(canonicalizePath(entry.path), lockedRepoRoot) ||
+        !registryPathEquals(canonicalizePath(entry.storagePath), storageLockKey)
+      ) {
+        throw new Error('GitNexus repository owner changed before deletion');
+      }
       const observedStorageIdentity = await readStorageObjectIdentity(storagePath);
       const lockErr = acquireRepoLock(storageLockKey, rootLockKey);
       if (lockErr) {
