@@ -2367,6 +2367,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
             const withOwnedLbugDb = <T>(operation: () => Promise<T>): Promise<T> =>
               withLbugDb(lbugPath, operation);
             await withOwnedLbugDb(async () => {
+              let reconciledGraphStats: { nodes: number; edges: number } | undefined;
               let embeddingMeta = await loadMeta(frozenOwner.canonicalStoragePath);
               const authoritativeLegacy = isEmptyLegacyCheckpoint(
                 embeddingMeta?.embeddingCheckpoint,
@@ -2460,6 +2461,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                     embeddingMeta = clearedMeta;
                     return;
                   }
+                  reconciledGraphStats = graphStats;
                 }
                 // Keep the old checkpoint persisted until the fresh pipeline
                 // either records a new window or finalizes successfully.
@@ -2593,12 +2595,63 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
               }
               const terminalMeta = {
                 ...embeddingMeta,
-                stats: { ...embeddingMeta.stats, embeddings: terminalIntegrity.validRows },
+                stats: {
+                  ...embeddingMeta.stats,
+                  ...reconciledGraphStats,
+                  embeddings: terminalIntegrity.validRows,
+                },
                 embeddingCheckpoint: undefined,
               };
-              await commitEmbedMetadata(barrier, 'COMMITTING_TERMINAL', () =>
-                saveMeta(frozenOwner.canonicalStoragePath, terminalMeta),
-              );
+              if (reconciledGraphStats) {
+                await commitEmbedMetadata(barrier, 'COMMITTING_TERMINAL', async () => {
+                  const owner = await assertZeroClearRegistryOwner(frozenOwner, terminalMeta);
+                  const commitReceipt: import('../storage/repo-manager.js').RegistryCommitReceiptRef =
+                    {};
+                  await registerRepo(owner.path, terminalMeta, {
+                    name: owner.name,
+                    allowDuplicateName: true,
+                    expectedOwner: owner,
+                    commitReceipt,
+                  });
+                  let metadataCommitted = false;
+                  try {
+                    const provenStoragePath = assertFrozenZeroClearRegistryOwner(
+                      owner,
+                      terminalMeta,
+                    );
+                    await saveMeta(provenStoragePath, terminalMeta);
+                    metadataCommitted = true;
+                    await assertZeroClearRegistryOwner(owner, terminalMeta);
+                  } catch (error) {
+                    const rollbackErrors: unknown[] = [error];
+                    if (commitReceipt.value) {
+                      try {
+                        await rollbackRegistryCommit(commitReceipt.value);
+                      } catch (rollbackError) {
+                        rollbackErrors.push(rollbackError);
+                      }
+                    }
+                    if (metadataCommitted) {
+                      try {
+                        await saveMeta(owner.canonicalStoragePath, embeddingMeta);
+                      } catch (rollbackError) {
+                        rollbackErrors.push(rollbackError);
+                      }
+                    }
+                    if (rollbackErrors.length > 1) {
+                      throw new AggregateError(
+                        rollbackErrors,
+                        'Embedding metadata commit failed and transactional rollback was incomplete',
+                      );
+                    }
+                    throw error;
+                  }
+                });
+              } else {
+                await commitEmbedMetadata(barrier, 'COMMITTING_TERMINAL', () =>
+                  saveMeta(frozenOwner.canonicalStoragePath, terminalMeta),
+                );
+              }
               embeddingMeta = terminalMeta;
               terminalOwnerMeta = terminalMeta;
             });

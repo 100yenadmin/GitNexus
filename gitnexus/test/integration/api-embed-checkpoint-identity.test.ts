@@ -1867,7 +1867,16 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     expect(state.getStrictLbugStats).toHaveBeenCalledOnce();
     expect(state.getActiveEmbeddingIdentity).toHaveBeenCalledOnce();
     expect(state.runEmbeddingPipeline).toHaveBeenCalledOnce();
-    expect(state.registerRepo).not.toHaveBeenCalled();
+    expect(state.registerRepo).toHaveBeenCalledWith(
+      REPO.path,
+      expect.objectContaining({ stats: { nodes: 4, edges: 5, embeddings: 0 } }),
+      expect.objectContaining({
+        name: REPO.name,
+        allowDuplicateName: true,
+        commitReceipt: expect.objectContaining({ value: expect.anything() }),
+      }),
+    );
+    expect(state.currentMeta.stats).toEqual({ nodes: 4, edges: 5, embeddings: 0 });
     expect(state.currentMeta.embeddingCheckpoint).toBeUndefined();
   });
 
