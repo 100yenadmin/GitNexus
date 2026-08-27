@@ -5,7 +5,7 @@
  */
 export const isMissingColumnOrTableError = (message: string): boolean =>
   // Allow only direct Binder missing-object grammar with terminal punctuation/whitespace.
-  /^Binder exception:[ \t]*(?:table|column|property)[ \t]+[^\s]+[ \t]+(?:does not exist|not found(?:[ \t]+(?:in catalog|for e))?)[.]?[ \t]*$/i.test(
+  /^Binder exception:[ \t]*(?:(?:table|column|property)[ \t]+[^\s]+[ \t]+(?:does not exist|not found(?:[ \t]+(?:in catalog|for e))?)|Cannot find property[ \t]+[^\s]+[ \t]+for[ \t]+[A-Za-z_][A-Za-z0-9_]*)[.]?[ \t]*$/i.test(
     message,
   );
 
