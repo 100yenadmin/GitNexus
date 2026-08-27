@@ -2224,8 +2224,12 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     expect(state.closeLbug).toHaveBeenCalledOnce();
     expect(JSON.stringify(state.currentMeta.embeddingCheckpoint)).toBe(before);
   });
-  it('persists completed-window identity before an interrupted finalization', async () => {
-    state.currentMeta = makeMeta(LIVE_DIGEST);
+  it('persists reconciled graph stats through an interrupted checkpoint and retry', async () => {
+    state.currentMeta = makeMeta(LIVE_DIGEST, REPO.path, true);
+    state.currentMeta.stats = { nodes: 17, edges: 19, embeddings: 0 };
+    state.liveIntegrity = makeIntegrity(LIVE_DIGEST, 0);
+    state.graphNodes = [];
+    state.getStrictLbugStats.mockResolvedValueOnce({ nodes: 4, edges: 5 });
     state.runEmbeddingPipeline.mockImplementationOnce(async (...args: unknown[]) => {
       const options = args[6] as {
         onCheckpoint: (checkpoint: {
@@ -2234,6 +2238,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
           chunksProcessed: number;
         }) => Promise<void>;
       };
+      state.liveIntegrity = makeIntegrity(LIVE_DIGEST, 3);
       await options.onCheckpoint({ nodesProcessed: 2, totalNodes: 4, chunksProcessed: 5 });
       throw new Error('simulated interruption after durable checkpoint');
     });
@@ -2256,6 +2261,12 @@ describe('POST /api/embed completed-checkpoint identity', () => {
       recoverableIdentitySha256: LIVE_DIGEST,
       pendingNodeIds: [],
     });
+    expect(state.currentMeta.stats).toEqual({ nodes: 4, edges: 5, embeddings: 0 });
+
+    expect((await runEmbedJob(baseUrl, REPO.name)).status).toBe('complete');
+    expect(state.getStrictLbugStats).toHaveBeenCalledOnce();
+    expect(state.currentMeta.stats).toEqual({ nodes: 4, edges: 5, embeddings: 3 });
+    expect(state.currentMeta.embeddingCheckpoint).toBeUndefined();
   });
 
   it.each([

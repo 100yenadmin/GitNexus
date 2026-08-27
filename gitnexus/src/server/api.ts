@@ -2519,6 +2519,14 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
               ): Promise<void> => {
                 const checkpointMeta = {
                   ...embeddingMeta,
+                  ...(reconciledGraphStats
+                    ? {
+                        stats: {
+                          ...embeddingMeta.stats,
+                          ...reconciledGraphStats,
+                        },
+                      }
+                    : {}),
                   embeddingCheckpoint: {
                     at: new Date().toISOString(),
                     ...checkpoint,
