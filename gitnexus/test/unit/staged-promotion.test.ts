@@ -11,6 +11,7 @@ import {
   prepareStagedWorkspace,
   promoteStagedGeneration,
   withAnalyzeOwnershipLock,
+  type AnalyzeStorageOwnershipToken,
   type PromotionBoundary,
   type RepositorySourceIdentity,
 } from '../../src/core/staged-promotion.js';
@@ -732,17 +733,23 @@ describe('common analyze ownership lock', () => {
     vi.stubEnv('GITNEXUS_HOME', home);
     await fs.mkdir(storagePath, { recursive: true });
     let release!: () => void;
+    let storageOwnership!: AnalyzeStorageOwnershipToken;
     const held = withAnalyzeOwnershipLock(
       storagePath,
       () => new Promise<void>((resolve) => (release = resolve)),
-      { repoRoot },
+      {
+        repoRoot,
+        onStorageOwnershipAcquired: (token) => {
+          storageOwnership = token;
+        },
+      },
     );
     // The nested Windows companion and storage claims each obtain a real
     // PowerShell process-generation token before entering the callback; hosted
     // runners can take well over ten seconds without indicating a deadlock.
     await vi.waitFor(() => expect(release).toBeTypeOf('function'), { timeout: 30_000 });
 
-    await attachAnalyzeOwnershipWorker(storagePath, repoRoot, process.pid);
+    await attachAnalyzeOwnershipWorker(storagePath, repoRoot, process.pid, storageOwnership);
     const lockEntries = await fs.readdir(path.join(home, 'locks'));
     const companion = path.join(home, 'locks', lockEntries[0]);
     const record = JSON.parse(await fs.readFile(companion, 'utf8')) as {

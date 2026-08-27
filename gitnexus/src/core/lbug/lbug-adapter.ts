@@ -32,6 +32,7 @@ import {
   embeddingIdentitySetDigest,
   embeddingSemanticIdentity,
 } from '../embeddings/identity-digest.js';
+import type { AnalyzeStorageOwnershipToken } from '../staged-promotion.js';
 import { extensionManager, type ExtensionEnsureOptions } from './extension-loader.js';
 import {
   classifyDeleteAllError,
@@ -830,26 +831,38 @@ export const acquireLbugOwnership = async (
   const { analyzeStorageOwnershipIsHeld, withAnalyzeOwnershipLock } =
     await import('../staged-promotion.js');
   const { attachAnalyzeOwnershipWorker } = await import('../staged-promotion.js');
+  let initialStorageOwnership: AnalyzeStorageOwnershipToken | undefined;
   const ownership = withAnalyzeOwnershipLock(
     storagePath,
     async () => {
       markEntered();
       await gate;
     },
-    { repoRoot, createStoragePath: false },
+    {
+      repoRoot,
+      createStoragePath: false,
+      onStorageOwnershipAcquired: (token) => {
+        initialStorageOwnership = token;
+      },
+    },
   );
   void ownership.catch(markFailed);
   await entered;
   let released = false;
   let frozenStoragePath: string | undefined;
+  let frozenStorageOwnership: AnalyzeStorageOwnershipToken | undefined;
   let storageOwnership: Promise<void> | undefined;
   let releaseStorageGate: (() => void) | undefined;
   return {
     acquireStorage: async (nextStoragePath: string) => {
       if (released) throw new Error('Analyze ownership was released before storage acquisition');
       const resolvedStoragePath = path.resolve(nextStoragePath);
-      if (analyzeStorageOwnershipIsHeld(resolvedStoragePath)) {
+      if (
+        initialStorageOwnership &&
+        analyzeStorageOwnershipIsHeld(resolvedStoragePath, initialStorageOwnership)
+      ) {
         frozenStoragePath = resolvedStoragePath;
+        frozenStorageOwnership = initialStorageOwnership;
         return;
       }
       if (storageOwnership) {
@@ -866,28 +879,52 @@ export const acquireLbugOwnership = async (
       const storageGate = new Promise<void>((resolve) => {
         releaseStorageGate = resolve;
       });
-      storageOwnership = withAnalyzeOwnershipLock(resolvedStoragePath, async () => {
-        markStorageEntered();
-        await storageGate;
-      });
+      let acquiredStorageOwnership: AnalyzeStorageOwnershipToken | undefined;
+      storageOwnership = withAnalyzeOwnershipLock(
+        resolvedStoragePath,
+        async () => {
+          markStorageEntered();
+          await storageGate;
+        },
+        {
+          onStorageOwnershipAcquired: (token) => {
+            acquiredStorageOwnership = token;
+          },
+        },
+      );
       void storageOwnership.catch(markStorageFailed);
       try {
         await storageEntered;
+        if (!acquiredStorageOwnership) {
+          throw new Error('Analyze storage ownership token was not captured');
+        }
+        frozenStorageOwnership = acquiredStorageOwnership;
       } catch (error) {
+        releaseStorageGate?.();
         await storageOwnership.catch(() => undefined);
         storageOwnership = undefined;
         releaseStorageGate = undefined;
         frozenStoragePath = undefined;
+        frozenStorageOwnership = undefined;
         throw error;
       }
     },
     attachWorker: async (workerPid: number) => {
       if (released) throw new Error('Analyze ownership was released before worker attachment');
       const attachedStoragePath = frozenStoragePath ?? path.resolve(storagePath);
-      if (!analyzeStorageOwnershipIsHeld(attachedStoragePath)) {
+      const attachedStorageOwnership = frozenStorageOwnership ?? initialStorageOwnership;
+      if (
+        !attachedStorageOwnership ||
+        !analyzeStorageOwnershipIsHeld(attachedStoragePath, attachedStorageOwnership)
+      ) {
         throw new Error('Analyze storage ownership must be acquired before worker attachment');
       }
-      await attachAnalyzeOwnershipWorker(attachedStoragePath, repoRoot, workerPid);
+      await attachAnalyzeOwnershipWorker(
+        attachedStoragePath,
+        repoRoot,
+        workerPid,
+        attachedStorageOwnership,
+      );
     },
     release: async () => {
       if (!released) {

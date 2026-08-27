@@ -48,6 +48,31 @@ describe('Ladybug writable ownership admission', () => {
     ).resolves.toBe('released');
   });
 
+  it('does not borrow another lease when distinct companions target one new storage path', async () => {
+    const { storagePath } = await makePaths();
+    const firstRepoRoot = path.join(path.dirname(storagePath), 'first-repo');
+    const secondRepoRoot = path.join(path.dirname(storagePath), 'second-repo');
+    await fs.mkdir(firstRepoRoot);
+    await fs.mkdir(secondRepoRoot);
+
+    const first = await acquireLbugOwnership(storagePath, firstRepoRoot);
+    const second = await acquireLbugOwnership(storagePath, secondRepoRoot);
+    await fs.mkdir(storagePath);
+
+    await first.acquireStorage(storagePath);
+    await first.attachWorker(process.pid);
+    await expect(second.acquireStorage(storagePath)).rejects.toThrow(/another analyze is active/i);
+
+    await first.release();
+    await second.acquireStorage(storagePath);
+    await second.attachWorker(process.pid);
+    await second.release();
+
+    await expect(fs.access(path.join(storagePath, 'analyze-staged.lock'))).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+  });
+
   it('refuses a writable session while the real analyzer owner is active', async () => {
     const { repoRoot, storagePath, lbugPath } = await makePaths();
     let markOwned!: () => void;
