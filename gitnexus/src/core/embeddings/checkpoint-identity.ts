@@ -38,7 +38,7 @@ export const assertEmbeddingIntegrity = (
 
 type CompletedEmbeddingCheckpoint = Pick<
   NonNullable<RepoMeta['embeddingCheckpoint']>,
-  'physicalRows' | 'validRows' | 'recoverableIdentitySha256'
+  'physicalRows' | 'validRows' | 'recoverableIdentitySha256' | 'physicalRowsSha256'
 >;
 
 export const assertCompletedCheckpointIdentity = (
@@ -50,20 +50,24 @@ export const assertCompletedCheckpointIdentity = (
     checkpoint.physicalRows,
     checkpoint.validRows,
     checkpoint.recoverableIdentitySha256,
+    checkpoint.physicalRowsSha256,
   ];
   if (values.every((value) => value === undefined)) return; // Legacy checkpoint.
   if (
     !Number.isSafeInteger(checkpoint.physicalRows) ||
     !Number.isSafeInteger(checkpoint.validRows) ||
     typeof checkpoint.recoverableIdentitySha256 !== 'string' ||
-    !/^[a-f0-9]{64}$/.test(checkpoint.recoverableIdentitySha256)
+    !/^[a-f0-9]{64}$/.test(checkpoint.recoverableIdentitySha256) ||
+    typeof checkpoint.physicalRowsSha256 !== 'string' ||
+    !/^[a-f0-9]{64}$/.test(checkpoint.physicalRowsSha256)
   ) {
     throw new Error(`${context} has an incomplete or malformed durable embedding identity.`);
   }
   assertEmbeddingIntegrity(report, context, checkpoint.physicalRows);
   if (
     report.validRows !== checkpoint.validRows ||
-    report.recoverableIdentitySha256 !== checkpoint.recoverableIdentitySha256
+    report.recoverableIdentitySha256 !== checkpoint.recoverableIdentitySha256 ||
+    report.physicalRowsSha256 !== checkpoint.physicalRowsSha256
   ) {
     throw new Error(
       `${context}: durable identity no longer matches the live embedding identities (${embeddingIntegritySummary(report)}).`,

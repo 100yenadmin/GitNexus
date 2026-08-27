@@ -27,6 +27,7 @@ const cleanEmbeddingIntegrityReport = {
   orphanRows: 0,
   wrongDimensionRows: 0,
   recoverableIdentitySha256: '0'.repeat(64),
+  physicalRowsSha256: '0'.repeat(64),
 };
 
 const mockEmbeddingIntegrityAdapter = () => ({

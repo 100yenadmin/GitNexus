@@ -2508,7 +2508,8 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                 if (
                   priorCheckpoint.physicalRows !== undefined ||
                   priorCheckpoint.validRows !== undefined ||
-                  priorCheckpoint.recoverableIdentitySha256 !== undefined
+                  priorCheckpoint.recoverableIdentitySha256 !== undefined ||
+                  priorCheckpoint.physicalRowsSha256 !== undefined
                 ) {
                   const integrity = await inspectEmbeddingIntegrity();
                   assertCompletedCheckpointIdentity(
@@ -2546,6 +2547,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                     physicalRows: integrity?.physicalRows,
                     validRows: integrity?.validRows,
                     recoverableIdentitySha256: integrity?.recoverableIdentitySha256,
+                    physicalRowsSha256: integrity?.physicalRowsSha256,
                   },
                 };
                 await commitEmbedMetadata(barrier, 'COMMITTING_CHECKPOINT', () =>

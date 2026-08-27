@@ -47,6 +47,7 @@ const cleanIntegrity = (rows: number) => ({
   orphanRows: 0,
   wrongDimensionRows: 0,
   recoverableIdentitySha256: 'a'.repeat(64),
+  physicalRowsSha256: 'a'.repeat(64),
 });
 
 interface FixtureEntry {
@@ -415,6 +416,7 @@ describe('doctor --registry read-only report (#133)', () => {
           physicalRows: 0,
           validRows: 0,
           recoverableIdentitySha256: 'a'.repeat(64),
+          physicalRowsSha256: 'a'.repeat(64),
         },
       }),
     );

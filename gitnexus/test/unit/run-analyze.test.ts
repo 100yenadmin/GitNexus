@@ -137,6 +137,7 @@ describe('run-analyze module', () => {
         physicalRows: 3,
         validRows: 3,
         recoverableIdentitySha256: 'a'.repeat(64),
+        physicalRowsSha256: 'a'.repeat(64),
       };
       await saveMeta(storagePath, {
         repoPath: tmpRepo.dbPath,
@@ -646,6 +647,7 @@ describe('run-analyze module', () => {
           physicalRows: 1,
           validRows: 1,
           recoverableIdentitySha256: '0'.repeat(64),
+          physicalRowsSha256: '0'.repeat(64),
         },
       });
       await expect(

@@ -131,6 +131,7 @@ async function importRepairSubject(options: {
     orphanRows: 0,
     wrongDimensionRows: 0,
     recoverableIdentitySha256: options.identityDigest ?? 'a'.repeat(64),
+    physicalRowsSha256: options.identityDigest ?? 'a'.repeat(64),
   }));
   const withLbugDb = vi.fn(async (_dbPath: string, operation: () => Promise<unknown>) =>
     operation(),
@@ -539,6 +540,7 @@ describe('runFullAnalysis VECTOR-only repair (#170)', () => {
         physicalRows: 3,
         validRows: 3,
         recoverableIdentitySha256: 'a'.repeat(64),
+        physicalRowsSha256: 'a'.repeat(64),
       },
     });
     try {
@@ -560,6 +562,7 @@ describe('runFullAnalysis VECTOR-only repair (#170)', () => {
         physicalRows: 3,
         validRows: 3,
         recoverableIdentitySha256: 'b'.repeat(64),
+        physicalRowsSha256: 'b'.repeat(64),
       },
     });
     try {
@@ -744,6 +747,7 @@ describe('runFullAnalysis VECTOR-only repair (#170)', () => {
         physicalRows: 3,
         validRows: 3,
         recoverableIdentitySha256: 'a'.repeat(64),
+        physicalRowsSha256: 'a'.repeat(64),
       },
     });
     try {

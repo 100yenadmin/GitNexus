@@ -227,6 +227,8 @@ export interface RepoMeta {
     validRows?: number;
     /** SHA-256 of the completed checkpoint's recoverable owner/chunk identities. */
     recoverableIdentitySha256?: string;
+    /** SHA-256 of every completed physical embedding row, including vector bytes. */
+    physicalRowsSha256?: string;
     /**
      * Nodes in the current checkpoint window. Any of these may have only a
      * subset of their chunks persisted after an abrupt process termination,

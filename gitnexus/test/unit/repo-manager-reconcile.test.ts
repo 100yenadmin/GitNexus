@@ -281,6 +281,7 @@ describe('runFullAnalysis metadata reconciliation (mocked pipeline)', () => {
         orphanRows: 0,
         wrongDimensionRows: 0,
         recoverableIdentitySha256: '0'.repeat(64),
+        physicalRowsSha256: '0'.repeat(64),
       })),
       embeddingIntegrityFailures: vi.fn(() => 0),
     }));

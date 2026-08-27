@@ -1861,6 +1861,7 @@ const runFullAnalysisImpl = async (
       checkpointToVerify.physicalRows,
       checkpointToVerify.validRows,
       checkpointToVerify.recoverableIdentitySha256,
+      checkpointToVerify.physicalRowsSha256,
     ].some((value) => value !== undefined)
   ) {
     try {
@@ -3232,6 +3233,7 @@ const runFullAnalysisImpl = async (
             physicalRows: integrity?.physicalRows,
             validRows: integrity?.validRows,
             recoverableIdentitySha256: integrity?.recoverableIdentitySha256,
+            physicalRowsSha256: integrity?.physicalRowsSha256,
           },
           pdg: resolvePdgConfig(options),
         });

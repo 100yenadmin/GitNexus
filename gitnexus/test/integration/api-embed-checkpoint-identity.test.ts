@@ -43,6 +43,7 @@ const makeIntegrity = (digest: string, physicalRows = 3): EmbeddingIntegrityRepo
   orphanRows: 0,
   wrongDimensionRows: 0,
   recoverableIdentitySha256: digest,
+  physicalRowsSha256: digest,
 });
 
 const makeMeta = (digest: string, repoPath = REPO.path, zeroCheckpoint = false): RepoMeta => ({
@@ -60,6 +61,7 @@ const makeMeta = (digest: string, repoPath = REPO.path, zeroCheckpoint = false):
     physicalRows: zeroCheckpoint ? undefined : 3,
     validRows: zeroCheckpoint ? undefined : 3,
     recoverableIdentitySha256: zeroCheckpoint ? undefined : digest,
+    physicalRowsSha256: zeroCheckpoint ? undefined : digest,
     pendingNodeIds: [],
   },
 });
@@ -361,6 +363,7 @@ const withRealRegistry = async (
       physicalRows: undefined,
       validRows: undefined,
       recoverableIdentitySha256: undefined,
+      physicalRowsSha256: undefined,
     };
     state.currentMeta = canonicalMeta;
     state.listRegisteredRepos.mockResolvedValue([canonical]);
@@ -769,6 +772,50 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     expect(JSON.stringify(state.currentMeta.embeddingCheckpoint)).toBe(checkpointBefore);
   });
 
+  it('rejects physical-row drift when semantic identities and counts are unchanged', async () => {
+    state.currentMeta = makeMeta(LIVE_DIGEST);
+    state.currentMeta.embeddingCheckpoint = {
+      ...state.currentMeta.embeddingCheckpoint!,
+      physicalRowsSha256: MISMATCHED_DIGEST,
+    };
+    const checkpointBefore = JSON.stringify(state.currentMeta.embeddingCheckpoint);
+
+    const response = await fetch(`${baseUrl}/api/embed`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ repo: REPO.name }),
+    });
+    const { jobId } = (await response.json()) as { jobId: string };
+    const job = await waitForTerminalJob(baseUrl, jobId);
+
+    expect(job.status).toBe('failed');
+    expect(job.error).toMatch(/durable identity no longer matches/i);
+    expect(state.runEmbeddingPipeline).not.toHaveBeenCalled();
+    expect(state.saveMeta).not.toHaveBeenCalled();
+    expect(JSON.stringify(state.currentMeta.embeddingCheckpoint)).toBe(checkpointBefore);
+  });
+
+  it('rejects a completed durable identity that omits its physical-row digest', async () => {
+    state.currentMeta = makeMeta(LIVE_DIGEST);
+    state.currentMeta.embeddingCheckpoint = {
+      ...state.currentMeta.embeddingCheckpoint!,
+      physicalRowsSha256: undefined,
+    };
+
+    const response = await fetch(`${baseUrl}/api/embed`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ repo: REPO.name }),
+    });
+    const { jobId } = (await response.json()) as { jobId: string };
+    const job = await waitForTerminalJob(baseUrl, jobId);
+
+    expect(job.status).toBe('failed');
+    expect(job.error).toMatch(/incomplete or malformed durable embedding identity/i);
+    expect(state.runEmbeddingPipeline).not.toHaveBeenCalled();
+    expect(state.saveMeta).not.toHaveBeenCalled();
+  });
+
   it.each([
     { field: 'provider', mismatch: { provider: 'other-provider' } },
     { field: 'model', mismatch: { model: 'other-model' } },
@@ -909,6 +956,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
       physicalRows: undefined,
       validRows: undefined,
       recoverableIdentitySha256: undefined,
+      physicalRowsSha256: undefined,
     };
     state.loadMeta.mockResolvedValueOnce(initial).mockResolvedValue(changed);
     const response = await fetch(`${baseUrl}/api/embed`, {
@@ -940,6 +988,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
       physicalRows: undefined,
       validRows: undefined,
       recoverableIdentitySha256: undefined,
+      physicalRowsSha256: undefined,
     };
     const changed = { ...initial, embeddingCheckpoint: undefined };
     state.loadMeta.mockResolvedValueOnce(initial).mockResolvedValue(changed);
@@ -971,6 +1020,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
       physicalRows: undefined,
       validRows: undefined,
       recoverableIdentitySha256: undefined,
+      physicalRowsSha256: undefined,
     };
     state.inspectEmbeddingIntegrity
       .mockResolvedValueOnce(makeIntegrity(LIVE_DIGEST, 0))
@@ -1005,6 +1055,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
       physicalRows: undefined,
       validRows: undefined,
       recoverableIdentitySha256: undefined,
+      physicalRowsSha256: undefined,
     };
     state.liveIntegrity = { ...state.liveIntegrity, physicalRows: 0, validRows: 0 };
     state.getStrictLbugStats.mockResolvedValueOnce({ nodes: 0, edges: 0 });
@@ -1600,6 +1651,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
       physicalRows: undefined,
       validRows: undefined,
       recoverableIdentitySha256: undefined,
+      physicalRowsSha256: undefined,
     };
     state.liveIntegrity = makeIntegrity(LIVE_DIGEST, 0);
     state.executeQuery.mockResolvedValue([]);
@@ -1633,6 +1685,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
       physicalRows: undefined,
       validRows: undefined,
       recoverableIdentitySha256: undefined,
+      physicalRowsSha256: undefined,
     };
     state.liveIntegrity = makeIntegrity(LIVE_DIGEST, 0);
     state.executeQuery.mockResolvedValue([]);
@@ -1676,6 +1729,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
       physicalRows: undefined,
       validRows: undefined,
       recoverableIdentitySha256: undefined,
+      physicalRowsSha256: undefined,
     };
     state.liveIntegrity = makeIntegrity(LIVE_DIGEST, 0);
     state.executeQuery.mockResolvedValue([]);
@@ -1726,6 +1780,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
       physicalRows: undefined,
       validRows: undefined,
       recoverableIdentitySha256: undefined,
+      physicalRowsSha256: undefined,
     };
     state.liveIntegrity = makeIntegrity(LIVE_DIGEST, 0);
     state.executeQuery.mockResolvedValue([]);
@@ -1801,6 +1856,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
       physicalRows: undefined,
       validRows: undefined,
       recoverableIdentitySha256: undefined,
+      physicalRowsSha256: undefined,
     };
     state.liveIntegrity = makeIntegrity(LIVE_DIGEST, 0);
     state.executeQuery.mockResolvedValue([{ id: 'Function:current' }]);
@@ -1995,6 +2051,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
       physicalRows: undefined,
       validRows: undefined,
       recoverableIdentitySha256: undefined,
+      physicalRowsSha256: undefined,
     };
     state.liveIntegrity = makeIntegrity(LIVE_DIGEST, 0);
     state.graphNodes = [];
@@ -2029,6 +2086,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
       physicalRows: undefined,
       validRows: undefined,
       recoverableIdentitySha256: undefined,
+      physicalRowsSha256: undefined,
     };
     state.liveIntegrity = makeIntegrity(LIVE_DIGEST, 0);
     state.graphNodes = [];
@@ -2077,6 +2135,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
       physicalRows: undefined,
       validRows: undefined,
       recoverableIdentitySha256: undefined,
+      physicalRowsSha256: undefined,
     };
     state.liveIntegrity = makeIntegrity(LIVE_DIGEST, 0);
     state.graphNodes = [];
@@ -2253,6 +2312,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
       physicalRows: undefined,
       validRows: undefined,
       recoverableIdentitySha256: undefined,
+      physicalRowsSha256: undefined,
     };
     state.liveIntegrity = makeIntegrity(LIVE_DIGEST, 0);
     state.executeQuery.mockRejectedValue(new Error('preflight query failed'));
@@ -2305,6 +2365,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
       physicalRows: 3,
       validRows: 3,
       recoverableIdentitySha256: LIVE_DIGEST,
+      physicalRowsSha256: LIVE_DIGEST,
       pendingNodeIds: [],
     });
     expect(state.currentMeta.stats).toEqual({ nodes: 4, edges: 5, embeddings: 0 });

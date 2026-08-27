@@ -24,6 +24,7 @@ const cleanEmbeddingIntegrity = (rows: number) => ({
   orphanRows: 0,
   wrongDimensionRows: 0,
   recoverableIdentitySha256: 'a'.repeat(64),
+  physicalRowsSha256: 'a'.repeat(64),
 });
 
 const createPlaceholderGraphStore = async (lbugPath: string): Promise<void> => {
@@ -1115,6 +1116,7 @@ describe('runFullAnalysis dirty-recovery parking failure fails fast (this shippi
           physicalRows: 3,
           validRows: 3,
           recoverableIdentitySha256: 'a'.repeat(64),
+          physicalRowsSha256: 'a'.repeat(64),
         },
       });
       await createPlaceholderGraphStore(lbugPath);
