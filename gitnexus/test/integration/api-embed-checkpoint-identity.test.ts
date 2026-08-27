@@ -1708,7 +1708,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
       expect(matches).toHaveLength(1);
       expect(matches[0]).toEqual({
         ...canonical,
-        stats: { ...canonical.stats, nodes: 0, edges: 0, embeddings: 0 },
+        stats: { ...canonical.stats, nodes: 0, edges: 0, communities: 0, embeddings: 0 },
       });
       expect(matches[0]).not.toHaveProperty('embeddingCheckpoint');
       expect(registry.find((entry) => entry.name === unrelated.name)).toEqual(unrelated);
@@ -1734,7 +1734,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
       const afterRetry = await actualReadRegistry();
       const converged = {
         ...canonical,
-        stats: { ...canonical.stats, nodes: 0, edges: 0, embeddings: 0 },
+        stats: { ...canonical.stats, nodes: 0, edges: 0, communities: 0, embeddings: 0 },
       };
       expect(afterRetry.filter((entry) => entry.path === canonical.path)).toEqual([converged]);
       expect(afterRetry.find((entry) => entry.name === unrelated.name)).toEqual(unrelated);

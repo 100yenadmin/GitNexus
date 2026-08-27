@@ -11,6 +11,7 @@ import path from 'node:path';
 import { it, expect, vi } from 'vitest';
 import { withTestLbugDB } from '../helpers/test-indexed-db.js';
 import { _initLockPathForTest } from '../../src/core/lbug/lbug-adapter.js';
+import { closeQueryResults } from '../../src/core/lbug/query-result-utils.js';
 import { EMBEDDING_DIMS } from '../../src/core/lbug/schema.js';
 import type { RegistryEntry, RepoMeta } from '../../src/storage/repo-manager.js';
 
@@ -106,7 +107,7 @@ withTestLbugDB(
             const result = await driftConnection.query(
               `CREATE (e:CodeEmbedding {id:'native-row', nodeId:'Function:native.ts:run', chunkIndex:0, startLine:1, endLine:1, embedding:[${zeroVector}], contentHash:'native-hash'})`,
             );
-            result.close();
+            await closeQueryResults(result);
           } finally {
             await driftConnection.close().catch(() => {});
           }
