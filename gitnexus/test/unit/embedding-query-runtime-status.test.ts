@@ -106,6 +106,19 @@ describe('provider-free query embedding runtime status', () => {
     expect(hookCalls).toEqual([]);
   });
 
+  it('rejects an explicitly empty HTTP dimensions value', async () => {
+    process.env.GITNEXUS_EMBEDDING_URL = 'https://embedding.example/v1';
+    process.env.GITNEXUS_EMBEDDING_MODEL = 'test-model';
+    process.env.GITNEXUS_EMBEDDING_DIMS = '';
+
+    await expectStatus({
+      available: false,
+      mode: 'http',
+      reason: 'http-config-invalid',
+    });
+    expect(hookCalls).toEqual([]);
+  });
+
   it('preserves the runtime-prefix capability gate', async () => {
     runtimeSource.value = 'runtime-prefix';
     prefixLoadable.value = false;

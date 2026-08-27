@@ -80,7 +80,10 @@ export const getQueryEmbeddingRuntimeStatus = async (): Promise<QueryEmbeddingRu
     } catch {
       return { available: false, mode: 'http', reason: 'http-config-invalid' };
     }
-    if (!validHttpInteger('GITNEXUS_EMBEDDING_DIMS', Number.MAX_SAFE_INTEGER, false)) {
+    if (
+      process.env.GITNEXUS_EMBEDDING_DIMS === '' ||
+      !validHttpInteger('GITNEXUS_EMBEDDING_DIMS', Number.MAX_SAFE_INTEGER, false)
+    ) {
       return { available: false, mode: 'http', reason: 'http-config-invalid' };
     }
     if (!validHttpInteger('GITNEXUS_EMBEDDING_MAX_ATTEMPTS', 20, false)) {
