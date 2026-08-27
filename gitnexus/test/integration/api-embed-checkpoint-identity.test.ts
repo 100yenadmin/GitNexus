@@ -138,6 +138,7 @@ const state = {
 
 let actualRegisterRepo: typeof import('../../src/storage/repo-manager.js').registerRepo;
 let actualReadRegistry: typeof import('../../src/storage/repo-manager.js').readRegistry;
+let actualRollbackRegistryCommit: typeof import('../../src/storage/repo-manager.js').rollbackRegistryCommit;
 
 const armDeleteHandlerSignal = (): Promise<void> =>
   new Promise((resolve) => {
@@ -176,13 +177,17 @@ vi.doMock('../../src/storage/repo-manager.js', async () => {
   );
   actualRegisterRepo = actual.registerRepo;
   actualReadRegistry = actual.readRegistry;
+  actualRollbackRegistryCommit = actual.rollbackRegistryCommit;
   return {
     ...actual,
     listRegisteredRepos: state.listRegisteredRepos,
     loadMeta: state.loadMeta,
     registerRepo: (...args: Parameters<typeof actual.registerRepo>) =>
       state.useRealRegistry ? actual.registerRepo(...args) : state.registerRepo(...args),
-    rollbackRegistryCommit: state.rollbackRegistryCommit,
+    rollbackRegistryCommit: (...args: Parameters<typeof actual.rollbackRegistryCommit>) =>
+      state.useRealRegistry
+        ? actualRollbackRegistryCommit(...args)
+        : state.rollbackRegistryCommit(...args),
     unregisterRepo: state.unregisterRepo,
     saveMeta: state.saveMeta,
     assertSafeStoragePath: (entry: RegistryEntry) => {
@@ -1715,16 +1720,15 @@ describe('POST /api/embed completed-checkpoint identity', () => {
         error: 'primary persistence failed',
       });
       const afterFailure = await actualReadRegistry();
-      const converged = afterFailure.find((entry) => entry.path === canonical.path);
-      expect(converged).toEqual({
-        ...canonical,
-        stats: { ...canonical.stats, nodes: 0, edges: 0, embeddings: 0 },
-      });
-      expect(converged).not.toHaveProperty('embeddingCheckpoint');
+      expect(afterFailure.filter((entry) => entry.path === canonical.path)).toEqual([canonical]);
       expect(state.currentMeta.embeddingCheckpoint).toEqual(checkpointBefore);
 
       expect((await submitEmbed(baseUrl, canonical.name)).status).toBe('complete');
       const afterRetry = await actualReadRegistry();
+      const converged = {
+        ...canonical,
+        stats: { ...canonical.stats, nodes: 0, edges: 0, embeddings: 0 },
+      };
       expect(afterRetry.filter((entry) => entry.path === canonical.path)).toEqual([converged]);
       expect(afterRetry.find((entry) => entry.name === unrelated.name)).toEqual(unrelated);
       expect(state.currentMeta.stats).toEqual(converged?.stats);
