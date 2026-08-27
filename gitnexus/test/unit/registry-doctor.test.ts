@@ -47,6 +47,7 @@ const cleanIntegrity = (rows: number) => ({
   orphanRows: 0,
   wrongDimensionRows: 0,
   recoverableIdentitySha256: 'a'.repeat(64),
+  physicalRowsSha256: 'a'.repeat(64),
 });
 
 interface FixtureEntry {
@@ -409,12 +410,60 @@ describe('doctor --registry read-only report (#133)', () => {
       JSON.stringify({
         ...meta,
         embeddingCheckpoint: {
+          nodesProcessed: 3,
+          totalNodes: 3,
+          dimensions: 384,
+          physicalRows: 3,
+          validRows: 3,
+          recoverableIdentitySha256: 'a'.repeat(64),
+          physicalRowsSha256: 'b'.repeat(64),
+        },
+      }),
+    );
+    const physicalDrift = await buildRegistryDoctorReport({
+      entries: [indexed.entry],
+      databaseProbe,
+    });
+    expect(physicalDrift.entries[0]?.database).toMatchObject({
+      status: 'available',
+      integrity: { status: 'malformed' },
+    });
+
+    await fs.writeFile(
+      metaPath,
+      JSON.stringify({
+        ...meta,
+        embeddingCheckpoint: {
+          nodesProcessed: 2,
+          totalNodes: 3,
+          dimensions: 384,
+          physicalRows: 3,
+          validRows: 3,
+          recoverableIdentitySha256: 'a'.repeat(64),
+        },
+      }),
+    );
+    const intermediate = await buildRegistryDoctorReport({
+      entries: [indexed.entry],
+      databaseProbe,
+    });
+    expect(intermediate.entries[0]?.database).toMatchObject({
+      status: 'available',
+      integrity: { status: 'clean' },
+    });
+
+    await fs.writeFile(
+      metaPath,
+      JSON.stringify({
+        ...meta,
+        embeddingCheckpoint: {
           nodesProcessed: 1,
           totalNodes: 1,
           dimensions: 384,
           physicalRows: 0,
           validRows: 0,
           recoverableIdentitySha256: 'a'.repeat(64),
+          physicalRowsSha256: 'a'.repeat(64),
         },
       }),
     );

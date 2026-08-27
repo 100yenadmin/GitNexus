@@ -17,6 +17,7 @@ const cleanIntegrity = {
   orphanRows: 0,
   wrongDimensionRows: 0,
   recoverableIdentitySha256: 'a'.repeat(64),
+  physicalRowsSha256: 'a'.repeat(64),
 };
 
 async function importRepairSubject() {
@@ -96,6 +97,7 @@ describe('VECTOR repair shared schema-error contract', () => {
           physicalRows: 0,
           validRows: 0,
           recoverableIdentitySha256: 'a'.repeat(64),
+          physicalRowsSha256: 'a'.repeat(64),
         },
       };
       await saveMeta(paths.storagePath, meta);

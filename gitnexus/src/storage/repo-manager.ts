@@ -15,10 +15,11 @@
  */
 
 import fs from 'fs/promises';
-import { realpathSync } from 'fs';
+import { lstatSync, realpathSync } from 'fs';
 import path from 'path';
 import os from 'os';
 import { randomBytes } from 'crypto';
+import { isDeepStrictEqual } from 'util';
 import {
   getInferredRepoName,
   getRemoteUrl,
@@ -216,6 +217,8 @@ export interface RepoMeta {
     nodesProcessed: number;
     totalNodes: number;
     chunksProcessed: number;
+    /** Provider identity is optional so legacy checkpoints remain readable. */
+    provider?: string;
     model: string;
     dimensions: number;
     /** Physical rows durably visible after the completed checkpoint. */
@@ -224,6 +227,8 @@ export interface RepoMeta {
     validRows?: number;
     /** SHA-256 of the completed checkpoint's recoverable owner/chunk identities. */
     recoverableIdentitySha256?: string;
+    /** SHA-256 of every completed physical embedding row, including vector bytes. */
+    physicalRowsSha256?: string;
     /**
      * Nodes in the current checkpoint window. Any of these may have only a
      * subset of their chunks persisted after an abrupt process termination,
@@ -419,6 +424,28 @@ const LEGACY_METADATA_FILE = 'meta.json';
 export const getStoragePath = (repoPath: string): string => {
   return path.join(path.resolve(repoPath), GITNEXUS_DIR);
 };
+
+/**
+ * Return the canonical storage key shared by server-side repository jobs.
+ *
+ * Callers must capture this before an operation can remove or retarget the
+ * repository root, then carry the returned value through lock release. A
+ * later canonicalization of a missing root falls back to its unresolved form
+ * and would no longer identify the storage that was locked.
+ */
+export const canonicalRepoLockKey = (repoRoot: string): string =>
+  canonicalizePath(getStoragePath(canonicalizePath(repoRoot)));
+
+/**
+ * Return the repository-stable half of the server writer lock identity.
+ *
+ * The prefix keeps a repository root distinct from a physical storage key.
+ * Server jobs hold both: the root key survives storage detach/materialization,
+ * while {@link canonicalRepoLockKey} still excludes distinct roots that share
+ * one physical storage target.
+ */
+export const canonicalRepoRootLockKey = (repoRoot: string): string =>
+  `repo-root:${canonicalizePath(repoRoot)}`;
 
 /**
  * Get paths to key storage files.
@@ -766,8 +793,11 @@ const reconcileMetaDir = async (dir: string): Promise<boolean> => {
  * pre-rename version sees current metadata instead of "no prior index".
  * Returns true when any file was written.
  */
-export const reconcileMetadataFiles = async (repoPath: string): Promise<boolean> => {
-  const storagePath = getStoragePath(repoPath);
+export const reconcileMetadataFiles = async (
+  repoPath: string,
+  frozenStoragePath?: string,
+): Promise<boolean> => {
+  const storagePath = frozenStoragePath ?? getStoragePath(repoPath);
   let changed = await reconcileMetaDir(storagePath);
 
   const branchesDir = path.join(storagePath, BRANCHES_DIR);
@@ -835,8 +865,11 @@ export function isMissingFilesystemError(err: unknown): boolean {
 /**
  * Keep .gitnexus/ ignored. It contains local index state and caches.
  */
-export const ensureGitNexusIgnored = async (repoPath: string): Promise<void> => {
-  const gitignorePath = path.join(getStoragePath(repoPath), '.gitignore');
+export const ensureGitNexusIgnored = async (
+  repoPath: string,
+  frozenStoragePath?: string,
+): Promise<void> => {
+  const gitignorePath = path.join(frozenStoragePath ?? getStoragePath(repoPath), '.gitignore');
   const desired = '*\n';
 
   // Idempotent fast path: skip the write entirely when the file already has
@@ -938,8 +971,20 @@ export const readRegistry = async (): Promise<RegistryEntry[]> => {
   }
 };
 
+const readRegistryForValidation = async (): Promise<RegistryEntry[]> => {
+  try {
+    const raw = await fs.readFile(getGlobalRegistryPath(), 'utf-8');
+    const data = JSON.parse(raw);
+    if (!Array.isArray(data)) throw new Error('Registry payload must be an array');
+    return data;
+  } catch (error) {
+    if (isMissingFilesystemError(error)) return [];
+    throw error;
+  }
+};
+
 /**
- * Write the global registry to disk
+ * Write the global registry to disk. Call only while holding the registry mutation lock.
  */
 const writeRegistry = async (entries: RegistryEntry[]): Promise<void> => {
   const dir = getGlobalDir();
@@ -996,6 +1041,12 @@ const waitForRegistryLock = async (): Promise<void> => {
   await new Promise((resolve) => setTimeout(resolve, REGISTRY_LOCK_RETRY_DELAY_MS));
 };
 
+const registryLockRecoveryError = (lockPath: string): Error =>
+  new Error(
+    `GitNexus: stale or unreadable registry mutation lock at ${lockPath}; ` +
+      'verify no GitNexus writer is active, remove the lock manually, and retry',
+  );
+
 const withRegistryMutationLock = async <T>(operation: () => Promise<T>): Promise<T> => {
   const lockPath = `${getGlobalRegistryPath()}.lock`;
   await fs.mkdir(path.dirname(lockPath), { recursive: true });
@@ -1024,15 +1075,12 @@ const withRegistryMutationLock = async <T>(operation: () => Promise<T>): Promise
 
       const owner = await readRegistryLock(lockPath);
       if (owner && !registryProcessIsAlive(owner.pid)) {
-        const current = await readRegistryLock(lockPath);
-        if (current?.nonce === owner.nonce) await fs.rm(lockPath, { force: true });
-        continue;
+        throw registryLockRecoveryError(lockPath);
       }
       if (!owner) {
         const state = await fs.stat(lockPath).catch(() => null);
         if (state && Date.now() - state.mtimeMs > REGISTRY_LOCK_UNINITIALIZED_GRACE_MS) {
-          await fs.rm(lockPath, { force: true });
-          continue;
+          throw registryLockRecoveryError(lockPath);
         }
       }
       await waitForRegistryLock();
@@ -1056,6 +1104,30 @@ const withRegistryMutationLock = async <T>(operation: () => Promise<T>): Promise
  * disambiguation requirement can keep calling `registerRepo(path, meta)`
  * unchanged.
  */
+type ExpectedRegistryOwner = Readonly<
+  Pick<
+    RegistryEntry,
+    'name' | 'path' | 'storagePath' | 'remoteUrl' | 'branch' | 'lastCommit' | 'indexedAt'
+  > & {
+    /** Captured before an identity-sensitive read; never persisted. */
+    canonicalPath: string;
+    /** Captured before an identity-sensitive read; never persisted. */
+    canonicalStoragePath: string;
+  }
+>;
+
+export interface RegistryCommitReceipt {
+  /** Exact entry replaced by this commit, or null when the commit inserted. */
+  previousOwner: RegistryEntry | null;
+  /** Exact entry written by this commit. */
+  committedOwner: RegistryEntry;
+}
+
+export interface RegistryCommitReceiptRef {
+  /** Populated only after the atomic registry write succeeds. */
+  value?: RegistryCommitReceipt;
+}
+
 export interface RegisterRepoOptions {
   /**
    * User-provided alias from `analyze --name <alias>` (#829). Overrides
@@ -1089,6 +1161,14 @@ export interface RegisterRepoOptions {
    * existing branch summaries).
    */
   branch?: string;
+  /** Internal compare-and-swap guard for a caller that just validated ownership. */
+  expectedOwner?: ExpectedRegistryOwner;
+  /** Internal frozen physical identity for a separately preserved display path. */
+  expectedCanonicalPath?: string;
+  /** Internal frozen storage identity held by the analyze ownership lock. */
+  expectedCanonicalStoragePath?: string;
+  /** Internal in-memory receipt used to roll back a later coupled-store failure. */
+  commitReceipt?: RegistryCommitReceiptRef;
 }
 
 /**
@@ -1247,6 +1327,26 @@ export const registerRepo = async (
   // falling back to `path.resolve` when the path doesn't exist.
   const canonicalInput = canonicalizePath(repoPath);
 
+  // Capture the caller-frozen fingerprints before the first registry read.
+  // Never recanonicalize the expected raw display fields as their substitute:
+  // a retarget between the caller's preflight and this commit must reject.
+  const expectedOwnerCanonicalPath = opts?.expectedOwner?.canonicalPath;
+  const expectedOwnerCanonicalStorage = opts?.expectedOwner?.canonicalStoragePath;
+  const expectedCanonicalPath = opts?.expectedCanonicalPath;
+  const expectedCanonicalStoragePath = opts?.expectedCanonicalStoragePath;
+  if (
+    expectedCanonicalPath !== undefined &&
+    !registryPathEquals(canonicalInput, expectedCanonicalPath)
+  ) {
+    throw new Error('GitNexus: expected registry path changed during locked commit');
+  }
+  if (
+    expectedCanonicalStoragePath !== undefined &&
+    !registryPathEquals(canonicalizePath(storagePath), expectedCanonicalStoragePath)
+  ) {
+    throw new Error('GitNexus: expected registry storage changed during locked commit');
+  }
+
   // Capture a current origin when callers provide older metadata without the
   // remote fingerprint (`gitnexus index` and direct API callers). No origin
   // leaves the repository path-scoped and local-only.
@@ -1368,15 +1468,88 @@ export const registerRepo = async (
   // R9): re-derive THIS run's delta against the FRESHEST snapshot so a
   // concurrent change to the OTHER axis (a branch upsert vs a primary refresh)
   // survives instead of being clobbered by a stale entry-time view.
+  let commitReceipt: RegistryCommitReceipt | undefined;
   await withRegistryMutationLock(async () => {
     const fresh = await readRegistry();
+    const registryBeforeWrite =
+      expectedCanonicalPath === undefined && expectedCanonicalStoragePath === undefined
+        ? undefined
+        : (JSON.parse(JSON.stringify(fresh)) as RegistryEntry[]);
+    if (
+      expectedCanonicalPath !== undefined &&
+      !registryPathEquals(canonicalizePath(repoPath), expectedCanonicalPath)
+    ) {
+      throw new Error('GitNexus: expected registry path changed during locked commit');
+    }
+    if (
+      expectedCanonicalStoragePath !== undefined &&
+      !registryPathEquals(canonicalizePath(storagePath), expectedCanonicalStoragePath)
+    ) {
+      throw new Error('GitNexus: expected registry storage changed during locked commit');
+    }
     // Close the analyze/index TOCTOU window: another process may have registered
     // this remote after the initial read but before our atomic registry write.
     assertRemoteIdentityAvailable(fresh, resolved, remoteUrl);
-    const freshIdx = fresh.findIndex((e) => {
-      const a = canonicalizePath(e.path);
-      return registryPathEquals(a, canonicalInput);
-    });
+    let freshIdx: number;
+    if (opts?.expectedOwner) {
+      const expected = opts.expectedOwner;
+      const expectedPath = expectedOwnerCanonicalPath!;
+      const expectedStorage = expectedOwnerCanonicalStorage!;
+      const currentCanonicalInput = canonicalizePath(repoPath);
+      const currentCanonicalStorage = canonicalizePath(storagePath);
+      const related = fresh
+        .map((owner, index) => ({ owner, index }))
+        .filter(({ owner }) => {
+          const ownerPath = path.isAbsolute(owner.path) ? canonicalizePath(owner.path) : undefined;
+          const ownerStorage = path.isAbsolute(owner.storagePath)
+            ? canonicalizePath(owner.storagePath)
+            : undefined;
+          return (
+            (ownerPath !== undefined &&
+              expectedPath !== undefined &&
+              registryPathEquals(ownerPath, expectedPath)) ||
+            (ownerStorage !== undefined &&
+              expectedStorage !== undefined &&
+              registryPathEquals(ownerStorage, expectedStorage))
+          );
+        });
+      const matches = related.filter(
+        ({ owner }) =>
+          path.isAbsolute(owner.path) &&
+          path.isAbsolute(owner.storagePath) &&
+          registryPathEquals(canonicalizePath(owner.path), expectedPath) &&
+          registryPathEquals(canonicalizePath(owner.storagePath), expectedStorage),
+      );
+      const match = matches[0];
+      if (
+        !path.isAbsolute(expectedPath) ||
+        !path.isAbsolute(expectedStorage) ||
+        !registryPathEquals(expectedPath, currentCanonicalInput) ||
+        !registryPathEquals(expectedStorage, currentCanonicalStorage) ||
+        related.length !== 1 ||
+        matches.length !== 1 ||
+        !match ||
+        match.owner.name !== expected.name ||
+        match.owner.path !== expected.path ||
+        match.owner.storagePath !== expected.storagePath ||
+        normalizeRepositoryRemote(match.owner.remoteUrl) !==
+          normalizeRepositoryRemote(expected.remoteUrl) ||
+        match.owner.branch !== expected.branch ||
+        match.owner.lastCommit !== expected.lastCommit ||
+        match.owner.indexedAt !== expected.indexedAt
+      ) {
+        throw new Error(
+          'GitNexus: expected registry owner changed during locked commit. ' +
+            'Wait for the current repository operation to finish and retry. ' +
+            'If this repeats, inspect concurrent analyze/embed activity.',
+        );
+      }
+      freshIdx = match.index;
+    } else {
+      freshIdx = fresh.findIndex((e) =>
+        registryPathEquals(canonicalizePath(e.path), canonicalInput),
+      );
+    }
     const freshExisting = freshIdx >= 0 ? fresh[freshIdx] : null;
     let merged: RegistryEntry;
     if (summary) {
@@ -1399,24 +1572,194 @@ export const registerRepo = async (
     }
 
     await writeRegistry(fresh);
+    const pathChangedAfterWrite =
+      expectedCanonicalPath !== undefined &&
+      !registryPathEquals(canonicalizePath(repoPath), expectedCanonicalPath);
+    const storageChangedAfterWrite =
+      expectedCanonicalStoragePath !== undefined &&
+      !registryPathEquals(canonicalizePath(storagePath), expectedCanonicalStoragePath);
+    if (pathChangedAfterWrite || storageChangedAfterWrite) {
+      const identityError = new Error(
+        pathChangedAfterWrite
+          ? 'GitNexus: expected registry path changed during locked commit'
+          : 'GitNexus: expected registry storage changed during locked commit',
+      );
+      if (!registryBeforeWrite) throw identityError;
+      try {
+        await writeRegistry(registryBeforeWrite);
+      } catch (rollbackError) {
+        throw new AggregateError(
+          [identityError, rollbackError],
+          'GitNexus: registry identity changed during commit and rollback was incomplete',
+        );
+      }
+      throw identityError;
+    }
+    commitReceipt = {
+      previousOwner: freshExisting ? { ...freshExisting } : null,
+      committedOwner: { ...merged },
+    };
   });
+  if (opts?.commitReceipt && commitReceipt) opts.commitReceipt.value = commitReceipt;
   return name;
+};
+
+/**
+ * Roll back exactly one successful {@link registerRepo} commit when a later
+ * coupled-store validation fails. The compare-and-swap is deliberately based
+ * on the raw committed registry projection, not fresh filesystem
+ * canonicalization: a symlink retarget is the failure this path must recover.
+ * Concurrent registry changes survive, and a changed committed projection is
+ * refused rather than overwritten.
+ */
+export const rollbackRegistryCommit = async (receipt: RegistryCommitReceipt): Promise<void> => {
+  await withRegistryMutationLock(async () => {
+    const fresh = await readRegistry();
+    const committedJson = JSON.stringify(receipt.committedOwner);
+    const matches = fresh
+      .map((owner, index) => ({ owner, index }))
+      .filter(({ owner }) => JSON.stringify(owner) === committedJson);
+    if (matches.length !== 1) {
+      throw new Error('GitNexus: registry changed after commit; rollback refused');
+    }
+    const index = matches[0].index;
+    if (receipt.previousOwner) fresh[index] = receipt.previousOwner;
+    else fresh.splice(index, 1);
+    await writeRegistry(fresh);
+  });
 };
 
 /**
  * Remove a repo from the global registry.
  * Called after `gitnexus clean`.
  */
-export const unregisterRepo = async (repoPath: string): Promise<void> => {
+export interface UnregisterRepoOptions {
+  /** Exact registry generation and physical owner captured before deletion. */
+  expectedOwner?: Readonly<RegistryEntry & { canonicalPath: string; canonicalStoragePath: string }>;
+}
+
+const registryEntryProjection = (entry: RegistryEntry): RegistryEntry => ({
+  name: entry.name,
+  path: entry.path,
+  storagePath: entry.storagePath,
+  indexedAt: entry.indexedAt,
+  lastCommit: entry.lastCommit,
+  ...(entry.remoteUrl !== undefined ? { remoteUrl: entry.remoteUrl } : {}),
+  ...(entry.stats !== undefined ? { stats: entry.stats } : {}),
+  ...(entry.branch !== undefined ? { branch: entry.branch } : {}),
+  ...(entry.branches !== undefined ? { branches: entry.branches } : {}),
+});
+
+const assertExpectedUnregisterOwner = (
+  repoPath: string,
+  expected: NonNullable<UnregisterRepoOptions['expectedOwner']>,
+): void => {
+  if (!registryPathEquals(canonicalizePath(repoPath), expected.canonicalPath)) {
+    throw new Error('GitNexus: expected registry owner changed before unregister');
+  }
+  let storageExists = true;
+  try {
+    lstatSync(expected.storagePath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') storageExists = false;
+    else throw error;
+  }
+  if (
+    storageExists &&
+    !registryPathEquals(canonicalizePath(expected.storagePath), expected.canonicalStoragePath)
+  ) {
+    throw new Error('GitNexus: expected registry storage changed before unregister');
+  }
+};
+
+type RegistryRemovalReceipt = {
+  removedOwner: RegistryEntry;
+  removedIndex: number;
+  expectedCanonicalPath: string;
+};
+
+const rollbackRegistryRemoval = async (receipt: RegistryRemovalReceipt): Promise<void> => {
+  // Resolve the mutable display path before the registry lock. Restoring raw
+  // bytes after that path retargets would publish the old owner for a new repo.
+  if (
+    !registryPathEquals(canonicalizePath(receipt.removedOwner.path), receipt.expectedCanonicalPath)
+  ) {
+    throw new Error('GitNexus: registry owner path changed; unregister rollback refused');
+  }
+  await withRegistryMutationLock(async () => {
+    const fresh = await readRegistry();
+    const removedJson = JSON.stringify(registryEntryProjection(receipt.removedOwner));
+    if (fresh.some((entry) => JSON.stringify(registryEntryProjection(entry)) === removedJson)) {
+      return;
+    }
+    if (
+      fresh.some(
+        (entry) =>
+          entry.path === receipt.removedOwner.path ||
+          entry.storagePath === receipt.removedOwner.storagePath,
+      )
+    ) {
+      throw new Error('GitNexus: registry owner changed after unregister; rollback refused');
+    }
+    fresh.splice(Math.min(receipt.removedIndex, fresh.length), 0, receipt.removedOwner);
+    await writeRegistry(fresh);
+  });
+};
+
+export const unregisterRepo = async (
+  repoPath: string,
+  opts?: UnregisterRepoOptions,
+): Promise<void> => {
   // Canonicalise BOTH sides so an unregister call issued with the
   // symlink form (`/var/folders/.../repo`) still matches an entry
   // written with the realpath form (`/private/var/folders/.../repo`),
   // and vice versa. Matches the semantics of `registerRepo` and
   // `resolveRegistryEntry` post-#1003 review.
+  const expected = opts?.expectedOwner;
   const resolved = canonicalizePath(repoPath);
-  const entries = await readRegistry();
-  const filtered = entries.filter((e) => !registryPathEquals(canonicalizePath(e.path), resolved));
-  await writeRegistry(filtered);
+  if (expected) assertExpectedUnregisterOwner(repoPath, expected);
+  let removalReceipt: RegistryRemovalReceipt | undefined;
+  await withRegistryMutationLock(async () => {
+    const entries = await readRegistry();
+    if (!expected) {
+      const filtered = entries.filter(
+        (e) => !registryPathEquals(canonicalizePath(e.path), resolved),
+      );
+      await writeRegistry(filtered);
+      return;
+    }
+
+    const expectedEntry = registryEntryProjection(expected);
+    const expectedJson = JSON.stringify(expectedEntry);
+    const matches = entries
+      .map((entry, index) => ({ entry, index }))
+      .filter(({ entry }) => JSON.stringify(registryEntryProjection(entry)) === expectedJson);
+    if (matches.length !== 1) {
+      throw new Error('GitNexus: expected registry owner changed before unregister');
+    }
+    const [{ entry: removedOwner, index: removedIndex }] = matches;
+    entries.splice(removedIndex, 1);
+    await writeRegistry(entries);
+    removalReceipt = {
+      removedOwner,
+      removedIndex,
+      expectedCanonicalPath: expected.canonicalPath,
+    };
+  });
+  if (!expected || !removalReceipt) return;
+  try {
+    assertExpectedUnregisterOwner(repoPath, expected);
+  } catch (error) {
+    try {
+      await rollbackRegistryRemoval(removalReceipt);
+    } catch (rollbackError) {
+      throw new AggregateError(
+        [error, rollbackError],
+        'GitNexus: unregister owner validation failed and registry rollback was incomplete',
+      );
+    }
+    throw error;
+  }
 };
 
 /**
@@ -1429,19 +1772,21 @@ export const unregisterRepo = async (repoPath: string): Promise<void> => {
  */
 export const removeBranchIndex = async (repoPath: string, branch: string): Promise<boolean> => {
   const resolved = canonicalizePath(repoPath);
-  const entries = await readRegistry();
-  const idx = entries.findIndex((e) => registryPathEquals(canonicalizePath(e.path), resolved));
-  if (idx < 0) return false;
-  const entry = entries[idx];
-  const before = entry.branches?.length ?? 0;
-  if (!entry.branches || before === 0) return false;
-  const remaining = entry.branches.filter((b) => b.branch !== branch);
-  if (remaining.length === before) return false; // branch not recorded
-  if (remaining.length > 0) entry.branches = remaining;
-  else delete entry.branches;
-  entries[idx] = entry;
-  await writeRegistry(entries);
-  return true;
+  return withRegistryMutationLock(async () => {
+    const entries = await readRegistry();
+    const idx = entries.findIndex((e) => registryPathEquals(canonicalizePath(e.path), resolved));
+    if (idx < 0) return false;
+    const entry = entries[idx];
+    const before = entry.branches?.length ?? 0;
+    if (!entry.branches || before === 0) return false;
+    const remaining = entry.branches.filter((b) => b.branch !== branch);
+    if (remaining.length === before) return false; // branch not recorded
+    if (remaining.length > 0) entry.branches = remaining;
+    else delete entry.branches;
+    entries[idx] = entry;
+    await writeRegistry(entries);
+    return true;
+  });
 };
 
 /**
@@ -1461,16 +1806,33 @@ export const removeBranchIndex = async (repoPath: string, branch: string): Promi
  * repos (never self-heals an unregistered repo, per #2264/#1169; the registry
  * check precedes the rm per #2364 review F2) — and no subprocess is spawned.
  */
-export const adoptFlatBranchLabel = async (repoPath: string, branch: string): Promise<void> => {
+export type FlatBranchAdoptionOutcome = 'ADOPTED' | 'PRIMARY_DRIFT_RECONCILED' | 'NOT_ADOPTED';
+
+export const adoptFlatBranchLabel = async (
+  repoPath: string,
+  branch: string,
+  frozenStoragePath?: string,
+): Promise<FlatBranchAdoptionOutcome> => {
   const canonicalInput = canonicalizePath(repoPath);
   const isRegistered = (list: RegistryEntry[]): number =>
     list.findIndex((e) => registryPathEquals(canonicalizePath(e.path), canonicalInput));
+  const primaryProjection = (entry: RegistryEntry): Omit<RegistryEntry, 'branches'> => {
+    const primary = { ...entry };
+    delete primary.branches;
+    return primary;
+  };
   // Cheap membership gate only (#2364 review F2): never touch the disk for an
-  // unregistered repo. The mutate below re-reads its own fresh snapshot.
-  if (isRegistered(await readRegistry()) < 0) return; // no-op, disk included (no self-heal)
+  // unregistered repo. Capture only the summary whose deletion this pass may
+  // authorize; the locked mutate below re-reads its own fresh snapshot.
+  const initialEntries = await readRegistry();
+  const initialIdx = isRegistered(initialEntries);
+  if (initialIdx < 0) return 'NOT_ADOPTED'; // no-op, disk included (no self-heal)
+  const observedPrimary = primaryProjection(initialEntries[initialIdx]);
+  const observedSummary = initialEntries[initialIdx].branches?.find((b) => b.branch === branch);
+  if (initialEntries[initialIdx].branch === branch && !observedSummary) return 'ADOPTED';
 
   const resolved = path.resolve(repoPath);
-  const { storagePath } = getStoragePaths(resolved);
+  const storagePath = frozenStoragePath ?? getStoragePaths(resolved).storagePath;
   // Remove a shadowed sub-index directory, mirroring `clean --branch`'s
   // containment guard: the target MUST live under .gitnexus/branches/.
   const branchDir = path.join(storagePath, BRANCHES_DIR, branchSlug(branch));
@@ -1510,22 +1872,41 @@ export const adoptFlatBranchLabel = async (repoPath: string, branch: string): Pr
     }
   }
 
-  // Re-read AFTER the potentially slow recursive rm: the registry is a
-  // multi-writer whole-file overwrite, and writing a pre-rm snapshot would
-  // silently clobber concurrent registerRepo/removeBranchIndex writers —
-  // the #2106 R9 re-read-before-write discipline registerRepo follows.
-  const entries = await readRegistry();
-  const idx = isRegistered(entries);
-  if (idx < 0) return; // unregistered concurrently → still a no-op
-  const entry = entries[idx];
-  const remaining = dirGone ? entry.branches?.filter((b) => b.branch !== branch) : entry.branches;
-  const droppedSummary = (entry.branches?.length ?? 0) !== (remaining?.length ?? 0);
-  if (entry.branch === branch && !droppedSummary) return; // already coherent
-  entry.branch = branch;
-  if (remaining && remaining.length > 0) entry.branches = remaining;
-  else delete entry.branches;
-  entries[idx] = entry;
-  await writeRegistry(entries);
+  // Re-read and commit under the shared writer lock AFTER all filesystem I/O.
+  // Drop only the exact summary observed before deletion: a concurrent refresh
+  // or re-registration describes new work and must survive even though its old
+  // directory was removed by this pass.
+  return withRegistryMutationLock(async () => {
+    const entries = await readRegistry();
+    const idx = isRegistered(entries);
+    if (idx < 0) return 'NOT_ADOPTED'; // unregistered concurrently → still a no-op
+    const entry = entries[idx];
+    const remaining =
+      dirGone && observedSummary
+        ? entry.branches?.filter(
+            (b) => b.branch !== branch || !isDeepStrictEqual(b, observedSummary),
+          )
+        : entry.branches;
+    const droppedSummary = (entry.branches?.length ?? 0) !== (remaining?.length ?? 0);
+
+    if (!isDeepStrictEqual(primaryProjection(entry), observedPrimary)) {
+      if (!droppedSummary) return 'NOT_ADOPTED';
+      const reconciled = { ...entry };
+      if (remaining && remaining.length > 0) reconciled.branches = remaining;
+      else delete reconciled.branches;
+      entries[idx] = reconciled;
+      await writeRegistry(entries);
+      return 'PRIMARY_DRIFT_RECONCILED';
+    }
+
+    if (entry.branch === branch && !droppedSummary) return 'ADOPTED';
+    const updated = { ...entry, branch };
+    if (remaining && remaining.length > 0) updated.branches = remaining;
+    else delete updated.branches;
+    entries[idx] = updated;
+    await writeRegistry(entries);
+    return 'ADOPTED';
+  });
 };
 
 /**
@@ -1643,9 +2024,13 @@ export const isRepoRegistered = async (repoPath: string): Promise<boolean> => {
  * Callers must skip this assertion on the `alreadyUpToDate` early-return
  * path, where the rebuild was deliberately not run.
  */
-export const assertAnalysisFinalized = async (repoPath: string): Promise<void> => {
+export const assertAnalysisFinalized = async (
+  repoPath: string,
+  expectedCanonicalStoragePath?: string,
+): Promise<void> => {
   const resolved = path.resolve(repoPath);
-  const { storagePath, metaPath } = getStoragePaths(resolved);
+  const storagePath = expectedCanonicalStoragePath ?? getStoragePaths(resolved).storagePath;
+  const metaPath = path.join(storagePath, INDEX_METADATA_FILE);
 
   try {
     await fs.access(metaPath);
@@ -1653,7 +2038,20 @@ export const assertAnalysisFinalized = async (repoPath: string): Promise<void> =
     throw new AnalysisNotFinalizedError(resolved, storagePath, 'meta', getGlobalRegistryPath());
   }
 
-  if (!(await isRepoRegistered(resolved))) {
+  const isRegistered = expectedCanonicalStoragePath
+    ? (await readRegistry()).some(
+        (entry) =>
+          path.isAbsolute(entry.path) &&
+          path.isAbsolute(entry.storagePath) &&
+          registryPathEquals(canonicalizePath(entry.path), canonicalizePath(resolved)) &&
+          registryPathEquals(canonicalizePath(entry.storagePath), expectedCanonicalStoragePath) &&
+          registryPathEquals(
+            canonicalizePath(getStoragePath(entry.path)),
+            expectedCanonicalStoragePath,
+          ),
+      )
+    : await isRepoRegistered(resolved);
+  if (!isRegistered) {
     throw new AnalysisNotFinalizedError(
       resolved,
       storagePath,
@@ -1809,14 +2207,45 @@ export const resolveRegistryEntry = (entries: RegistryEntry[], target: string): 
  * therefore "not confirmed present," not "confirmed present"; downstream DB
  * opens are independently and lazily guarded.
  */
+const isRegistryEntryProvablyMissing = async (entry: RegistryEntry): Promise<boolean> => {
+  let indexFound = false;
+  let firstNonMissingError: NodeJS.ErrnoException | null = null;
+  let lastMissingError: NodeJS.ErrnoException | null = null;
+
+  try {
+    await fs.access(path.join(entry.storagePath, INDEX_METADATA_FILE));
+    indexFound = true;
+  } catch (err: any) {
+    if (isMissingFilesystemError(err)) lastMissingError = err;
+    else firstNonMissingError = err;
+  }
+
+  if (!indexFound) {
+    try {
+      await fs.access(path.join(entry.storagePath, LEGACY_METADATA_FILE));
+      indexFound = true;
+    } catch (err: any) {
+      if (isMissingFilesystemError(err)) lastMissingError = err;
+      else if (!firstNonMissingError) firstNonMissingError = err;
+    }
+  }
+
+  if (indexFound) return false;
+  if (!firstNonMissingError && lastMissingError) return true;
+  logger.warn(
+    { name: entry.name, storagePath: entry.storagePath, code: firstNonMissingError?.code },
+    'Keeping registry entry despite fs.access failure (not provably absent); not pruning to avoid mass registry wipe.',
+  );
+  return false;
+};
+
 export const listRegisteredRepos = async (opts?: {
   validate?: boolean;
 }): Promise<RegistryEntry[]> => {
-  const entries = await readRegistry();
-  if (!opts?.validate) return entries;
+  if (!opts?.validate) return readRegistry();
+  const entries = await readRegistryForValidation();
 
-  // Validate each entry still has a .gitnexus/ directory with metadata
-  const valid: RegistryEntry[] = [];
+  const prunable: RegistryEntry[] = [];
   for (const entry of entries) {
     // Named to avoid shadowing the exported `hasIndex` function above.
     let indexFound = false;
@@ -1843,28 +2272,29 @@ export const listRegisteredRepos = async (opts?: {
       }
     }
 
-    if (indexFound) {
-      valid.push(entry);
-    } else if (!firstNonMissingError && lastMissingError) {
-      // Index genuinely removed — safe to prune
-    } else {
-      // Not provably absent — keep entry to prevent mass registry wipe.
-      // Warn so an I/O storm becomes observable instead of silently
-      // keeping (or, pre-fix, silently wiping) entries.
+    if (!indexFound && !firstNonMissingError && lastMissingError) {
+      prunable.push(entry);
+    } else if (!indexFound) {
       logger.warn(
         { name: entry.name, storagePath: entry.storagePath, code: firstNonMissingError?.code },
         'Keeping registry entry despite fs.access failure (not provably absent); not pruning to avoid mass registry wipe.',
       );
-      valid.push(entry);
     }
   }
 
-  // If we pruned any entries, save the cleaned registry
-  if (valid.length !== entries.length) {
-    await writeRegistry(valid);
-  }
+  if (prunable.length === 0) return entries;
 
-  return valid;
+  // Final lock-held revalidation closes the identical re-registration race.
+  return withRegistryMutationLock(async () => {
+    const fresh = await readRegistryForValidation();
+    const rebased: RegistryEntry[] = [];
+    for (const entry of fresh) {
+      const exactCandidate = prunable.some((candidate) => isDeepStrictEqual(entry, candidate));
+      if (!exactCandidate || !(await isRegistryEntryProvablyMissing(entry))) rebased.push(entry);
+    }
+    if (rebased.length !== fresh.length) await writeRegistry(rebased);
+    return rebased;
+  });
 };
 
 // ─── Global CLI Config (~/.gitnexus/config.json) ─────────────────────────

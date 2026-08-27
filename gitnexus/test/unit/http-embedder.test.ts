@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { getEmbeddingDims, isEmbedderReady } from '../../src/mcp/core/embedder.js';
+import { httpEmbeddingProvider } from '../../src/core/embeddings/embedding-identity.js';
 
 const ENV_KEYS = [
   'GITNEXUS_EMBEDDING_URL',
@@ -75,6 +76,48 @@ describe('HTTP embedding backend', () => {
   });
 
   describe('core embedder HTTP path', () => {
+    it('derives a stable provider after stripping credentials and trailing slashes', () => {
+      const provider = httpEmbeddingProvider('HTTPS://user:secret@example.com/v1///');
+      expect(provider).toBe(httpEmbeddingProvider('https://example.com/v1'));
+      expect(provider).not.toContain('secret');
+    });
+
+    it('refuses fragments instead of colliding with the fragment-free route', () => {
+      for (const endpoint of ['https://example.com/v1#fragment', 'https://example.com/v1#']) {
+        expect(() => httpEmbeddingProvider(endpoint)).toThrow(/fragments are unverifiable/i);
+      }
+    });
+
+    it('refuses leading or trailing whitespace before provider hashing', () => {
+      for (const endpoint of [' https://example.com/v1', 'https://example.com/v1 ']) {
+        expect(() => httpEmbeddingProvider(endpoint)).toThrow(/surrounding whitespace/i);
+      }
+    });
+
+    it('refuses backslashes before provider hashing can normalize the effective route', () => {
+      for (const endpoint of ['https://example.com/v1\\', 'https:\\example.com\\v1']) {
+        expect(() => httpEmbeddingProvider(endpoint)).toThrow(/backslashes are unverifiable/i);
+      }
+    });
+
+    it('refuses query-bearing and malformed endpoints before provider use', () => {
+      expect(() => httpEmbeddingProvider('https://example.com/v1?deployment=secret')).toThrow(
+        /query routing is unverifiable/i,
+      );
+      expect(() => httpEmbeddingProvider('not-an-endpoint')).toThrow(/malformed/i);
+    });
+
+    it('exposes the local provider identity outside HTTP mode', async () => {
+      delete process.env.GITNEXUS_EMBEDDING_URL;
+      delete process.env.GITNEXUS_EMBEDDING_MODEL;
+      const { getActiveEmbeddingIdentity } = await import('../../src/core/embeddings/embedder.js');
+      expect(getActiveEmbeddingIdentity()).toEqual({
+        provider: 'local',
+        model: 'Snowflake/snowflake-arctic-embed-xs',
+        dimensions: 384,
+      });
+    });
+
     it('sends correct request payload', async () => {
       process.env.GITNEXUS_EMBEDDING_URL = 'http://test:8080/v1';
       process.env.GITNEXUS_EMBEDDING_MODEL = 'test-model';

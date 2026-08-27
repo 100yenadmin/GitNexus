@@ -87,6 +87,34 @@ export const resolveEmbeddingInstallPolicy = (): ExtensionInstallPolicy => {
 const ensureVectorExtensionAvailable = async (): Promise<boolean> => {
   return loadVectorExtension(undefined, { policy: resolveEmbeddingInstallPolicy() });
 };
+
+const waitForOperationOrAbort = <T>(operation: Promise<T>, signal?: AbortSignal): Promise<T> => {
+  if (!signal) return operation;
+  signal.throwIfAborted();
+
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const cleanup = () => signal.removeEventListener('abort', onAbort);
+    const resolveOnce = (value: T) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(value);
+    };
+    const rejectOnce = (reason: unknown) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(reason);
+    };
+    const onAbort = () =>
+      rejectOnce(signal.reason ?? new DOMException('This operation was aborted', 'AbortError'));
+
+    signal.addEventListener('abort', onAbort, { once: true });
+    operation.then(resolveOnce, rejectOnce);
+    if (signal.aborted) onAbort();
+  });
+};
 /**
  * Bump this when the embedding text template changes in a way that should
  * invalidate existing vectors, such as metadata/header shape changes,
@@ -353,7 +381,7 @@ export const batchInsertEmbeddings = async (
  * dynamic import only (lazy-embeddings convention, #2370).
  */
 export const buildVectorIndex = async (): Promise<boolean> => {
-  const integrity = await inspectEmbeddingIntegrity();
+  const integrity = await inspectEmbeddingIntegrity(undefined, true);
   if (embeddingIntegrityFailures(integrity) > 0 || integrity.physicalRows !== integrity.validRows) {
     throw new Error(
       `Vector index creation refused malformed embedding rows ` +
@@ -527,14 +555,17 @@ export const runEmbeddingPipeline = async (
     });
 
     if (!isEmbedderReady()) {
-      await initEmbedder((modelProgress: ModelProgress) => {
-        const downloadPercent = modelProgress.progress ?? 0;
-        onProgress({
-          phase: 'loading-model',
-          percent: Math.round(downloadPercent * 0.2),
-          modelDownloadPercent: downloadPercent,
-        });
-      }, finalConfig);
+      await waitForOperationOrAbort(
+        initEmbedder((modelProgress: ModelProgress) => {
+          const downloadPercent = modelProgress.progress ?? 0;
+          onProgress({
+            phase: 'loading-model',
+            percent: Math.round(downloadPercent * 0.2),
+            modelDownloadPercent: downloadPercent,
+          });
+        }, finalConfig),
+        pipelineOptions.signal,
+      );
       throwIfCancelled();
     }
 

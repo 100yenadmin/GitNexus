@@ -9,6 +9,8 @@ describe('isMissingColumnOrTableError', () => {
     'Binder exception: table CodeEmbedding not found in catalog',
     'Binder exception: column chunkIndex not found',
     'Binder exception: property contentHash not found for e.',
+    'Binder exception: Cannot find property chunkIndex for e.',
+    'Binder exception: Cannot find property contentHash for embedding_row',
   ])('accepts established missing-schema form: %s', (message) => {
     expect(isMissingColumnOrTableError(message)).toBe(true);
   });
@@ -20,6 +22,7 @@ describe('isMissingColumnOrTableError', () => {
     'Runtime exception: Binder exception: Column chunkIndex does not exist',
     'Binder exception: Table CodeEmbedding does not exist; connection reset by peer',
     'Binder exception: Table CodeEmbedding not found; database does not exist',
+    'Binder exception: Cannot find property chunkIndex for e; connection reset',
     'query does not exist',
     'key does not exist',
     'path does not exist',

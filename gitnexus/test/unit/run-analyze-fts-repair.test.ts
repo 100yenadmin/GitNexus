@@ -24,6 +24,7 @@ const cleanEmbeddingIntegrity = (rows: number) => ({
   orphanRows: 0,
   wrongDimensionRows: 0,
   recoverableIdentitySha256: 'a'.repeat(64),
+  physicalRowsSha256: 'a'.repeat(64),
 });
 
 const createPlaceholderGraphStore = async (lbugPath: string): Promise<void> => {
@@ -954,6 +955,7 @@ describe('runFullAnalysis wipe-and-restore vector-index stamp (tri-review 466951
           nodesProcessed: 0,
           totalNodes: 2,
           chunksProcessed: 0,
+          provider: 'local',
           model: 'Snowflake/snowflake-arctic-embed-xs',
           dimensions: EMBEDDING_DIMS,
           pendingNodeIds: [pendingNodeId],
@@ -1107,12 +1109,14 @@ describe('runFullAnalysis dirty-recovery parking failure fails fast (this shippi
           nodesProcessed: 2,
           totalNodes: 2,
           chunksProcessed: 2,
+          provider: 'local',
           model: 'Snowflake/snowflake-arctic-embed-xs',
           dimensions: EMBEDDING_DIMS,
           pendingNodeIds: [],
           physicalRows: 3,
           validRows: 3,
           recoverableIdentitySha256: 'a'.repeat(64),
+          physicalRowsSha256: 'a'.repeat(64),
         },
       });
       await createPlaceholderGraphStore(lbugPath);
