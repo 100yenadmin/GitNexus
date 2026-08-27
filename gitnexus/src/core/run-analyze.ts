@@ -1839,6 +1839,9 @@ const runFullAnalysisImpl = async (
       );
     }
     assertCompletedCheckpointIdentity(legacyCheckpoint, integrity, CLI_CHECKPOINT_CONTEXT);
+    if (options.incrementalOnly) {
+      incrementalOnlyStop('the provider-less empty checkpoint requires a metadata restamp');
+    }
     existingMeta = {
       ...existingMeta,
       stats: { ...existingMeta.stats, embeddings: 0 },

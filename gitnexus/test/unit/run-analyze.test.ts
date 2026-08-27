@@ -203,6 +203,49 @@ describe('run-analyze module', () => {
     }
   });
 
+  it('keeps a provider-less empty checkpoint byte-identical in incremental-only mode', async () => {
+    const tmpRepo = await createTempDir('gitnexus-run-analyze-checkpoint-incremental-only-');
+    try {
+      execSync('git init', { cwd: tmpRepo.dbPath, stdio: 'pipe' });
+      execSync('git -c user.name=test -c user.email=test@test commit --allow-empty -m init', {
+        cwd: tmpRepo.dbPath,
+        stdio: 'pipe',
+      });
+
+      const { runFullAnalysis } = await import('../../src/core/run-analyze.js');
+      await runFullAnalysis(
+        tmpRepo.dbPath,
+        { skipAgentsMd: true, skipSkills: true },
+        { onProgress: () => {} },
+      );
+
+      const { storagePath } = getStoragePaths(tmpRepo.dbPath);
+      const completed = await loadMeta(storagePath);
+      if (!completed) throw new Error('expected completed metadata');
+      await saveMeta(storagePath, {
+        ...completed,
+        stats: { ...completed.stats, embeddings: 0 },
+        embeddingCheckpoint: {
+          at: new Date().toISOString(),
+          nodesProcessed: 0,
+          totalNodes: 0,
+          chunksProcessed: 0,
+          model: 'legacy-model',
+          dimensions: 384,
+        },
+      });
+      const metaPath = path.join(storagePath, 'gitnexus.json');
+      const before = await fs.readFile(metaPath);
+
+      await expect(
+        runFullAnalysis(tmpRepo.dbPath, { incrementalOnly: true }, { onProgress: () => {} }),
+      ).rejects.toThrow(/provider-less empty checkpoint requires a metadata restamp/i);
+      expect(await fs.readFile(metaPath)).toEqual(before);
+    } finally {
+      await tmpRepo.cleanup();
+    }
+  });
+
   it('refuses completed VECTOR repair checkpoints with mismatched or unknown providers', async () => {
     const tmpRepo = await createTempDir('gitnexus-run-analyze-vector-repair-identity-');
     const saved = {
