@@ -620,10 +620,10 @@ describe('common analyze ownership lock', () => {
           release = resolve;
         }),
     );
-    // The nested Windows companion and storage claims each obtain a real
-    // PowerShell process-generation token before entering the callback; hosted
-    // runners can take well over ten seconds without indicating a deadlock.
-    await vi.waitFor(() => expect(release).toBeTypeOf('function'), { timeout: 30_000 });
+    // The Windows ownership claim obtains a real PowerShell process-generation
+    // token before entering the callback; hosted runners can take longer than
+    // Vitest's one-second default without indicating a deadlock.
+    await vi.waitFor(() => expect(release).toBeTypeOf('function'), { timeout: 10_000 });
     await expect(fs.access(path.join(root, 'analyze-staged.lock'))).resolves.toBeUndefined();
 
     await expect(withAnalyzeOwnershipLock(root, async () => undefined)).rejects.toThrow(
@@ -718,7 +718,10 @@ describe('common analyze ownership lock', () => {
       () => new Promise<void>((resolve) => (release = resolve)),
       { repoRoot },
     );
-    await vi.waitFor(() => expect(release).toBeTypeOf('function'));
+    // The nested Windows companion and storage claims each obtain a real
+    // PowerShell process-generation token before entering the callback; hosted
+    // runners can take well over ten seconds without indicating a deadlock.
+    await vi.waitFor(() => expect(release).toBeTypeOf('function'), { timeout: 30_000 });
 
     await attachAnalyzeOwnershipWorker(storagePath, repoRoot, process.pid);
     const lockEntries = await fs.readdir(path.join(home, 'locks'));
