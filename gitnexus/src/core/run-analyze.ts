@@ -1378,7 +1378,7 @@ const runFullAnalysisImpl = async (
     // path, so finish its source-side bookkeeping before returning the explicit
     // recovery-only result. Context generation is best-effort, matching the
     // ordinary successful path.
-    await ensureGitNexusIgnored(repoPath);
+    await ensureGitNexusIgnored(repoPath, storagePath);
     if (!placement.branch) {
       try {
         await generateAIContextFiles(
@@ -1569,7 +1569,7 @@ const runFullAnalysisImpl = async (
     // before the rename must keep doing so.
     if (!options.staged) {
       try {
-        await reconcileMetadataFiles(repoPath);
+        await reconcileMetadataFiles(repoPath, storagePath);
       } catch (err) {
         const code = (err as NodeJS.ErrnoException)?.code;
         log(`Metadata reconciliation failed (non-critical${code ? `, ${code}` : ''}); continuing.`);
@@ -1682,7 +1682,7 @@ const runFullAnalysisImpl = async (
             'if that also fails, verify FTS extension availability via `gitnexus doctor`.',
         );
       }
-      await ensureGitNexusIgnored(repoPath);
+      await ensureGitNexusIgnored(repoPath, storagePath);
       progress('fts', 90, 'Search indexes ready');
       progress('done', 100, 'Done');
       return {
@@ -2089,7 +2089,7 @@ const runFullAnalysisImpl = async (
         if (stagedPaths) {
           await discardStagedWorkspace(stagedPaths);
         } else if (!options.incrementalOnly) {
-          await ensureGitNexusIgnored(repoPath);
+          await ensureGitNexusIgnored(repoPath, storagePath);
         }
         return {
           // `resolveRepoIdentityRoot` collapses worktree roots to the
@@ -3516,7 +3516,7 @@ const runFullAnalysisImpl = async (
 
     // Side effects that describe the canonical generation happen only after a
     // staged promotion has committed.
-    await ensureGitNexusIgnored(repoPath);
+    await ensureGitNexusIgnored(repoPath, storagePath);
 
     let aggregatedClusterCount = 0;
     if (pipelineResult.communityResult?.communities) {

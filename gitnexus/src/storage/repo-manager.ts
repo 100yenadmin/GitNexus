@@ -791,8 +791,11 @@ const reconcileMetaDir = async (dir: string): Promise<boolean> => {
  * pre-rename version sees current metadata instead of "no prior index".
  * Returns true when any file was written.
  */
-export const reconcileMetadataFiles = async (repoPath: string): Promise<boolean> => {
-  const storagePath = getStoragePath(repoPath);
+export const reconcileMetadataFiles = async (
+  repoPath: string,
+  frozenStoragePath?: string,
+): Promise<boolean> => {
+  const storagePath = frozenStoragePath ?? getStoragePath(repoPath);
   let changed = await reconcileMetaDir(storagePath);
 
   const branchesDir = path.join(storagePath, BRANCHES_DIR);
@@ -860,8 +863,11 @@ export function isMissingFilesystemError(err: unknown): boolean {
 /**
  * Keep .gitnexus/ ignored. It contains local index state and caches.
  */
-export const ensureGitNexusIgnored = async (repoPath: string): Promise<void> => {
-  const gitignorePath = path.join(getStoragePath(repoPath), '.gitignore');
+export const ensureGitNexusIgnored = async (
+  repoPath: string,
+  frozenStoragePath?: string,
+): Promise<void> => {
+  const gitignorePath = path.join(frozenStoragePath ?? getStoragePath(repoPath), '.gitignore');
   const desired = '*\n';
 
   // Idempotent fast path: skip the write entirely when the file already has

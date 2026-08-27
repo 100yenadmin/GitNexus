@@ -533,6 +533,15 @@ describe('ensureGitNexusIgnored (#1233)', () => {
     ).resolves.toBe('*\n');
   });
 
+  it('writes the internal ignore file only to a frozen storage target', async () => {
+    const frozenStorage = path.join(tmpRepo.dbPath, 'frozen-storage');
+
+    await ensureGitNexusIgnored(tmpRepo.dbPath, frozenStorage);
+
+    await expect(fs.readFile(path.join(frozenStorage, '.gitignore'), 'utf-8')).resolves.toBe('*\n');
+    await expect(fs.access(path.join(tmpRepo.dbPath, '.gitnexus', '.gitignore'))).rejects.toThrow();
+  });
+
   it('does not create or modify the repository root .gitignore', async () => {
     const rootGitignorePath = path.join(tmpRepo.dbPath, '.gitignore');
     await fs.writeFile(rootGitignorePath, 'node_modules/\n');
