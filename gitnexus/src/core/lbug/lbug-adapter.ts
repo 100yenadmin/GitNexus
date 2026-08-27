@@ -890,6 +890,7 @@ export const acquireLbugOwnership = async (
           await storageGate;
         },
         {
+          createStoragePath: false,
           onStorageOwnershipAcquired: (token) => {
             acquiredStorageOwnership = token;
           },
@@ -899,7 +900,9 @@ export const acquireLbugOwnership = async (
       try {
         await storageEntered;
         if (!acquiredStorageOwnership) {
-          throw new Error('Analyze storage ownership token was not captured');
+          throw new Error(
+            `Analyze storage path does not exist or disappeared before ownership: ${resolvedStoragePath}`,
+          );
         }
         frozenStorageOwnership = acquiredStorageOwnership;
       } catch (error) {

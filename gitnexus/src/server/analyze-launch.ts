@@ -52,6 +52,8 @@ export interface LaunchDeps {
    * before the rewrite keeps reading the pre-rewrite state until evicted.
    */
   closeDbHandle: () => Promise<void>;
+  /** Test seam; production defaults to the exact filesystem validation below. */
+  validateRepoDirectory?: (repoPath: string) => void;
 }
 
 export interface LaunchOptions {
@@ -60,6 +62,19 @@ export interface LaunchOptions {
   dropEmbeddings?: boolean;
   registryName?: string;
 }
+
+export const assertExistingRepoDirectory = (repoPath: string): void => {
+  let stat;
+  try {
+    stat = statSync(repoPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      throw new Error(`Repository path does not exist: ${repoPath}`);
+    }
+    throw error;
+  }
+  if (!stat.isDirectory()) throw new Error(`Repository path is not a directory: ${repoPath}`);
+};
 
 const MAX_WORKER_RETRIES = 2;
 
@@ -148,6 +163,7 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
     releaseRepoLock,
     acquireAnalyzeOwnership,
     closeDbHandle,
+    validateRepoDirectory = assertExistingRepoDirectory,
   } = deps;
 
   return function launchAnalysisWorker(
@@ -162,6 +178,15 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
     // the repository root. The same physical root is sent to every retry so a
     // later symlink retarget cannot move the worker outside the held lock.
     const lockedRepoPath = canonicalizePath(targetPath);
+    try {
+      validateRepoDirectory(lockedRepoPath);
+    } catch (error) {
+      jobManager.updateJob(job.id, {
+        status: 'failed',
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return;
+    }
     const analyzeRootLockKey = canonicalRepoRootLockKey(lockedRepoPath);
     const rootLockErr = acquireRepoLock(analyzeRootLockKey);
     if (rootLockErr) {
@@ -523,10 +548,14 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
           await finishCancelledLaunch(currentJob.cancellationReason);
           return;
         }
-        if (existsSync(lockedRepoPath) && !existsSync(lexicalStoragePath)) {
+        // The path may disappear while companion admission is pending. Check
+        // again before storage creation, and create only the direct child so a
+        // concurrent removal cannot recursively recreate the repository root.
+        validateRepoDirectory(lockedRepoPath);
+        if (!existsSync(lexicalStoragePath)) {
           // The cross-process companion is already held, so first-analysis
           // storage cannot race DELETE between materialization and worker start.
-          mkdirSync(lexicalStoragePath, { recursive: true });
+          mkdirSync(lexicalStoragePath);
         }
         // Storage may have been absent when ownership admission began, then
         // materialized as a symlink while the companion was pending. Re-freeze

@@ -22,6 +22,16 @@ const makePaths = async () => {
 };
 
 describe('Ladybug writable ownership admission', () => {
+  it('does not materialize an absent storage path during storage acquisition', async () => {
+    const { repoRoot, storagePath } = await makePaths();
+    const lease = await acquireLbugOwnership(storagePath, repoRoot);
+
+    await expect(lease.acquireStorage(storagePath)).rejects.toThrow(/storage path does not exist/i);
+    await expect(fs.access(storagePath)).rejects.toMatchObject({ code: 'ENOENT' });
+
+    await lease.release();
+  });
+
   it('holds one real analyze ownership lease across separately sequenced preflight work', async () => {
     const { repoRoot, storagePath } = await makePaths();
     await expect(fs.access(storagePath)).rejects.toMatchObject({ code: 'ENOENT' });

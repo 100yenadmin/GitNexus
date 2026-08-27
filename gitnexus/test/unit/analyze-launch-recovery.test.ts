@@ -92,6 +92,7 @@ const launchDeps = (
     acquireStorage,
     attachWorker,
     closeDbHandle: vi.fn(async () => undefined),
+    validateRepoDirectory: vi.fn(),
   };
 };
 
@@ -120,6 +121,55 @@ describe('analyze worker recovery-only parent contract', () => {
 });
 
 describe('analyze worker shared lock ownership', () => {
+  it('rejects a missing repository before acquiring or materializing storage', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-missing-analyze-'));
+    const missingRepo = path.join(root, 'missing-repo');
+    try {
+      const { job, manager } = fakeJobManager();
+      const releaseRepoLock = vi.fn();
+      const { validateRepoDirectory: _testStub, ...deps } = launchDeps(manager, releaseRepoLock);
+
+      createLaunchAnalysisWorker(deps)(job, missingRepo, {});
+
+      expect(job.status).toBe('failed');
+      expect(job).toMatchObject({ error: expect.stringMatching(/path does not exist/i) });
+      expect(deps.acquireRepoLock).not.toHaveBeenCalled();
+      expect(deps.acquireAnalyzeOwnership).not.toHaveBeenCalled();
+      await expect(fs.stat(missingRepo)).rejects.toMatchObject({ code: 'ENOENT' });
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('does not recreate a repository that disappears during ownership admission', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-disappearing-analyze-'));
+    const repoRoot = path.join(root, 'repo');
+    await fs.mkdir(repoRoot);
+    try {
+      const { job, manager } = fakeJobManager();
+      const releaseRepoLock = vi.fn();
+      const { validateRepoDirectory: _testStub, ...deps } = launchDeps(manager, releaseRepoLock);
+      deps.acquireAnalyzeOwnership.mockImplementationOnce(async () => {
+        await fs.rm(repoRoot, { recursive: true });
+        return {
+          acquireStorage: deps.acquireStorage,
+          release: deps.ownershipRelease,
+          attachWorker: deps.attachWorker,
+        };
+      });
+
+      createLaunchAnalysisWorker(deps)(job, repoRoot, {});
+      await vi.waitFor(() => expect(job.status).toBe('failed'));
+
+      expect(job).toMatchObject({ error: expect.stringMatching(/path does not exist/i) });
+      expect(deps.acquireStorage).not.toHaveBeenCalled();
+      expect(deps.ownershipRelease).toHaveBeenCalledOnce();
+      await expect(fs.stat(repoRoot)).rejects.toMatchObject({ code: 'ENOENT' });
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it('attaches the worker generation before sending its start command', async () => {
     const { job, manager } = fakeJobManager();
     const child = fakeChild();
