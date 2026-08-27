@@ -98,6 +98,15 @@ describe('run-analyze module', () => {
     expect(source.match(/Re-run with --embeddings 0/g)).toHaveLength(1);
   });
 
+  it.each([' http://test:8080/v1', 'http://test:8080/v1 ', '\thttp://test:8080/v1\n'])(
+    'rejects endpoint surrounding whitespace before hashing (%j)',
+    (endpoint) => {
+      expect(() => httpEmbeddingProvider(endpoint)).toThrow(
+        'HTTP embedding endpoint must not have surrounding whitespace.',
+      );
+    },
+  );
+
   it('gives provider-less durable-proof mismatches actionable recovery guidance', async () => {
     const tmpRepo = await createTempDir('gitnexus-run-analyze-checkpoint-guidance-');
     try {
@@ -136,6 +145,48 @@ describe('run-analyze module', () => {
         /gitnexus analyze --force --drop-embeddings --embeddings 0/,
       );
       expect((await loadMeta(storagePath))?.embeddingCheckpoint).toMatchObject(checkpoint);
+    } finally {
+      await tmpRepo.cleanup();
+    }
+  });
+
+  it('refuses a provider-less zero-node checkpoint that records completed chunks', async () => {
+    const tmpRepo = await createTempDir('gitnexus-run-analyze-checkpoint-chunks-');
+    try {
+      execSync('git init', { cwd: tmpRepo.dbPath, stdio: 'pipe' });
+      execSync('git -c user.name=test -c user.email=test@test commit --allow-empty -m init', {
+        cwd: tmpRepo.dbPath,
+        stdio: 'pipe',
+      });
+      await createReadableEmptyIndex(tmpRepo.dbPath);
+      const { storagePath } = getStoragePaths(tmpRepo.dbPath);
+      const checkpoint = {
+        at: new Date().toISOString(),
+        nodesProcessed: 0,
+        totalNodes: 0,
+        chunksProcessed: 1,
+        model: 'legacy-model',
+        dimensions: 384,
+      };
+      await saveMeta(storagePath, {
+        repoPath: tmpRepo.dbPath,
+        lastCommit: execSync('git rev-parse HEAD', {
+          cwd: tmpRepo.dbPath,
+          encoding: 'utf8',
+        }).trim(),
+        indexedAt: checkpoint.at,
+        schemaVersion: INCREMENTAL_SCHEMA_VERSION,
+        stats: { embeddings: 0 },
+        embeddingCheckpoint: checkpoint,
+      });
+
+      const { runFullAnalysis } = await import('../../src/core/run-analyze.js');
+      await expect(runFullAnalysis(tmpRepo.dbPath, {}, { onProgress: () => {} })).rejects.toThrow(
+        /unknown-provider/i,
+      );
+      expect((await loadMeta(storagePath))?.embeddingCheckpoint).toMatchObject({
+        chunksProcessed: 1,
+      });
     } finally {
       await tmpRepo.cleanup();
     }
@@ -547,6 +598,7 @@ describe('run-analyze module', () => {
       const resumedPending = await loadMeta(storagePath);
       if (!resumedPending) throw new Error('expected pending-window resume metadata');
       fetchMock.mockClear();
+      const mismatchedProvider = httpEmbeddingProvider('http://other:8080/v1');
       await saveMeta(storagePath, {
         ...resumedPending,
         embeddingCheckpoint: {
@@ -554,7 +606,7 @@ describe('run-analyze module', () => {
           nodesProcessed: 1,
           totalNodes: 2,
           chunksProcessed: 1,
-          provider: httpEmbeddingProvider('http://other:8080/v1'),
+          provider: mismatchedProvider,
           model: 'test-model',
           dimensions: 384,
         },
@@ -565,7 +617,9 @@ describe('run-analyze module', () => {
           { skipAgentsMd: true, skipSkills: true },
           { onProgress: () => {} },
         ),
-      ).rejects.toThrow('Cannot resume embedding checkpoint');
+      ).rejects.toThrow(
+        `Cannot resume embedding checkpoint: it uses ${mismatchedProvider} / test-model at 384 dimensions`,
+      );
       expect(fetchMock).not.toHaveBeenCalled();
 
       await saveMeta(storagePath, {

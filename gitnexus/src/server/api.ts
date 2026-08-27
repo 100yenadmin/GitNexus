@@ -84,11 +84,13 @@ const isEmptyLegacyCheckpoint = (checkpoint?: RepoMeta['embeddingCheckpoint']): 
   checkpoint.provider === undefined &&
   checkpoint.nodesProcessed === 0 &&
   checkpoint.totalNodes === 0 &&
+  checkpoint.chunksProcessed === 0 &&
   !checkpoint.pendingNodeIds?.length;
 
-const API_CHECKPOINT_CONTEXT =
+const apiCheckpointContext = (repoPath: string): string =>
   'Cannot resume embedding checkpoint. Manual recovery required: do not retry POST /api/embed. ' +
-  'Run `gitnexus analyze --force --drop-embeddings --embeddings 0`.';
+  'Run `gitnexus analyze --force --drop-embeddings --embeddings 0` with its repository argument ' +
+  `set to the selected repository path ${JSON.stringify(repoPath)}; do not run it from an unrelated directory.`;
 const API_METADATA_DRIFT_CONTEXT =
   'Repository metadata changed during preflight. Retry POST /api/embed after the current repository operation finishes. ' +
   'If this repeats, stop and ask the repository owner to inspect concurrent analyze/embed activity.';
@@ -2338,7 +2340,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                   `Cannot resume embedding checkpoint: it uses ${tentativeCheckpoint.provider ?? 'unknown-provider'} / ` +
                     `${tentativeCheckpoint.model} at ${tentativeCheckpoint.dimensions} dimensions, but this run resolves ` +
                     `${embeddingIdentity.provider} / ${embeddingIdentity.model} at ${embeddingIdentity.dimensions}. ` +
-                    API_CHECKPOINT_CONTEXT,
+                    apiCheckpointContext(frozenOwner.canonicalPath),
                 );
               }
             }
@@ -2357,13 +2359,13 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                 if (integrity.physicalRows > 0) {
                   throw new Error(
                     'Cannot resume embedding checkpoint: it uses unknown-provider while the table contains ' +
-                      `rows. ${API_CHECKPOINT_CONTEXT}`,
+                      `rows. ${apiCheckpointContext(frozenOwner.canonicalPath)}`,
                   );
                 }
                 assertCompletedCheckpointIdentity(
                   priorCheckpoint,
                   integrity,
-                  API_CHECKPOINT_CONTEXT,
+                  apiCheckpointContext(frozenOwner.canonicalPath),
                 );
                 await hasEmbeddableNodes(executeQuery, embedController.signal);
               });
@@ -2397,13 +2399,13 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                 if (integrity.physicalRows > 0) {
                   throw new Error(
                     'Cannot resume embedding checkpoint: it uses unknown-provider while the table contains ' +
-                      `rows. ${API_CHECKPOINT_CONTEXT}`,
+                      `rows. ${apiCheckpointContext(frozenOwner.canonicalPath)}`,
                   );
                 }
                 assertCompletedCheckpointIdentity(
                   priorCheckpoint,
                   integrity,
-                  API_CHECKPOINT_CONTEXT,
+                  apiCheckpointContext(frozenOwner.canonicalPath),
                 );
                 if (!graphHasNodes) {
                   embedController.signal.throwIfAborted();
@@ -2499,7 +2501,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                   `Cannot resume embedding checkpoint: it uses ${priorCheckpoint.provider ?? 'unknown-provider'} / ` +
                     `${priorCheckpoint.model} at ${priorCheckpoint.dimensions} dimensions, but this run resolves ` +
                     `${embeddingIdentity.provider} / ${embeddingIdentity.model} at ${embeddingIdentity.dimensions}. ` +
-                    API_CHECKPOINT_CONTEXT,
+                    apiCheckpointContext(frozenOwner.canonicalPath),
                 );
               }
               if (priorCheckpoint && !priorCheckpoint.pendingNodeIds?.length) {
@@ -2512,7 +2514,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                   assertCompletedCheckpointIdentity(
                     priorCheckpoint,
                     integrity,
-                    API_CHECKPOINT_CONTEXT,
+                    apiCheckpointContext(frozenOwner.canonicalPath),
                   );
                 }
               }

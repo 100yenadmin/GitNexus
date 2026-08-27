@@ -446,7 +446,13 @@ export const assertVectorRepairPreflight = async (
     );
   }
   if (checkpoint && checkpointComplete) {
-    if (checkpoint.provider === undefined && checkpoint.totalNodes === 0) return meta;
+    if (
+      checkpoint.provider === undefined &&
+      checkpoint.totalNodes === 0 &&
+      checkpoint.chunksProcessed === 0
+    ) {
+      return meta;
+    }
     // The checkpoint is the only durable record of which model produced the
     // stored vectors. The resume path refuses a model/dimension mismatch, and
     // repair clears the checkpoint on success — so repairing through a
@@ -1706,6 +1712,7 @@ const runFullAnalysisImpl = async (
     checkpoint.provider === undefined &&
     checkpoint.nodesProcessed === 0 &&
     checkpoint.totalNodes === 0 &&
+    checkpoint.chunksProcessed === 0 &&
     !checkpoint.pendingNodeIds?.length;
   if (existingMeta?.embeddingCheckpoint) {
     if (options.dropEmbeddings) {

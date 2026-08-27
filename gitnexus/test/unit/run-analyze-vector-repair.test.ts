@@ -669,6 +669,33 @@ describe('runFullAnalysis VECTOR-only repair (#170)', () => {
     }
   });
 
+  it('refuses a provider-less zero-node checkpoint that records completed chunks', async () => {
+    const restoreEnv = pinDefaultEmbeddingIdentity();
+    const indexed = await createIndexedFixture(0, {
+      embeddingCheckpoint: {
+        ...completedCheckpoint,
+        nodesProcessed: 0,
+        totalNodes: 0,
+        chunksProcessed: 1,
+        provider: undefined,
+      },
+    });
+    try {
+      const { runFullAnalysis, mocks } = await importRepairSubject({ counts: [0, 0, 0, 0] });
+      await expect(
+        runFullAnalysis(indexed.fixture.dbPath, { repairVector: true }, { onProgress: () => {} }),
+      ).rejects.toThrow(/unknown-provider/i);
+      expect(mocks.initLbugForMaintenance).not.toHaveBeenCalled();
+      const untouched = JSON.parse(
+        await fs.readFile(path.join(indexed.paths.storagePath, 'gitnexus.json'), 'utf8'),
+      );
+      expect(untouched.embeddingCheckpoint).toMatchObject({ chunksProcessed: 1 });
+    } finally {
+      restoreEnv();
+      await indexed.fixture.cleanup();
+    }
+  });
+
   it('clears an unregistered zero-node checkpoint without first registering the index', async () => {
     const restoreEnv = pinDefaultEmbeddingIdentity();
     const indexed = await createIndexedFixture(5, {

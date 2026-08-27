@@ -54,7 +54,7 @@ const makeMeta = (digest: string, repoPath = REPO.path, zeroCheckpoint = false):
     at: REPO.indexedAt,
     nodesProcessed: zeroCheckpoint ? 0 : 1,
     totalNodes: zeroCheckpoint ? 0 : 2,
-    chunksProcessed: 3,
+    chunksProcessed: zeroCheckpoint ? 0 : 3,
     ...identity,
     provider: zeroCheckpoint ? undefined : identity.provider,
     physicalRows: zeroCheckpoint ? undefined : 3,
@@ -860,12 +860,41 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     expect(job.error).toMatch(/but this run resolves/);
     expect(job.error).toMatch(/do not retry POST \/api\/embed/i);
     expect(job.error).toMatch(/gitnexus analyze --force --drop-embeddings --embeddings 0/);
+    expect(job.error).toContain(REPO.path);
     expect(job.error).not.toMatch(/POST \/api\/analyze/);
     expect(state.openModes).toEqual([]);
     expect(state.withLbugReadOnlyNonRecovering).not.toHaveBeenCalled();
     expect(state.withLbugDb).not.toHaveBeenCalled();
     expect(state.getActiveEmbeddingIdentity).toHaveBeenCalledOnce();
     expect(JSON.stringify(state.currentMeta.embeddingCheckpoint)).toBe(before);
+  });
+
+  it('refuses a provider-less zero-node checkpoint that records completed chunks', async () => {
+    state.currentMeta = makeMeta(LIVE_DIGEST, REPO.path, true);
+    state.currentMeta.embeddingCheckpoint = {
+      ...state.currentMeta.embeddingCheckpoint!,
+      chunksProcessed: 1,
+    };
+    state.liveIntegrity = makeIntegrity(LIVE_DIGEST, 0);
+    state.graphNodes = [];
+    const before = structuredClone(state.currentMeta.embeddingCheckpoint);
+
+    const response = await fetch(`${baseUrl}/api/embed`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ repo: REPO.name }),
+    });
+    const { jobId } = (await response.json()) as { jobId: string };
+    const job = await waitForTerminalJob(baseUrl, jobId);
+
+    expect(job.status).toBe('failed');
+    expect(job.error).toMatch(/unknown-provider/i);
+    expect(job.error).toContain(REPO.path);
+    expect(state.openModes).toEqual([]);
+    expect(state.withLbugReadOnlyNonRecovering).not.toHaveBeenCalled();
+    expect(state.withLbugDb).not.toHaveBeenCalled();
+    expect(state.runEmbeddingPipeline).not.toHaveBeenCalled();
+    expect(state.currentMeta.embeddingCheckpoint).toEqual(before);
   });
 
   it('refuses metadata drift before provider-capable work', async () => {
@@ -1804,6 +1833,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     );
     expect(job.error).toMatch(/do not retry POST \/api\/embed/i);
     expect(job.error).toMatch(/gitnexus analyze --force --drop-embeddings --embeddings 0/);
+    expect(job.error).toContain(REPO.path);
     expect(job.error).not.toMatch(/POST \/api\/analyze/);
     expect(state.withLbugDb).not.toHaveBeenCalled();
     expect(state.runEmbeddingPipeline).not.toHaveBeenCalled();
