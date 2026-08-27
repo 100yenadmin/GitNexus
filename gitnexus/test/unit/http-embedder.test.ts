@@ -90,7 +90,7 @@ describe('HTTP embedding backend', () => {
 
     it('refuses leading or trailing whitespace before provider hashing', () => {
       for (const endpoint of [' https://example.com/v1', 'https://example.com/v1 ']) {
-        expect(() => httpEmbeddingProvider(endpoint)).toThrow(/leading or trailing whitespace/i);
+        expect(() => httpEmbeddingProvider(endpoint)).toThrow(/surrounding whitespace/i);
       }
     });
 

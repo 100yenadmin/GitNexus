@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -27,8 +27,17 @@ const result = (recoveredPromotionOnly?: boolean, alreadyUpToDate?: boolean): An
   ftsRepairedOnly: undefined,
   ftsSkipped: undefined,
 });
-const virtualStoragePath = path.resolve('/virtual/demo', '.gitnexus');
-const virtualRootLockKey = canonicalRepoRootLockKey('/virtual/demo');
+const virtualRepoPath = path.join(os.tmpdir(), `gitnexus-analyze-launch-${process.pid}`);
+const virtualStoragePath = path.resolve(virtualRepoPath, '.gitnexus');
+const virtualRootLockKey = canonicalRepoRootLockKey(virtualRepoPath);
+
+beforeAll(async () => {
+  await fs.mkdir(virtualRepoPath, { recursive: true });
+});
+
+afterAll(async () => {
+  await fs.rm(virtualRepoPath, { recursive: true, force: true });
+});
 
 type Listener = (...args: unknown[]) => void;
 
@@ -177,7 +186,7 @@ describe('analyze worker shared lock ownership', () => {
     const releaseRepoLock = vi.fn();
     const deps = launchDeps(manager, releaseRepoLock);
 
-    createLaunchAnalysisWorker(deps)(job, '/virtual/demo', {});
+    createLaunchAnalysisWorker(deps)(job, virtualRepoPath, {});
     await waitForWorkerStart();
     await vi.waitFor(() => expect(child.child.send).toHaveBeenCalled());
 
@@ -201,7 +210,7 @@ describe('analyze worker shared lock ownership', () => {
     const releaseRepoLock = vi.fn();
     const deps = launchDeps(manager, releaseRepoLock);
 
-    createLaunchAnalysisWorker(deps)(job, '/virtual/demo', {});
+    createLaunchAnalysisWorker(deps)(job, virtualRepoPath, {});
     await waitForWorkerStart();
     child.emit('message', { type: 'complete', result: result(undefined, true) });
     child.emit('close', 0);
@@ -225,7 +234,7 @@ describe('analyze worker shared lock ownership', () => {
     deps.closeDbHandle = vi.fn(() => closeGate);
     const launch = createLaunchAnalysisWorker(deps);
 
-    launch(job, '/virtual/demo', {});
+    launch(job, virtualRepoPath, {});
     await waitForWorkerStart();
     child.emit('message', { type: 'complete', result: result(true) });
     child.emit('error', new Error('late error'));
@@ -251,7 +260,7 @@ describe('analyze worker shared lock ownership', () => {
     });
     deps.ownershipRelease.mockImplementationOnce(() => ownershipReleaseGate);
 
-    createLaunchAnalysisWorker(deps)(job, '/virtual/demo', {});
+    createLaunchAnalysisWorker(deps)(job, virtualRepoPath, {});
     await waitForWorkerStart();
     child.emit('message', { type: 'complete', result: result(true) });
     child.emit('close', 0);
@@ -360,7 +369,7 @@ describe('analyze worker shared lock ownership', () => {
     const releaseRepoLock = vi.fn();
     const launch = createLaunchAnalysisWorker(launchDeps(manager, releaseRepoLock));
 
-    launch(job, '/virtual/demo', {});
+    launch(job, virtualRepoPath, {});
     await waitForWorkerStart();
     job.cancellationReason = 'Cancelled by user';
     child.emit('message', { type: 'error', message: 'cancelled' });
@@ -381,7 +390,7 @@ describe('analyze worker shared lock ownership', () => {
     const deps = launchDeps(manager, releaseRepoLock);
     deps.ownershipRelease.mockRejectedValueOnce(new Error('release refused'));
 
-    createLaunchAnalysisWorker(deps)(job, '/virtual/demo', {});
+    createLaunchAnalysisWorker(deps)(job, virtualRepoPath, {});
     await waitForWorkerStart();
     job.cancellationReason = 'Cancelled by user';
     child.emit('close', 0);
@@ -412,7 +421,7 @@ describe('analyze worker shared lock ownership', () => {
         }),
     );
 
-    createLaunchAnalysisWorker(deps)(job, '/virtual/demo', {});
+    createLaunchAnalysisWorker(deps)(job, virtualRepoPath, {});
     await vi.waitFor(() => expect(deps.acquireAnalyzeOwnership).toHaveBeenCalledOnce());
     job.cancellationReason = 'Cancelled by user';
     admitOwnership();
@@ -431,7 +440,7 @@ describe('analyze worker shared lock ownership', () => {
     const releaseRepoLock = vi.fn();
     const launch = createLaunchAnalysisWorker(launchDeps(manager, releaseRepoLock));
 
-    launch(job, '/virtual/demo', {});
+    launch(job, virtualRepoPath, {});
     await waitForWorkerStart();
     child.emit('message', { type: 'error', message: 'worker failed' });
     expect(job.status).toBe('analyzing');
@@ -623,7 +632,7 @@ describe('analyze worker shared lock ownership', () => {
     const releaseRepoLock = vi.fn();
     const launch = createLaunchAnalysisWorker(launchDeps(manager, releaseRepoLock));
 
-    launch(job, '/virtual/demo', {});
+    launch(job, virtualRepoPath, {});
     await waitForWorkerStart();
     child.emit('error', new Error('ipc failed'));
 
@@ -657,7 +666,7 @@ describe('analyze worker shared lock ownership', () => {
     });
     const launch = createLaunchAnalysisWorker(launchDeps(manager, releaseRepoLock));
 
-    launch(job, '/virtual/demo', {});
+    launch(job, virtualRepoPath, {});
 
     if (_label === 'send') {
       await waitForWorkerStart();
@@ -687,7 +696,7 @@ describe('analyze worker shared lock ownership', () => {
       const releaseRepoLock = vi.fn();
       const launch = createLaunchAnalysisWorker(launchDeps(manager, releaseRepoLock));
 
-      launch(job, '/virtual/demo', {});
+      launch(job, virtualRepoPath, {});
       await waitForWorkerStart();
       first.emit('close', 1);
       vi.advanceTimersByTime(1000);
