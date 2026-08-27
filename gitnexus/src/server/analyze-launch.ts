@@ -30,6 +30,8 @@ import type { AnalyzeResultIpc } from './analyze-worker-ipc.js';
 const _require = createRequire(import.meta.url);
 
 export interface AnalyzeOwnershipLease {
+  /** Add the exact re-frozen physical storage boundary while retaining companion ownership. */
+  acquireStorage(storagePath: string): Promise<void>;
   release(): Promise<void>;
   /** Attach the forked worker before sending its start command. */
   attachWorker?: (workerPid: number) => Promise<void>;
@@ -334,9 +336,10 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
           // prove this job's write and would wait the full timeout. The worker
           // has already completed the journal transaction; evict/reload now,
           // then fail the analyze request with explicit retry guidance.
-          const settle = msg.result.recoveredPromotionOnly
-            ? Promise.resolve()
-            : waitForSettledIndex(analyzeStorageLockKey, jobStartMs);
+          const settle =
+            msg.result.recoveredPromotionOnly || msg.result.alreadyUpToDate
+              ? Promise.resolve()
+              : waitForSettledIndex(analyzeStorageLockKey, jobStartMs);
           finishTerminalCleanup(
             settle
               .then(() => closeDbHandle())
@@ -530,6 +533,7 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
         // its physical identity only after admission and carry that one target
         // through the local lock, worker, finalization, and release paths.
         analyzeStorageLockKey = canonicalRepoLockKey(lockedRepoPath);
+        await ownershipLease.acquireStorage(analyzeStorageLockKey);
         const storageLockErr = acquireRepoLock(analyzeStorageLockKey);
         if (storageLockErr) throw new Error(storageLockErr);
         storageLockHeld = true;

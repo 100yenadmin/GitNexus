@@ -28,6 +28,9 @@ describe('Ladybug writable ownership admission', () => {
     const lease = await acquireLbugOwnership(storagePath, repoRoot);
     await expect(fs.access(storagePath)).rejects.toMatchObject({ code: 'ENOENT' });
 
+    await fs.mkdir(storagePath);
+    await lease.acquireStorage(storagePath);
+    await expect(fs.access(path.join(storagePath, 'analyze-staged.lock'))).resolves.toBeUndefined();
     await lease.attachWorker(process.pid);
 
     await expect(
@@ -36,7 +39,9 @@ describe('Ladybug writable ownership admission', () => {
 
     await lease.release();
     await lease.release();
-    await expect(fs.access(storagePath)).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(fs.access(path.join(storagePath, 'analyze-staged.lock'))).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
 
     await expect(
       withAnalyzeOwnershipLock(storagePath, async () => 'released', { repoRoot }),
