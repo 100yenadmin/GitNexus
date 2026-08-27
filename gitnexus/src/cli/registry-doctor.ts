@@ -368,12 +368,12 @@ export const probeRegistryDatabaseCounts: RegistryDatabaseProbe = async (lbugPat
     if (embeddingTablePresent) {
       try {
         embeddingDimensions = await adapter.getStoredEmbeddingDimensions();
-        report = await adapter.inspectEmbeddingIntegrity(embeddingDimensions);
+        report = await adapter.inspectEmbeddingIntegrity(embeddingDimensions, true);
       } catch (error) {
         if (!isLegacyMissingChunkIndexError(error)) throw error;
       }
     } else {
-      report = await adapter.inspectEmbeddingIntegrity();
+      report = await adapter.inspectEmbeddingIntegrity(undefined, true);
     }
     const malformed =
       report &&
@@ -640,15 +640,20 @@ const inspectEntry = async (
           checkpoint.physicalRows,
           checkpoint.validRows,
           checkpoint.recoverableIdentitySha256,
+          checkpoint.physicalRowsSha256,
         ];
         const hasCheckpointIdentity = checkpointIdentity.some((value) => value !== undefined);
+        const terminalCheckpoint = checkpoint.nodesProcessed === checkpoint.totalNodes;
         const completeCheckpointIdentity =
           Number.isSafeInteger(checkpoint.physicalRows) &&
           checkpoint.physicalRows >= 0 &&
           Number.isSafeInteger(checkpoint.validRows) &&
           checkpoint.validRows >= 0 &&
           typeof checkpoint.recoverableIdentitySha256 === 'string' &&
-          /^[a-f0-9]{64}$/.test(checkpoint.recoverableIdentitySha256);
+          /^[a-f0-9]{64}$/.test(checkpoint.recoverableIdentitySha256) &&
+          (!terminalCheckpoint || typeof checkpoint.physicalRowsSha256 === 'string') &&
+          (checkpoint.physicalRowsSha256 === undefined ||
+            /^[a-f0-9]{64}$/.test(checkpoint.physicalRowsSha256));
         const scannedIdentity =
           integrity.status !== 'unavailable' && 'physicalRows' in integrity ? integrity : null;
         const checkpointMismatch =
@@ -659,7 +664,9 @@ const inspectEntry = async (
             (scannedIdentity !== null &&
               (checkpoint.validRows !== scannedIdentity.validRows ||
                 checkpoint.recoverableIdentitySha256 !==
-                  scannedIdentity.recoverableIdentitySha256)));
+                  scannedIdentity.recoverableIdentitySha256 ||
+                (checkpoint.physicalRowsSha256 !== undefined &&
+                  checkpoint.physicalRowsSha256 !== scannedIdentity.physicalRowsSha256))));
         const dimensionMismatch =
           embeddingDimensions !== undefined && checkpoint.dimensions !== embeddingDimensions;
         const completedCheckpoint =

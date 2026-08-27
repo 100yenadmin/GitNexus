@@ -2365,9 +2365,10 @@ describe('POST /api/embed completed-checkpoint identity', () => {
       physicalRows: 3,
       validRows: 3,
       recoverableIdentitySha256: LIVE_DIGEST,
-      physicalRowsSha256: LIVE_DIGEST,
       pendingNodeIds: [],
     });
+    expect(persisted?.physicalRowsSha256).toBeUndefined();
+    expect(state.inspectEmbeddingIntegrity).toHaveBeenCalledWith(undefined, false);
     expect(state.currentMeta.stats).toEqual({ nodes: 4, edges: 5, embeddings: 0 });
 
     expect((await runEmbedJob(baseUrl, REPO.name)).status).toBe('complete');
@@ -2385,6 +2386,33 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     );
     expect(state.currentMeta.stats).toEqual({ nodes: 4, edges: 5, embeddings: 3 });
     expect(state.currentMeta.embeddingCheckpoint).toBeUndefined();
+  });
+
+  it('persists physical identity only for the terminal checkpoint window', async () => {
+    state.currentMeta = makeMeta(LIVE_DIGEST);
+    state.liveIntegrity = makeIntegrity(LIVE_DIGEST, 3);
+    state.runEmbeddingPipeline.mockImplementationOnce(async (...args: unknown[]) => {
+      const options = args[6] as {
+        onCheckpoint: (checkpoint: {
+          nodesProcessed: number;
+          totalNodes: number;
+          chunksProcessed: number;
+        }) => Promise<void>;
+      };
+      await options.onCheckpoint({ nodesProcessed: 4, totalNodes: 4, chunksProcessed: 5 });
+    });
+
+    expect((await runEmbedJob(baseUrl, REPO.name)).status).toBe('complete');
+
+    const savedCheckpoint = state.saveMeta.mock.calls
+      .map(([, meta]) => meta.embeddingCheckpoint)
+      .find((checkpoint) => checkpoint?.nodesProcessed === 4);
+    expect(savedCheckpoint).toMatchObject({
+      nodesProcessed: 4,
+      totalNodes: 4,
+      physicalRowsSha256: LIVE_DIGEST,
+    });
+    expect(state.inspectEmbeddingIntegrity).toHaveBeenCalledWith(undefined, true);
   });
 
   it.each([

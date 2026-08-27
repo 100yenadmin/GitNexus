@@ -381,7 +381,7 @@ export const batchInsertEmbeddings = async (
  * dynamic import only (lazy-embeddings convention, #2370).
  */
 export const buildVectorIndex = async (): Promise<boolean> => {
-  const integrity = await inspectEmbeddingIntegrity();
+  const integrity = await inspectEmbeddingIntegrity(undefined, true);
   if (embeddingIntegrityFailures(integrity) > 0 || integrity.physicalRows !== integrity.validRows) {
     throw new Error(
       `Vector index creation refused malformed embedding rows ` +

@@ -224,6 +224,7 @@ withTestLbugDB(
       const vi = d.embeddingPhysicalVectorInfo;
       const nonfinite = new Array(EMBEDDING_DIMS).fill(0.5);
       nonfinite[0] = Infinity;
+      expect((await adapter.inspectEmbeddingIntegrity()).physicalRowsSha256).toBe('');
       const base = await read();
       await adapter.executeWithReusedStatement(
         'MATCH (e:CodeEmbedding) WHERE e.id = $id SET e.contentHash = $hash',

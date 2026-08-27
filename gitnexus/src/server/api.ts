@@ -2511,7 +2511,10 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                   priorCheckpoint.recoverableIdentitySha256 !== undefined ||
                   priorCheckpoint.physicalRowsSha256 !== undefined
                 ) {
-                  const integrity = await inspectEmbeddingIntegrity();
+                  const integrity = await inspectEmbeddingIntegrity(
+                    undefined,
+                    priorCheckpoint.physicalRowsSha256 !== undefined,
+                  );
                   assertCompletedCheckpointIdentity(
                     priorCheckpoint,
                     integrity,
@@ -2547,7 +2550,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                     physicalRows: integrity?.physicalRows,
                     validRows: integrity?.validRows,
                     recoverableIdentitySha256: integrity?.recoverableIdentitySha256,
-                    physicalRowsSha256: integrity?.physicalRowsSha256,
+                    physicalRowsSha256: integrity?.physicalRowsSha256 || undefined,
                   },
                 };
                 await commitEmbedMetadata(barrier, 'COMMITTING_CHECKPOINT', () =>
@@ -2596,7 +2599,10 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                   },
                   onCheckpoint: async (checkpoint) => {
                     await flushWAL();
-                    const integrity = await inspectEmbeddingIntegrity();
+                    const integrity = await inspectEmbeddingIntegrity(
+                      undefined,
+                      checkpoint.nodesProcessed === checkpoint.totalNodes,
+                    );
                     if (
                       embeddingIntegrityFailures(integrity) > 0 ||
                       integrity.physicalRows !== integrity.validRows
@@ -2613,7 +2619,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
               // handles this during process exit, but the server keeps the
               // connection open for other routes — a CHECKPOINT is enough.
               await flushWAL();
-              const terminalIntegrity = await inspectEmbeddingIntegrity();
+              const terminalIntegrity = await inspectEmbeddingIntegrity(undefined, true);
               if (
                 embeddingIntegrityFailures(terminalIntegrity) > 0 ||
                 terminalIntegrity.physicalRows !== terminalIntegrity.validRows

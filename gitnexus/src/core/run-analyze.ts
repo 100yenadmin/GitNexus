@@ -1031,7 +1031,10 @@ const runFullAnalysisImpl = async (
       readOnlyPreflight = {
         stats: await getLbugStats(),
         embeddingCount,
-        integrity: await inspectEmbeddingIntegrity(),
+        integrity: await inspectEmbeddingIntegrity(
+          undefined,
+          existingMeta.embeddingCheckpoint?.physicalRowsSha256 !== undefined,
+        ),
       };
     } finally {
       await closeLbug().catch(() => {});
@@ -1865,9 +1868,12 @@ const runFullAnalysisImpl = async (
     ].some((value) => value !== undefined)
   ) {
     try {
-      const completedIntegrity = await withLbugDb(lbugPath, inspectEmbeddingIntegrity, {
-        readOnly: true,
-      });
+      const completedIntegrity = await withLbugDb(
+        lbugPath,
+        () =>
+          inspectEmbeddingIntegrity(undefined, checkpointToVerify.physicalRowsSha256 !== undefined),
+        { readOnly: true },
+      );
       assertCompletedCheckpointIdentity(
         checkpointToVerify,
         completedIntegrity,
@@ -3233,7 +3239,7 @@ const runFullAnalysisImpl = async (
             physicalRows: integrity?.physicalRows,
             validRows: integrity?.validRows,
             recoverableIdentitySha256: integrity?.recoverableIdentitySha256,
-            physicalRowsSha256: integrity?.physicalRowsSha256,
+            physicalRowsSha256: integrity?.physicalRowsSha256 || undefined,
           },
           pdg: resolvePdgConfig(options),
         });
@@ -3273,7 +3279,10 @@ const runFullAnalysisImpl = async (
           },
           onCheckpoint: async (checkpoint) => {
             await checkpointOnce();
-            const integrity = await inspectEmbeddingIntegrity();
+            const integrity = await inspectEmbeddingIntegrity(
+              undefined,
+              checkpoint.nodesProcessed === checkpoint.totalNodes,
+            );
             assertEmbeddingIntegrity(integrity, 'Completed embedding checkpoint');
             await saveEmbeddingCheckpoint(checkpoint, [], integrity.validRows, integrity);
           },
@@ -3294,7 +3303,7 @@ const runFullAnalysisImpl = async (
     progress('done', 98, 'Saving metadata...');
 
     // Finalization, metadata, and registration trust only canonical live rows.
-    const terminalIntegrity = await inspectEmbeddingIntegrity();
+    const terminalIntegrity = await inspectEmbeddingIntegrity(undefined, true);
     assertEmbeddingIntegrity(terminalIntegrity, 'Terminal embedding finalization');
     const embeddingCount = terminalIntegrity.validRows;
 

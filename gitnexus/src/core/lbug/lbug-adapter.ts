@@ -2361,7 +2361,7 @@ export const scanEmbeddingPreservationRows = async (
  */
 export const inspectEmbeddingIntegrity = async (
   expectedDimensions: number = EMBEDDING_DIMS,
-  fullDigest = true,
+  fullDigest = false,
 ): Promise<EmbeddingIntegrityReport> => {
   const c = conn;
   if (!c) throw new Error('LadybugDB not initialized. Call initLbug first.');
