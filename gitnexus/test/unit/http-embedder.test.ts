@@ -88,6 +88,12 @@ describe('HTTP embedding backend', () => {
       }
     });
 
+    it('refuses leading or trailing whitespace before provider hashing', () => {
+      for (const endpoint of [' https://example.com/v1', 'https://example.com/v1 ']) {
+        expect(() => httpEmbeddingProvider(endpoint)).toThrow(/surrounding whitespace/i);
+      }
+    });
+
     it('refuses query-bearing and malformed endpoints before provider use', () => {
       expect(() => httpEmbeddingProvider('https://example.com/v1?deployment=secret')).toThrow(
         /query routing is unverifiable/i,

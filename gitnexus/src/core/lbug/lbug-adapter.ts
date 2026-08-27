@@ -7,7 +7,7 @@ import path from 'path';
 import lbug from '@ladybugdb/core';
 import { closeQueryResults } from './query-result-utils.js';
 import { escapeCypherString } from './cypher-escape.js';
-import { isMissingColumnOrTableError } from './schema-errors.js';
+import { isExpectedMissingTableError, isMissingColumnOrTableError } from './schema-errors.js';
 import { withConnLock } from './conn-lock.js';
 import { isWalDriverActive } from './wal-driver-state.js';
 import { KnowledgeGraph } from '../graph/types.js';
@@ -35,6 +35,7 @@ import {
   embeddingIdentitySetDigest,
   embeddingSemanticIdentity,
 } from '../embeddings/identity-digest.js';
+import type { AnalyzeStorageOwnershipToken } from '../staged-promotion.js';
 import { extensionManager, type ExtensionEnsureOptions } from './extension-loader.js';
 import {
   classifyDeleteAllError,
@@ -746,8 +747,16 @@ export const initLbugForMaintenance = async (dbPath: string) =>
  * an init lock, or opens the database writable. Callers must close the shared
  * handle with {@link closeLbug} when their bounded read is complete.
  */
-export const initLbugReadOnlyNonRecovering = async (dbPath: string) =>
-  runWithSessionLock(async () => {
+async function runLbugReadOnlyNonRecovering(dbPath: string): Promise<LbugConnectionHandle>;
+async function runLbugReadOnlyNonRecovering<T>(
+  dbPath: string,
+  operation: () => Promise<T>,
+): Promise<T>;
+async function runLbugReadOnlyNonRecovering<T>(
+  dbPath: string,
+  operation?: () => Promise<T>,
+): Promise<LbugConnectionHandle | T> {
+  return runWithSessionLock(async () => {
     if (conn || db) await safeClose();
     resetOpenConnectionState();
 
@@ -783,8 +792,161 @@ export const initLbugReadOnlyNonRecovering = async (dbPath: string) =>
     conn = opened.conn;
     currentDbPath = dbPath;
     currentDbReadOnly = true;
-    return { db, conn };
+    if (!operation) return opened;
+    try {
+      return await operation();
+    } finally {
+      await safeClose().finally(resetOpenConnectionState);
+    }
   });
+}
+
+export const initLbugReadOnlyNonRecovering = (dbPath: string) =>
+  runLbugReadOnlyNonRecovering(dbPath);
+
+export const withLbugReadOnlyNonRecovering = async <T>(
+  dbPath: string,
+  operation: () => Promise<T>,
+): Promise<T> => runLbugReadOnlyNonRecovering(dbPath, operation);
+
+export interface LbugOwnershipLease {
+  /** Acquire the exact re-frozen physical storage boundary while retaining the companion lease. */
+  acquireStorage(storagePath: string): Promise<void>;
+  release(): Promise<void>;
+  /** Attach a forked analyzer generation before it receives its start IPC. */
+  attachWorker(workerPid: number): Promise<void>;
+}
+
+export const acquireLbugOwnership = async (
+  storagePath: string,
+  repoRoot: string,
+): Promise<LbugOwnershipLease> => {
+  let releaseGate!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    releaseGate = resolve;
+  });
+  let markEntered!: () => void;
+  let markFailed!: (reason?: unknown) => void;
+  const entered = new Promise<void>((resolve, reject) => {
+    markEntered = resolve;
+    markFailed = reject;
+  });
+  const { analyzeStorageOwnershipIsHeld, withAnalyzeOwnershipLock } =
+    await import('../staged-promotion.js');
+  const { attachAnalyzeOwnershipWorker } = await import('../staged-promotion.js');
+  let initialStorageOwnership: AnalyzeStorageOwnershipToken | undefined;
+  const ownership = withAnalyzeOwnershipLock(
+    storagePath,
+    async () => {
+      markEntered();
+      await gate;
+    },
+    {
+      repoRoot,
+      createStoragePath: false,
+      onStorageOwnershipAcquired: (token) => {
+        initialStorageOwnership = token;
+      },
+    },
+  );
+  void ownership.catch(markFailed);
+  await entered;
+  let released = false;
+  let frozenStoragePath: string | undefined;
+  let frozenStorageOwnership: AnalyzeStorageOwnershipToken | undefined;
+  let storageOwnership: Promise<void> | undefined;
+  let releaseStorageGate: (() => void) | undefined;
+  return {
+    acquireStorage: async (nextStoragePath: string) => {
+      if (released) throw new Error('Analyze ownership was released before storage acquisition');
+      const resolvedStoragePath = path.resolve(nextStoragePath);
+      if (
+        initialStorageOwnership &&
+        analyzeStorageOwnershipIsHeld(resolvedStoragePath, initialStorageOwnership)
+      ) {
+        frozenStoragePath = resolvedStoragePath;
+        frozenStorageOwnership = initialStorageOwnership;
+        return;
+      }
+      if (storageOwnership) {
+        if (frozenStoragePath === resolvedStoragePath) return;
+        throw new Error('Analyze storage ownership is already frozen to a different target');
+      }
+      frozenStoragePath = resolvedStoragePath;
+      let markStorageEntered!: () => void;
+      let markStorageFailed!: (reason?: unknown) => void;
+      const storageEntered = new Promise<void>((resolve, reject) => {
+        markStorageEntered = resolve;
+        markStorageFailed = reject;
+      });
+      const storageGate = new Promise<void>((resolve) => {
+        releaseStorageGate = resolve;
+      });
+      let acquiredStorageOwnership: AnalyzeStorageOwnershipToken | undefined;
+      storageOwnership = withAnalyzeOwnershipLock(
+        resolvedStoragePath,
+        async () => {
+          markStorageEntered();
+          await storageGate;
+        },
+        {
+          createStoragePath: false,
+          onStorageOwnershipAcquired: (token) => {
+            acquiredStorageOwnership = token;
+          },
+        },
+      );
+      void storageOwnership.catch(markStorageFailed);
+      try {
+        await storageEntered;
+        if (!acquiredStorageOwnership) {
+          throw new Error(
+            `Analyze storage path does not exist or disappeared before ownership: ${resolvedStoragePath}`,
+          );
+        }
+        frozenStorageOwnership = acquiredStorageOwnership;
+      } catch (error) {
+        releaseStorageGate?.();
+        await storageOwnership.catch(() => undefined);
+        storageOwnership = undefined;
+        releaseStorageGate = undefined;
+        frozenStoragePath = undefined;
+        frozenStorageOwnership = undefined;
+        throw error;
+      }
+    },
+    attachWorker: async (workerPid: number) => {
+      if (released) throw new Error('Analyze ownership was released before worker attachment');
+      const attachedStoragePath = frozenStoragePath ?? path.resolve(storagePath);
+      const attachedStorageOwnership = frozenStorageOwnership ?? initialStorageOwnership;
+      if (
+        !attachedStorageOwnership ||
+        !analyzeStorageOwnershipIsHeld(attachedStoragePath, attachedStorageOwnership)
+      ) {
+        throw new Error('Analyze storage ownership must be acquired before worker attachment');
+      }
+      await attachAnalyzeOwnershipWorker(
+        attachedStoragePath,
+        repoRoot,
+        workerPid,
+        attachedStorageOwnership,
+      );
+    },
+    release: async () => {
+      if (!released) {
+        released = true;
+        releaseStorageGate?.();
+        releaseGate();
+      }
+      const failures: unknown[] = [];
+      if (storageOwnership) await storageOwnership.catch((error) => failures.push(error));
+      await ownership.catch((error) => failures.push(error));
+      if (failures.length === 1) throw failures[0];
+      if (failures.length > 1)
+        throw new AggregateError(failures, 'Analyze ownership release failed');
+    },
+  };
+};
 
 /**
  * Execute multiple queries against one repo DB atomically.
@@ -797,8 +959,20 @@ export const initLbugReadOnlyNonRecovering = async (dbPath: string) =>
 export const withLbugDb = async <T>(
   dbPath: string,
   operation: () => Promise<T>,
-  options: { readOnly?: boolean } = {},
+  options: {
+    readOnly?: boolean;
+    ownershipStoragePath?: string;
+    ownershipRepoRoot?: string;
+  } = {},
 ): Promise<T> => {
+  if (options.ownershipStoragePath) {
+    const { withAnalyzeOwnershipLock } = await import('../staged-promotion.js');
+    return withAnalyzeOwnershipLock(
+      options.ownershipStoragePath,
+      () => withLbugDb(dbPath, operation, { readOnly: options.readOnly }),
+      { repoRoot: options.ownershipRepoRoot },
+    );
+  }
   let lastError: unknown;
   const readOnly = options.readOnly === true;
   for (let attempt = 1; attempt <= DB_LOCK_RETRY_ATTEMPTS; attempt++) {
@@ -1797,6 +1971,61 @@ export const getLbugStats = async (): Promise<{ nodes: number; edges: number }> 
   }
 
   return { nodes: totalNodes, edges: totalEdges };
+};
+
+type StrictCountRow = { cnt?: unknown; 0?: unknown };
+type StrictCountQuery = (cypher: string) => Promise<StrictCountRow[]>;
+
+const queryStrictCount = async (
+  tableName: string,
+  cypher: string,
+  runQuery: StrictCountQuery,
+): Promise<number> => {
+  try {
+    const rows = await runQuery(cypher);
+    const row = rows.length === 1 ? rows[0] : undefined;
+    const rawCount = row?.cnt ?? row?.[0];
+    if (typeof rawCount !== 'number' && typeof rawCount !== 'bigint') {
+      throw new Error(`Invalid graph count returned for ${tableName}`);
+    }
+    const count = Number(rawCount);
+    if (!Number.isSafeInteger(count) || count < 0) {
+      throw new Error(`Invalid graph count returned for ${tableName}`);
+    }
+    return count;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (isExpectedMissingTableError(message, tableName)) return 0;
+    throw error;
+  }
+};
+
+/** Fail-closed graph counts for the /api/embed zero-checkpoint commit path. */
+export const getStrictLbugStats = async (
+  queryOverride?: StrictCountQuery,
+): Promise<{ nodes: number; edges: number }> => {
+  let runQuery = queryOverride;
+  if (!runQuery) {
+    const c = conn;
+    if (!c) throw new Error('LadybugDB not initialized. Call initLbug first.');
+    runQuery = (cypher: string) => withConnLock(async () => readQueryRows(await c.query(cypher)));
+  }
+
+  let nodes = 0;
+  for (const tableName of NODE_TABLES) {
+    nodes += await queryStrictCount(
+      tableName,
+      `MATCH (n:${escapeTableName(tableName)}) RETURN count(n) AS cnt`,
+      runQuery,
+    );
+    if (!Number.isSafeInteger(nodes)) throw new Error('Invalid total graph node count');
+  }
+  const edges = await queryStrictCount(
+    REL_TABLE_NAME,
+    `MATCH ()-[r:${REL_TABLE_NAME}]->() RETURN count(r) AS cnt`,
+    runQuery,
+  );
+  return { nodes, edges };
 };
 
 /**

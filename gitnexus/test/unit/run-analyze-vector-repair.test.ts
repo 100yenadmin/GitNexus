@@ -58,6 +58,7 @@ const completedCheckpoint = {
   nodesProcessed: 5,
   totalNodes: 5,
   chunksProcessed: 6,
+  provider: 'local',
   model: 'Snowflake/snowflake-arctic-embed-xs',
   dimensions: 384,
 } as const;
@@ -87,6 +88,7 @@ async function importRepairSubject(options: {
   missingEmbeddingTable?: boolean;
   malformedEmbeddingTable?: boolean;
   identityDigest?: string;
+  registered?: boolean;
   afterInitialPreflight?: () => Promise<void> | void;
 }) {
   const counts = [...(options.counts ?? [3, 3, 3, 3])];
@@ -129,11 +131,13 @@ async function importRepairSubject(options: {
     orphanRows: 0,
     wrongDimensionRows: 0,
     recoverableIdentitySha256: options.identityDigest ?? 'a'.repeat(64),
+    physicalRowsSha256: options.identityDigest ?? 'a'.repeat(64),
   }));
   const withLbugDb = vi.fn(async (_dbPath: string, operation: () => Promise<unknown>) =>
     operation(),
   );
   const registerRepo = vi.fn(async () => 'fixture-repo');
+  const isRepoRegistered = vi.fn(async () => options.registered ?? true);
   const probeDoctorPool = vi.fn(async () => probes.shift() ?? healthyProbe);
   vi.doMock('../../src/core/lbug/lbug-adapter.js', async (importActual) => ({
     ...(await importActual<typeof import('../../src/core/lbug/lbug-adapter.js')>()),
@@ -171,6 +175,7 @@ async function importRepairSubject(options: {
   vi.doMock('../../src/storage/repo-manager.js', async (importActual) => ({
     ...(await importActual<typeof import('../../src/storage/repo-manager.js')>()),
     registerRepo,
+    isRepoRegistered,
   }));
 
   const subject = await import('../../src/core/run-analyze.js');
@@ -187,6 +192,7 @@ async function importRepairSubject(options: {
       inspectEmbeddingIntegrity,
       withLbugDb,
       registerRepo,
+      isRepoRegistered,
       probeDoctorPool,
     },
   };
@@ -534,6 +540,7 @@ describe('runFullAnalysis VECTOR-only repair (#170)', () => {
         physicalRows: 3,
         validRows: 3,
         recoverableIdentitySha256: 'a'.repeat(64),
+        physicalRowsSha256: 'a'.repeat(64),
       },
     });
     try {
@@ -555,6 +562,7 @@ describe('runFullAnalysis VECTOR-only repair (#170)', () => {
         physicalRows: 3,
         validRows: 3,
         recoverableIdentitySha256: 'b'.repeat(64),
+        physicalRowsSha256: 'b'.repeat(64),
       },
     });
     try {
@@ -581,7 +589,7 @@ describe('runFullAnalysis VECTOR-only repair (#170)', () => {
       const { runFullAnalysis, mocks } = await importRepairSubject({});
       await expect(
         runFullAnalysis(indexed.fixture.dbPath, { repairVector: true }, { onProgress: () => {} }),
-      ).rejects.toThrow(/records legacy \/ voyage-code-3 at 384 dimensions/i);
+      ).rejects.toThrow(/records local \/ voyage-code-3 at 384 dimensions/i);
       expect(mocks.initLbugForMaintenance).not.toHaveBeenCalled();
 
       const untouched = JSON.parse(
@@ -617,17 +625,19 @@ describe('runFullAnalysis VECTOR-only repair (#170)', () => {
     }
   });
 
-  it('clears a completed zero-node checkpoint on the not-indexed path (empty repository)', async () => {
+  it('clears a completed zero-node checkpoint and resets stats on the not-indexed path', async () => {
     const restoreEnv = pinDefaultEmbeddingIdentity();
     // An empty repository's embed run completed trivially (totalNodes 0) and
     // crashed before finalize. Repair must report not-indexed AND clear the
     // checkpoint, or the repo stays permanently marked as interrupted.
-    const indexed = await createIndexedFixture(0, {
+    const indexed = await createIndexedFixture(5, {
+      stats: { files: 2, nodes: 1, edges: 2, embeddings: 5 },
       embeddingCheckpoint: {
         ...completedCheckpoint,
         nodesProcessed: 0,
         totalNodes: 0,
         chunksProcessed: 0,
+        provider: undefined,
       },
     });
     try {
@@ -639,13 +649,113 @@ describe('runFullAnalysis VECTOR-only repair (#170)', () => {
       );
 
       expect(result.vectorRepairStatus).toBe('not-indexed');
+      expect(result.repoName).toBe('fixture-repo');
       expect(mocks.initLbugForMaintenance).not.toHaveBeenCalled();
+      expect(mocks.registerRepo).toHaveBeenCalledOnce();
+      expect(mocks.registerRepo.mock.calls[0]?.[1]).toMatchObject({
+        stats: { nodes: 5, edges: 4, embeddings: 0 },
+        embeddingCheckpoint: undefined,
+        incrementalInProgress: undefined,
+      });
 
       const cleared = JSON.parse(
         await fs.readFile(path.join(indexed.paths.storagePath, 'gitnexus.json'), 'utf8'),
       );
       expect(cleared.embeddingCheckpoint).toBeUndefined();
       expect(cleared.incrementalInProgress).toBeUndefined();
+      expect(cleared.stats.embeddings).toBe(0);
+      expect(cleared.stats.nodes).toBe(5);
+      expect(cleared.stats.edges).toBe(4);
+    } finally {
+      restoreEnv();
+      await indexed.fixture.cleanup();
+    }
+  });
+
+  it('refuses a provider-less zero-node checkpoint that records completed chunks', async () => {
+    const restoreEnv = pinDefaultEmbeddingIdentity();
+    const indexed = await createIndexedFixture(0, {
+      embeddingCheckpoint: {
+        ...completedCheckpoint,
+        nodesProcessed: 0,
+        totalNodes: 0,
+        chunksProcessed: 1,
+        provider: undefined,
+      },
+    });
+    try {
+      const { runFullAnalysis, mocks } = await importRepairSubject({ counts: [0, 0, 0, 0] });
+      await expect(
+        runFullAnalysis(indexed.fixture.dbPath, { repairVector: true }, { onProgress: () => {} }),
+      ).rejects.toThrow(/unknown-provider/i);
+      expect(mocks.initLbugForMaintenance).not.toHaveBeenCalled();
+      const untouched = JSON.parse(
+        await fs.readFile(path.join(indexed.paths.storagePath, 'gitnexus.json'), 'utf8'),
+      );
+      expect(untouched.embeddingCheckpoint).toMatchObject({ chunksProcessed: 1 });
+    } finally {
+      restoreEnv();
+      await indexed.fixture.cleanup();
+    }
+  });
+
+  it('clears an unregistered zero-node checkpoint without first registering the index', async () => {
+    const restoreEnv = pinDefaultEmbeddingIdentity();
+    const indexed = await createIndexedFixture(5, {
+      embeddingCheckpoint: {
+        ...completedCheckpoint,
+        nodesProcessed: 0,
+        totalNodes: 0,
+        chunksProcessed: 0,
+        provider: undefined,
+      },
+    });
+    try {
+      const { runFullAnalysis, mocks } = await importRepairSubject({
+        counts: [0, 0, 0, 0],
+        registered: false,
+      });
+      const result = await runFullAnalysis(
+        indexed.fixture.dbPath,
+        { repairVector: true },
+        { onProgress: () => {} },
+      );
+
+      expect(result.vectorRepairStatus).toBe('not-indexed');
+      expect(mocks.registerRepo).not.toHaveBeenCalled();
+
+      const cleared = JSON.parse(
+        await fs.readFile(path.join(indexed.paths.storagePath, 'gitnexus.json'), 'utf8'),
+      );
+      expect(cleared.embeddingCheckpoint).toBeUndefined();
+      expect(cleared.stats.embeddings).toBe(0);
+    } finally {
+      restoreEnv();
+      await indexed.fixture.cleanup();
+    }
+  });
+
+  it('refuses provider-less durable proof when recorded rows vanished', async () => {
+    const restoreEnv = pinDefaultEmbeddingIdentity();
+    const indexed = await createIndexedFixture(3, {
+      embeddingCheckpoint: {
+        ...completedCheckpoint,
+        nodesProcessed: 0,
+        totalNodes: 0,
+        chunksProcessed: 0,
+        provider: undefined,
+        physicalRows: 3,
+        validRows: 3,
+        recoverableIdentitySha256: 'a'.repeat(64),
+        physicalRowsSha256: 'a'.repeat(64),
+      },
+    });
+    try {
+      const { runFullAnalysis, mocks } = await importRepairSubject({ counts: [0, 0, 0, 0] });
+      await expect(
+        runFullAnalysis(indexed.fixture.dbPath, { repairVector: true }, { onProgress: () => {} }),
+      ).rejects.toThrow(/failed embedding integrity validation/i);
+      expect(mocks.initLbugForMaintenance).not.toHaveBeenCalled();
     } finally {
       restoreEnv();
       await indexed.fixture.cleanup();

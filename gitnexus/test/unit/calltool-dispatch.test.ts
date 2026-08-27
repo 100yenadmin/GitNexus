@@ -4051,6 +4051,85 @@ describe('LocalBackend.resolveRepo branch scope (#2106)', () => {
     }
   });
 
+  it('refuses a flat branch label while branch adoption is incomplete', async () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'gnx-275-incomplete-label-'));
+    const storagePath = path.join(dir, '.gitnexus');
+    mkdirSync(storagePath, { recursive: true });
+    writeFileSync(
+      path.join(storagePath, 'meta.json'),
+      JSON.stringify({
+        repoPath: dir,
+        lastCommit: 'new-generation',
+        indexedAt: 'now',
+        branch: 'main',
+        incrementalInProgress: {
+          startedAt: 1,
+          toWriteCount: 0,
+          phase: 'branch-adoption',
+        },
+      }),
+    );
+    try {
+      vi.mocked(listRegisteredRepos).mockResolvedValue([
+        {
+          name: 'incomplete',
+          path: dir,
+          storagePath,
+          indexedAt: 'now',
+          lastCommit: 'new-generation',
+          branch: 'main',
+        },
+      ]);
+      await backend.init();
+
+      await expect(backend.resolveRepo('incomplete', 'main')).rejects.toThrow(/not indexed/i);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('routes the flat branch during an ordinary embedding checkpoint', async () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'gnx-275-embedding-checkpoint-'));
+    const storagePath = path.join(dir, '.gitnexus');
+    mkdirSync(storagePath, { recursive: true });
+    writeFileSync(
+      path.join(storagePath, 'meta.json'),
+      JSON.stringify({
+        repoPath: dir,
+        lastCommit: 'stable-generation',
+        indexedAt: 'now',
+        branch: 'main',
+        embeddingCheckpoint: {
+          at: 'now',
+          nodesProcessed: 0,
+          totalNodes: 1,
+          chunksProcessed: 0,
+        },
+      }),
+    );
+    try {
+      vi.mocked(listRegisteredRepos).mockResolvedValue([
+        {
+          name: 'checkpointed',
+          path: dir,
+          storagePath,
+          indexedAt: 'stale-cache',
+          lastCommit: 'stale-cache',
+          branch: 'main',
+        },
+      ]);
+      await backend.init();
+
+      await expect(backend.resolveRepo('checkpointed', 'main')).resolves.toMatchObject({
+        lbugPath: path.join(storagePath, 'lbug'),
+        branch: 'main',
+        lastCommit: 'stable-generation',
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('a stale cached label errors instead of serving the flat handle (#2364 F1 arm i)', async () => {
     // Long-lived server cached branch 'main'; a plain analyze on feature/z
     // restamped the flat meta (and the pool reinit will hot-swap content).

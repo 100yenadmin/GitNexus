@@ -30,6 +30,7 @@ vi.mock('../../src/core/lbug/lbug-adapter.js', () => ({
     orphanRows: 0,
     wrongDimensionRows: 0,
     recoverableIdentitySha256: '0'.repeat(64),
+    physicalRowsSha256: '0'.repeat(64),
   })),
   embeddingIntegrityFailures: vi.fn(() => 0),
 }));

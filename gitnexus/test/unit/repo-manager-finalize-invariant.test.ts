@@ -132,6 +132,28 @@ describe('assertAnalysisFinalized (#1169)', () => {
     await expect(assertAnalysisFinalized(variant)).resolves.toBeUndefined();
   });
 
+  it('rejects finalization when the registered storage link retargets after analysis', async () => {
+    const storageA = path.join(tmpHome.dbPath, 'frozen-storage-a');
+    const storageB = path.join(tmpHome.dbPath, 'retargeted-storage-b');
+    await fs.mkdir(storageA);
+    await fs.mkdir(storageB);
+    const storageLink = path.join(tmpRepo.dbPath, '.gitnexus');
+    await fs.symlink(storageA, storageLink, 'dir');
+    const frozenStoragePath = await fs.realpath(storageA);
+    await saveMeta(frozenStoragePath, meta);
+    await registerRepo(tmpRepo.dbPath, meta, {
+      expectedCanonicalStoragePath: frozenStoragePath,
+    });
+
+    await fs.unlink(storageLink);
+    await fs.symlink(storageB, storageLink, 'dir');
+    await saveMeta(storageB, meta);
+
+    await expect(assertAnalysisFinalized(tmpRepo.dbPath, frozenStoragePath)).rejects.toMatchObject({
+      missing: 'registry-entry',
+    });
+  });
+
   // isRepoRegistered backs the analyze up-to-date fast-path gate (#2264): the
   // fast path must NOT short-circuit a repo that is indexed-but-unregistered
   // (e.g. a prior --name collision wrote meta.json then failed before

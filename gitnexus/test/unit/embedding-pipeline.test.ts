@@ -27,6 +27,7 @@ const cleanEmbeddingIntegrityReport = {
   orphanRows: 0,
   wrongDimensionRows: 0,
   recoverableIdentitySha256: '0'.repeat(64),
+  physicalRowsSha256: '0'.repeat(64),
 };
 
 const mockEmbeddingIntegrityAdapter = () => ({
@@ -184,6 +185,53 @@ describe('runEmbeddingPipeline incremental mode', () => {
   it('exports runEmbeddingPipeline as a named export', async () => {
     const mod = await import('../../src/core/embeddings/embedding-pipeline.js');
     expect(typeof mod.runEmbeddingPipeline).toBe('function');
+  });
+
+  it('stops waiting for first-time model initialization when the job is aborted', async () => {
+    vi.resetModules();
+    let initializationStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      initializationStarted = resolve;
+    });
+    const neverFinishes = new Promise<void>(() => {});
+    vi.doMock('../../src/core/embeddings/embedder.js', () => ({
+      initEmbedder: vi.fn(() => {
+        initializationStarted();
+        return neverFinishes;
+      }),
+      embedBatch: vi.fn(),
+      embedText: vi.fn(),
+      embeddingToArray: vi.fn(),
+      isEmbedderReady: vi.fn().mockReturnValue(false),
+    }));
+    vi.doMock('../../src/core/lbug/lbug-adapter.js', () => ({
+      ...mockEmbeddingIntegrityAdapter(),
+      loadVectorExtension: vi.fn().mockResolvedValue(true),
+      createVectorIndex: vi.fn(),
+      dropVectorIndex: vi.fn(),
+    }));
+
+    const executeQuery = vi.fn();
+    const controller = new AbortController();
+    const { runEmbeddingPipeline } =
+      await import('../../src/core/embeddings/embedding-pipeline.js');
+    const pipeline = runEmbeddingPipeline(
+      executeQuery,
+      vi.fn(),
+      vi.fn(),
+      {},
+      undefined,
+      undefined,
+      {
+        signal: controller.signal,
+      },
+    );
+
+    await started;
+    controller.abort();
+
+    await expect(pipeline).rejects.toMatchObject({ name: 'AbortError' });
+    expect(executeQuery).not.toHaveBeenCalled();
   });
 });
 
