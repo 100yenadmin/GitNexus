@@ -66,6 +66,7 @@ import { quarantineSidecarsForDirtyRecovery } from './lbug/sidecar-recovery.js';
 import {
   getStoragePaths,
   resolveBranchPlacement,
+  branchSlug,
   saveMeta,
   loadMeta,
   ensureGitNexusIgnored,
@@ -77,6 +78,8 @@ import {
   cleanupOldKuzuFiles,
   reconcileMetadataFiles,
   isMissingFilesystemError,
+  canonicalizePath,
+  registryPathEquals,
   INDEX_METADATA_FILE,
   INCREMENTAL_SCHEMA_VERSION,
   type RepoMeta,
@@ -177,6 +180,18 @@ export interface AnalyzeCallbacks {
 }
 
 export interface AnalyzeOptions {
+  /**
+   * Internal server-only display path. Filesystem work stays bound to the
+   * canonical `repoPath` argument while metadata and registry projections keep
+   * the stable path the operator registered.
+   */
+  registryPath?: string;
+  /**
+   * Internal server-only physical storage target captured before the shared
+   * repository lock is acquired. Never canonicalize this value again: doing
+   * so after a `.gitnexus` symlink retarget would escape the held lock.
+   */
+  analyzeStoragePath?: string;
   /**
    * Force a full re-index of the pipeline. Callers may OR this with
    * other flags that imply re-analysis (e.g. `--skills`), so the value
@@ -769,6 +784,14 @@ const runFullAnalysisImpl = async (
     callbacks.onProgress(phase, percent, message);
 
   const { repoHasGit, remoteUrl: repositoryRemoteUrl } = repositoryIdentity;
+  const persistedRepoPath = options.registryPath ?? repoPath;
+  const expectedPersistedCanonicalPath = canonicalizePath(repoPath);
+  const frozenRegistryIdentity = {
+    expectedCanonicalPath: expectedPersistedCanonicalPath,
+    ...(options.analyzeStoragePath
+      ? { expectedCanonicalStoragePath: options.analyzeStoragePath }
+      : {}),
+  };
 
   // Resolve + validate operator-provided FTS config once, before the expensive
   // parse/load phases. A typo fails here in ms; createSearchFTSIndexes reuses
@@ -795,7 +818,7 @@ const runFullAnalysisImpl = async (
   // `storagePath` is ALWAYS the flat `.gitnexus` — content-addressed caches
   // (parse-cache, parsedfile-store) and the kuzu-migration cleanup live there
   // and are shared across branches (#2106 KTD7).
-  const { storagePath } = getStoragePaths(repoPath);
+  const storagePath = options.analyzeStoragePath ?? getStoragePaths(repoPath).storagePath;
 
   const currentCommit = repoHasGit ? getCurrentCommit(repoPath) : '';
 
@@ -825,7 +848,23 @@ const runFullAnalysisImpl = async (
   });
   const branchLabel = options.branch ?? checkedOutBranch;
   const placement = options.branch ? await resolveBranchPlacement(repoPath, branchLabel) : {};
-  const canonicalPaths = getStoragePaths(repoPath, placement.branch);
+  const canonicalPaths = options.analyzeStoragePath
+    ? {
+        storagePath,
+        lbugPath: path.join(
+          placement.branch
+            ? path.join(storagePath, 'branches', branchSlug(placement.branch))
+            : storagePath,
+          'lbug',
+        ),
+        metaPath: path.join(
+          placement.branch
+            ? path.join(storagePath, 'branches', branchSlug(placement.branch))
+            : storagePath,
+          INDEX_METADATA_FILE,
+        ),
+      }
+    : getStoragePaths(repoPath, placement.branch);
   // Prevent a previous analyze in the same process from leaking its graph hint
   // into any pre-pipeline database open in this run.
   setBufferPoolSizeHint(undefined);
@@ -833,12 +872,109 @@ const runFullAnalysisImpl = async (
   const promotionPaths = getStagedAnalyzePaths(canonicalPaths.lbugPath, canonicalMetaDir);
   const stagedPaths: StagedAnalyzePaths | undefined = options.staged ? promotionPaths : undefined;
 
-  const commitStagedMetadataAndRegistry = async (meta: RepoMeta): Promise<string> => {
-    await saveMeta(canonicalMetaDir, meta);
-    return registerRepo(repoPath, meta, {
+  // A plain analyze of the flat slot may be switching its informational
+  // branch label. Until registry adoption commits, every durable metadata
+  // projection retains exactly the branch property that existed at entry
+  // (including property absence). This keeps checkpoints and ordinary or
+  // recovered staged promotions retryable after any partial failure.
+  const implicitFlatBranch =
+    !options.branch && !placement.branch && branchLabel ? branchLabel : null;
+  const canonicalMetaBeforeAdoption = implicitFlatBranch ? await loadMeta(canonicalMetaDir) : null;
+  let canonicalBranchExistedBeforeAdoption =
+    canonicalMetaBeforeAdoption !== null &&
+    Object.prototype.hasOwnProperty.call(canonicalMetaBeforeAdoption, 'branch');
+  let canonicalBranchBeforeAdoption = canonicalMetaBeforeAdoption?.branch;
+  let implicitFlatBranchAdoptionPending =
+    implicitFlatBranch !== null &&
+    (!canonicalBranchExistedBeforeAdoption || canonicalBranchBeforeAdoption !== implicitFlatBranch);
+  const refreshPreAdoptionBranch = (meta: RepoMeta | null): void => {
+    canonicalBranchExistedBeforeAdoption =
+      meta !== null && Object.prototype.hasOwnProperty.call(meta, 'branch');
+    canonicalBranchBeforeAdoption = meta?.branch;
+    implicitFlatBranchAdoptionPending =
+      implicitFlatBranch !== null &&
+      (!canonicalBranchExistedBeforeAdoption ||
+        canonicalBranchBeforeAdoption !== implicitFlatBranch);
+  };
+  const preservePreAdoptionBranch = (meta: RepoMeta): RepoMeta => {
+    if (!implicitFlatBranch) return meta;
+    const protectedMeta = { ...meta };
+    if (canonicalBranchExistedBeforeAdoption) protectedMeta.branch = canonicalBranchBeforeAdoption;
+    else delete protectedMeta.branch;
+    return protectedMeta;
+  };
+  const markPendingImplicitFlatAdoption = (meta: RepoMeta): RepoMeta => {
+    const protectedMeta = preservePreAdoptionBranch(meta);
+    if (!implicitFlatBranchAdoptionPending || protectedMeta.incrementalInProgress) {
+      return protectedMeta;
+    }
+    const now = Date.now();
+    return {
+      ...protectedMeta,
+      incrementalInProgress: {
+        startedAt: now,
+        updatedAt: now,
+        targetCommit: meta.lastCommit,
+        phase: 'branch-adoption',
+        toWriteCount: 0,
+      },
+    };
+  };
+  const savePreAdoptionMeta = (metaDir: string, meta: RepoMeta): Promise<void> =>
+    saveMeta(metaDir, markPendingImplicitFlatAdoption(meta));
+  const adoptAndRestampImplicitFlatBranch = async (meta: RepoMeta): Promise<RepoMeta> => {
+    if (!implicitFlatBranch) return meta;
+    const outcome = options.analyzeStoragePath
+      ? await adoptFlatBranchLabel(repoPath, implicitFlatBranch, storagePath)
+      : await adoptFlatBranchLabel(repoPath, implicitFlatBranch);
+    if (outcome !== 'ADOPTED') {
+      log(
+        `Warning: workspace branch adoption returned ${outcome}; ` +
+          'retaining the prior branch label and retry protection.',
+      );
+      return preservePreAdoptionBranch(meta);
+    }
+    // The staged commit callback may have persisted a protected copy that is
+    // not the same object as `meta`. Inspect the canonical file itself before
+    // taking the coherent-state shortcut, so a staged adoption marker cannot
+    // survive just because the caller's copy was unmarked.
+    const persistedMeta = await loadMeta(canonicalMetaDir);
+    if (
+      persistedMeta &&
+      Object.prototype.hasOwnProperty.call(persistedMeta, 'branch') &&
+      persistedMeta.branch === implicitFlatBranch &&
+      persistedMeta.incrementalInProgress?.phase !== 'branch-adoption'
+    ) {
+      return meta;
+    }
+    const canonicalMeta = persistedMeta ?? meta;
+    const dirtyPhase = canonicalMeta.incrementalInProgress;
+    const adoptedMeta: RepoMeta = {
+      ...canonicalMeta,
+      ...meta,
+      branch: implicitFlatBranch,
+      incrementalInProgress:
+        dirtyPhase?.phase === 'branch-adoption'
+          ? undefined
+          : (meta.incrementalInProgress ?? dirtyPhase),
+    };
+    await saveMeta(canonicalMetaDir, adoptedMeta);
+    return adoptedMeta;
+  };
+
+  const commitStagedMetadataAndRegistry = async (
+    meta: RepoMeta,
+    pendingFlatAdoption = false,
+  ): Promise<string> => {
+    const protectedMeta = pendingFlatAdoption
+      ? markPendingImplicitFlatAdoption(meta)
+      : preservePreAdoptionBranch(meta);
+    await saveMeta(canonicalMetaDir, protectedMeta);
+    return registerRepo(persistedRepoPath, protectedMeta, {
       name: options.registryName,
       allowDuplicateName: options.allowDuplicateName,
       branch: placement.branch,
+      ...frozenRegistryIdentity,
     });
   };
 
@@ -962,7 +1098,7 @@ const runFullAnalysisImpl = async (
         if (await isRepoRegistered(repoPath)) {
           projectName = await commitStagedMetadataAndRegistry(clearedMeta);
         } else {
-          await saveMeta(canonicalMetaDir, clearedMeta);
+          await savePreAdoptionMeta(canonicalMetaDir, clearedMeta);
         }
         resultStats = {
           ...clearedMeta.stats,
@@ -1086,7 +1222,7 @@ const runFullAnalysisImpl = async (
         // the stale marker, or the next repair/resume re-enters recovery.
         embeddingCheckpoint: undefined,
         incrementalInProgress: undefined,
-        repoPath,
+        repoPath: persistedRepoPath,
         remoteUrl: repositoryRemoteUrl ?? existingMeta.remoteUrl,
         stats: {
           ...existingMeta.stats,
@@ -1107,10 +1243,12 @@ const runFullAnalysisImpl = async (
           },
         },
       };
+      repairedMeta = preservePreAdoptionBranch(repairedMeta);
       await saveMeta(canonicalMetaDir, repairedMeta);
-      projectName = await registerRepo(repoPath, repairedMeta, {
+      projectName = await registerRepo(persistedRepoPath, repairedMeta, {
         name: options.registryName,
         allowDuplicateName: options.allowDuplicateName,
+        ...frozenRegistryIdentity,
       });
     } finally {
       await closeLbug().catch(() => {});
@@ -1158,7 +1296,7 @@ const runFullAnalysisImpl = async (
       stagedMeta.stats?.embeddings,
     );
     return (
-      await promoteStagedGeneration(paths, commitStagedMetadataAndRegistry, {
+      await promoteStagedGeneration(paths, (meta) => commitStagedMetadataAndRegistry(meta, true), {
         readRepositoryIdentity,
       })
     ).projectName;
@@ -1210,15 +1348,25 @@ const runFullAnalysisImpl = async (
     await validatePendingPromotionEmbeddingCandidate(promotionPaths);
     const recoveredPromotion = await promoteStagedGeneration(
       promotionPaths,
-      commitStagedMetadataAndRegistry,
+      (meta) => commitStagedMetadataAndRegistry(meta, true),
       {
         readRepositoryIdentity,
       },
     );
     log('Recovered and completed the previous staged promotion.');
-    const recoveredMeta = await loadMeta(canonicalMetaDir);
+    let recoveredMeta = await loadMeta(canonicalMetaDir);
     if (!recoveredMeta) {
       throw new Error('Recovered staged promotion is missing canonical metadata.');
+    }
+    if (implicitFlatBranch) {
+      try {
+        recoveredMeta = await adoptAndRestampImplicitFlatBranch(recoveredMeta);
+      } catch (error) {
+        log(
+          `Warning: could not sync the recovered workspace branch label ` +
+            `(${(error as Error).message}); will retry on the next run.`,
+        );
+      }
     }
     const recoveredRepoName =
       recoveredPromotion.projectName ??
@@ -1230,7 +1378,7 @@ const runFullAnalysisImpl = async (
     // path, so finish its source-side bookkeeping before returning the explicit
     // recovery-only result. Context generation is best-effort, matching the
     // ordinary successful path.
-    await ensureGitNexusIgnored(repoPath);
+    await ensureGitNexusIgnored(repoPath, storagePath);
     if (!placement.branch) {
       try {
         await generateAIContextFiles(
@@ -1421,13 +1569,17 @@ const runFullAnalysisImpl = async (
     // before the rename must keep doing so.
     if (!options.staged) {
       try {
-        await reconcileMetadataFiles(repoPath);
+        await reconcileMetadataFiles(repoPath, storagePath);
       } catch (err) {
         const code = (err as NodeJS.ErrnoException)?.code;
         log(`Metadata reconciliation failed (non-critical${code ? `, ${code}` : ''}); continuing.`);
       }
     }
     existingMeta = await loadMeta(metaDir);
+    // Reconciliation may select a fresher legacy mirror. All later adoption-
+    // protected writes must preserve that reconciled branch projection, not
+    // the stale primary file observed before reconciliation.
+    if (implicitFlatBranch) refreshPreAdoptionBranch(existingMeta);
   }
 
   // ── FTS-only repair path ────────────────────────────────────────────
@@ -1530,7 +1682,7 @@ const runFullAnalysisImpl = async (
             'if that also fails, verify FTS extension availability via `gitnexus doctor`.',
         );
       }
-      await ensureGitNexusIgnored(repoPath);
+      await ensureGitNexusIgnored(repoPath, storagePath);
       progress('fts', 90, 'Search indexes ready');
       progress('done', 100, 'Done');
       return {
@@ -1684,7 +1836,7 @@ const runFullAnalysisImpl = async (
       embeddingCheckpoint: undefined,
     };
     if (stagedPaths || !(await isRepoRegistered(repoPath))) {
-      await saveMeta(metaDir, existingMeta);
+      await savePreAdoptionMeta(metaDir, existingMeta);
     } else {
       await commitStagedMetadataAndRegistry(existingMeta);
     }
@@ -1885,7 +2037,7 @@ const runFullAnalysisImpl = async (
             stats: { ...existingMeta.stats, embeddings: fastPathIntegrity.validRows },
           };
           try {
-            await saveMeta(metaDir, fastPathMeta);
+            await savePreAdoptionMeta(metaDir, fastPathMeta);
           } catch (err) {
             if (!isReadOnlyFilesystemError(err)) throw err;
             log(
@@ -1904,9 +2056,8 @@ const runFullAnalysisImpl = async (
         // stamp, mirroring the end-of-run meta write.
         if (
           !stagedPaths &&
-          !placement.branch &&
-          branchLabel &&
-          existingMeta.branch !== branchLabel
+          implicitFlatBranch &&
+          (!options.incrementalOnly || existingMeta.branch !== implicitFlatBranch)
         ) {
           if (options.incrementalOnly) {
             incrementalOnlyStop('the flat index branch label requires a metadata restamp');
@@ -1922,9 +2073,7 @@ const runFullAnalysisImpl = async (
           // date" run must not fail over it; read-only storage — the
           // documented Docker :ro workflow (#1549) — degrades to a warning.
           try {
-            await adoptFlatBranchLabel(repoPath, branchLabel);
-            fastPathMeta = { ...fastPathMeta, branch: branchLabel };
-            await saveMeta(metaDir, fastPathMeta);
+            fastPathMeta = await adoptAndRestampImplicitFlatBranch(fastPathMeta);
           } catch (err) {
             // EACCES/EPERM also arise from ownership problems and transient
             // Windows locks, so keep the real error visible alongside the
@@ -1940,7 +2089,7 @@ const runFullAnalysisImpl = async (
         if (stagedPaths) {
           await discardStagedWorkspace(stagedPaths);
         } else if (!options.incrementalOnly) {
-          await ensureGitNexusIgnored(repoPath);
+          await ensureGitNexusIgnored(repoPath, storagePath);
         }
         return {
           // `resolveRepoIdentityRoot` collapses worktree roots to the
@@ -2254,7 +2403,7 @@ const runFullAnalysisImpl = async (
     // success at the meta-save step. Scoped to this branch's meta.json.
     if (!options.incrementalOnly) {
       const now = Date.now();
-      await saveMeta(metaDir, {
+      await savePreAdoptionMeta(metaDir, {
         ...existingMeta!,
         incrementalInProgress: {
           startedAt: now,
@@ -2277,7 +2426,7 @@ const runFullAnalysisImpl = async (
     // toWriteCount: 0 is the full-path sentinel (no incremental write set).
     if (existingMeta) {
       const now = Date.now();
-      await saveMeta(metaDir, {
+      await savePreAdoptionMeta(metaDir, {
         ...existingMeta,
         incrementalInProgress: {
           startedAt: now,
@@ -2405,7 +2554,7 @@ const runFullAnalysisImpl = async (
         extra: Partial<NonNullable<RepoMeta['incrementalInProgress']>> = {},
       ): Promise<void> => {
         if (!incrementalMutationAuthorized) return;
-        await saveMeta(metaDir, {
+        await savePreAdoptionMeta(metaDir, {
           ...existingMeta!,
           incrementalInProgress: {
             startedAt: dirtyStartedAt,
@@ -3045,9 +3194,9 @@ const runFullAnalysisImpl = async (
       ): Promise<void> => {
         const fileHashes: Record<string, string> = {};
         for (const [key, value] of newFileHashes) fileHashes[key] = value;
-        await saveMeta(metaDir, {
+        await savePreAdoptionMeta(metaDir, {
           ...(existingMeta ?? {}),
-          repoPath,
+          repoPath: persistedRepoPath,
           lastCommit: currentCommit,
           indexedAt: new Date().toISOString(),
           branch: branchLabel ?? existingMeta?.branch,
@@ -3180,8 +3329,8 @@ const runFullAnalysisImpl = async (
     // RepoMeta's status unions (tri-review 4669518496 P1/U3) — an unannotated
     // literal widens the vectorSearch.status ternary to `string` and the
     // honesty contract silently decays to "whatever interpolates".
-    const meta: RepoMeta = {
-      repoPath,
+    const meta: RepoMeta = preservePreAdoptionBranch({
+      repoPath: persistedRepoPath,
       lastCommit: currentCommit,
       indexedAt: new Date().toISOString(),
       // Branch identity this index represents (#2106). Recorded for the flat
@@ -3246,14 +3395,15 @@ const runFullAnalysisImpl = async (
       // stamp after an on→off flip; the next pdgModeMismatch then compares
       // off==off and incremental eligibility is restored.
       pdg: resolvePdgConfig(options),
-    };
+    });
     if (isIncremental && hashDiff) {
       callbacks.onRecoveryBoundary?.('before-finalize', {
         phase: escalatedFullWrite ? 'escalated-load-graph' : 'load-graph',
         targetCommit: currentCommit,
       });
     }
-    await saveMeta(metaDir, meta);
+    const metadataToCommit = stagedPaths ? meta : markPendingImplicitFlatAdoption(meta);
+    await saveMeta(metaDir, metadataToCommit);
 
     // Persist the incremental parse cache for the next run. Wraps in
     // try/catch so a cache-write failure never breaks an otherwise
@@ -3345,17 +3495,18 @@ const runFullAnalysisImpl = async (
     } else {
       // Forward the --name alias and registry-collision bypass only after the
       // canonical DB is finalized. In staged mode this same commit is journaled.
-      projectName = await registerRepo(repoPath, meta, {
+      projectName = await registerRepo(persistedRepoPath, metadataToCommit, {
         name: options.registryName,
         allowDuplicateName: options.allowDuplicateName,
         branch: placement.branch,
+        ...frozenRegistryIdentity,
       });
     }
 
     // ── #2354: the flat workspace slot has adopted this run's branch ──────
-    if (!placement.branch && branchLabel) {
+    if (implicitFlatBranch) {
       try {
-        await adoptFlatBranchLabel(repoPath, branchLabel);
+        await adoptAndRestampImplicitFlatBranch(metadataToCommit);
       } catch (e) {
         log(
           `Warning: could not sync the workspace branch label (${(e as Error).message}); continuing.`,
@@ -3365,7 +3516,7 @@ const runFullAnalysisImpl = async (
 
     // Side effects that describe the canonical generation happen only after a
     // staged promotion has committed.
-    await ensureGitNexusIgnored(repoPath);
+    await ensureGitNexusIgnored(repoPath, storagePath);
 
     let aggregatedClusterCount = 0;
     if (pipelineResult.communityResult?.communities) {
@@ -3440,11 +3591,42 @@ const runFullAnalysisImpl = async (
   }
 };
 
+type AnalyzeInternalContext = {
+  /** The server parent owns the frozen storage/root lease through finalization. */
+  parentAnalyzeOwnershipHeld?: boolean;
+};
+
 export async function runFullAnalysis(
   repoPath: string,
   options: AnalyzeOptions,
   callbacks: AnalyzeCallbacks,
+  internal: AnalyzeInternalContext = {},
 ): Promise<AnalyzeResult> {
+  if (
+    !internal.parentAnalyzeOwnershipHeld &&
+    (options.analyzeStoragePath !== undefined || options.registryPath !== undefined)
+  ) {
+    throw new Error(
+      'Frozen analyzeStoragePath and registryPath overrides require parent-held analyze ownership.',
+    );
+  }
+  if (
+    internal.parentAnalyzeOwnershipHeld &&
+    (!options.analyzeStoragePath || !options.registryPath)
+  ) {
+    throw new Error(
+      'Parent-held analyze ownership requires frozen analyzeStoragePath and registryPath.',
+    );
+  }
+  if (
+    options.registryPath !== undefined &&
+    !registryPathEquals(canonicalizePath(options.registryPath), canonicalizePath(repoPath))
+  ) {
+    throw new Error('GitNexus: analyze display path changed before worker start');
+  }
+  if (options.analyzeStoragePath !== undefined && !path.isAbsolute(options.analyzeStoragePath)) {
+    throw new Error('GitNexus: analyze storage target must be absolute');
+  }
   if (options.incrementalOnly && options.dropEmbeddings) {
     throw new Error(
       'Cannot combine `--incremental-only` with `--drop-embeddings`. ' +
@@ -3477,8 +3659,8 @@ export async function runFullAnalysis(
   await assertCanonicalRepositoryIdentity(repoPath, repositoryRemoteUrl);
   if (options.repairVector) await assertVectorRepairPreflight(repoPath);
 
-  const { storagePath } = getStoragePaths(repoPath);
-  return withAnalyzeOwnershipLock(storagePath, async () => {
+  const storagePath = options.analyzeStoragePath ?? getStoragePaths(repoPath).storagePath;
+  const runWithOwnedStorage = async (): Promise<AnalyzeResult> => {
     // The first preflight avoids creating an ownership lock for a known-dirty
     // index. Repeat it after lock acquisition because a writer may have run
     // while this command was waiting and left new recovery or dirty state.
@@ -3489,5 +3671,11 @@ export async function runFullAnalysis(
       repoHasGit,
       remoteUrl: repositoryRemoteUrl,
     });
-  });
+  };
+
+  if (internal.parentAnalyzeOwnershipHeld) {
+    return runWithOwnedStorage();
+  }
+
+  return withAnalyzeOwnershipLock(storagePath, runWithOwnedStorage, { repoRoot: repoPath });
 }

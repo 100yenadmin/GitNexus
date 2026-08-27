@@ -74,7 +74,7 @@ describe('/api/embed metadata commit barrier', () => {
   });
 
   it.each(['empty graph', 'terminal'])(
-    'finishes a %s commit before deferred cancellation',
+    'holds a %s terminal claim through deferred cancellation',
     async () => {
       const barrier = createEmbedCommitBarrier();
       const blocked = blockedWrite();
@@ -82,8 +82,8 @@ describe('/api/embed metadata commit barrier', () => {
       expect(requestEmbedCancellation(barrier, 'cancelled', vi.fn())).toBe('deferred');
       blocked.release();
       await commit;
-      expect(barrier.phase).toBe('COMPLETE');
-      expect(requestEmbedCancellation(barrier, 'late', vi.fn())).toBe('terminal');
+      expect(barrier.phase).toBe('COMMITTING_TERMINAL');
+      expect(requestEmbedCancellation(barrier, 'late', vi.fn())).toBe('deferred');
     },
   );
 
