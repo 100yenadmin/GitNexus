@@ -739,6 +739,7 @@ describe('runFullAnalysis VECTOR-only repair (#170)', () => {
         ...completedCheckpoint,
         nodesProcessed: 0,
         totalNodes: 0,
+        chunksProcessed: 0,
         provider: undefined,
         physicalRows: 3,
         validRows: 3,

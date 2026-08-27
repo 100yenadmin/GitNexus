@@ -49,6 +49,8 @@ const state = {
   })),
   pipeline: vi.fn(),
   identity: vi.fn(),
+  releaseOwnership: vi.fn(async () => undefined),
+  acquireOwnership: vi.fn(async () => ({ release: state.releaseOwnership })),
   withLbugDb: vi.fn(async (_path: string, run: () => Promise<unknown>) => run()),
 };
 
@@ -61,6 +63,7 @@ vi.doMock('../../storage/repo-manager.js', async () => ({
   saveMeta: state.saveMeta,
 }));
 vi.doMock('../../core/lbug/lbug-adapter.js', () => ({
+  acquireLbugOwnership: state.acquireOwnership,
   executeQuery: state.executeQuery,
   executePrepared: vi.fn(async () => []),
   executeWithReusedStatement: vi.fn(async () => undefined),
@@ -150,6 +153,8 @@ describe('POST /api/embed checkpoint recovery', () => {
     });
     state.pipeline.mockReset();
     state.identity.mockReset();
+    state.acquireOwnership.mockClear();
+    state.releaseOwnership.mockClear();
     state.saveMeta.mockClear();
     state.withLbugDb.mockClear();
   });
