@@ -80,6 +80,16 @@ describe('run-analyze module', () => {
     );
   });
 
+  it('uses the non-recovering opener for provider-less legacy checkpoint proof', async () => {
+    const source = await fs.readFile(
+      path.join(__dirname, '..', '..', 'src', 'core', 'run-analyze.ts'),
+      'utf-8',
+    );
+    expect(source).toMatch(
+      /const integrity = await withLbugReadOnlyNonRecovering\(\s*lbugPath,\s*inspectEmbeddingIntegrity/,
+    );
+  });
+
   it('stamps the provider on new checkpoints and rejects unknown legacy resumes', async () => {
     const source = await fs.readFile(
       path.join(__dirname, '..', '..', 'src', 'core', 'run-analyze.ts'),

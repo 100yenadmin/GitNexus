@@ -18,6 +18,7 @@ import {
   initLbug,
   initLbugForMaintenance,
   initLbugReadOnlyNonRecovering,
+  withLbugReadOnlyNonRecovering,
   loadGraphToLbug,
   getLbugStats,
   executeQuery,
@@ -1827,9 +1828,7 @@ const runFullAnalysisImpl = async (
 
   const legacyCheckpoint = existingMeta?.embeddingCheckpoint;
   if (!options.dropEmbeddings && legacyCheckpoint && isEmptyLegacyCheckpoint(legacyCheckpoint)) {
-    const integrity = await withLbugDb(lbugPath, inspectEmbeddingIntegrity, {
-      readOnly: true,
-    }).finally(() => closeLbug());
+    const integrity = await withLbugReadOnlyNonRecovering(lbugPath, inspectEmbeddingIntegrity);
     if (integrity.physicalRows > 0) {
       throw new Error(
         'Cannot resume embedding checkpoint: it uses unknown-provider while the table contains ' +
