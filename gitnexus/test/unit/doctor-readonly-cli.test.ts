@@ -200,6 +200,15 @@ describe('read-only doctor CLI modes (#127, #133)', () => {
     });
   });
 
+  it('treats a missing registry as a healthy empty installation', () => {
+    const result = runDoctor(['--registry', '--json']);
+    expect(result.status).toBe(0);
+    expect(JSON.parse(result.stdout)).toMatchObject({
+      registryRead: { status: 'available' },
+      summary: { entries: 0 },
+    });
+  });
+
   it('diagnoses malformed HTTP dimensions through registry Doctor JSON', async () => {
     const repoPath = path.join(home.dbPath, 'repo');
     await fs.writeFile(

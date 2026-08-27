@@ -1087,11 +1087,14 @@ const isBranchSummaryShape = (value: unknown): boolean =>
   typeof value.lastCommit === 'string' &&
   isStatsShape(value.stats);
 
+const isAbsoluteRegistryPath = (value: unknown): value is string =>
+  typeof value === 'string' && (path.isAbsolute(value) || path.win32.isAbsolute(value));
+
 const isRegistryEntryShape = (value: unknown): value is RegistryEntry =>
   isRecord(value) &&
-  ['name', 'path', 'storagePath', 'indexedAt', 'lastCommit'].every(
-    (key) => typeof value[key] === 'string',
-  ) &&
+  ['name', 'indexedAt', 'lastCommit'].every((key) => typeof value[key] === 'string') &&
+  isAbsoluteRegistryPath(value.path) &&
+  isAbsoluteRegistryPath(value.storagePath) &&
   (value.remoteUrl === undefined || typeof value.remoteUrl === 'string') &&
   (value.branch === undefined || typeof value.branch === 'string') &&
   isStatsShape(value.stats) &&
@@ -1102,7 +1105,10 @@ export const readRegistryStrict = async (): Promise<RegistryReadResult> => {
   let raw: string;
   try {
     raw = await fs.readFile(getGlobalRegistryPath(), 'utf-8');
-  } catch {
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      return { status: 'available', entries: [] };
+    }
     return { status: 'failed', reason: 'unreadable' };
   }
 

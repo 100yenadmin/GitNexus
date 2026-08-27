@@ -208,6 +208,45 @@ describe('doctor --registry read-only report (#133)', () => {
     ).toBe(true);
   });
 
+  it('skips the query runtime probe for failed, empty, and graph-only registries', async () => {
+    const embeddingRuntimeProbe = vi.fn(async () => ({
+      available: false as const,
+      mode: 'local' as const,
+      reason: 'local-runtime-unloadable' as const,
+    }));
+
+    const emptyReport = await buildRegistryDoctorReport({ entries: [], embeddingRuntimeProbe });
+    expect(emptyReport.summary.entries).toBe(0);
+    expect(embeddingRuntimeProbe).not.toHaveBeenCalled();
+
+    await fs.writeFile(path.join(fixture.dbPath, 'registry.json'), '{');
+    const failedReport = await withEnv({ GITNEXUS_HOME: fixture.dbPath }, () =>
+      buildRegistryDoctorReport({ embeddingRuntimeProbe }),
+    );
+    expect(failedReport.registryRead).toEqual({ status: 'failed', reason: 'malformed' });
+    expect(embeddingRuntimeProbe).not.toHaveBeenCalled();
+
+    const graphOnly = await createEntry(
+      fixture.dbPath,
+      'runtime-probe-graph-only',
+      'RuntimeProbeGraphOnly',
+      'https://github.com/owner/runtime-probe-graph-only.git',
+      { nodes: 1, edges: 0, embeddings: 0 },
+    );
+    await buildRegistryDoctorReport({
+      entries: [graphOnly.entry],
+      embeddingRuntimeProbe,
+      databaseProbe: async () => ({
+        nodes: 1,
+        edges: 0,
+        embeddings: 0,
+        integrity: cleanIntegrity(0),
+      }),
+      headProbe: () => 'a'.repeat(40),
+    });
+    expect(embeddingRuntimeProbe).not.toHaveBeenCalled();
+  });
+
   it('reports canonical remote and alias collisions, count drift, and local-only entries', async () => {
     const alpha = await createEntry(
       fixture.dbPath,
@@ -591,6 +630,18 @@ describe('doctor --registry read-only report (#133)', () => {
         await fs.writeFile(
           path.join(fixture.dbPath, 'registry.json'),
           JSON.stringify([{ ...base, stats: { [key]: value } }]),
+        );
+        expect(await readRegistryStrict()).toEqual({ status: 'failed', reason: 'malformed' });
+      }
+
+      for (const invalidPath of ['', '.', 'repo', 'repo/.gitnexus']) {
+        await fs.writeFile(
+          path.join(fixture.dbPath, 'registry.json'),
+          JSON.stringify([
+            invalidPath.endsWith('.gitnexus')
+              ? { ...base, storagePath: invalidPath }
+              : { ...base, path: invalidPath },
+          ]),
         );
         expect(await readRegistryStrict()).toEqual({ status: 'failed', reason: 'malformed' });
       }

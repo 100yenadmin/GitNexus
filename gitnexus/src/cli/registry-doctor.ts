@@ -539,7 +539,7 @@ const inspectEntry = async (
   entry: RegistryEntry,
   entryPosition: number,
   options: RegistryDoctorOptions,
-  embeddingRuntime: QueryEmbeddingRuntimeStatus,
+  getEmbeddingRuntime: () => Promise<QueryEmbeddingRuntimeStatus>,
 ): Promise<RegistryEntryDoctorReport> => {
   const normalizedRemote = normalizeRepositoryRemote(entry.remoteUrl);
   const identity: RegistryEntryDoctorReport['identity'] = normalizedRemote
@@ -725,6 +725,7 @@ const inspectEntry = async (
   const embeddings = database.status === 'available' ? database.counts.embeddings : 0;
   const embeddingBearing =
     embeddings > 0 || (base.registry.counts.embeddings ?? 0) > 0 || (counts.embeddings ?? 0) > 0;
+  const embeddingRuntime = embeddingBearing ? await getEmbeddingRuntime() : null;
   const queryDimensions = getQueryEmbeddingDimensions();
   const queryDimensionMismatch =
     embeddingBearing &&
@@ -742,7 +743,7 @@ const inspectEntry = async (
     capabilities.graph === 'available' &&
     capabilities.fts === 'available' &&
     capabilities.vectorSearch === 'vector-index' &&
-    embeddingRuntime.available &&
+    embeddingRuntime?.available === true &&
     !queryDimensionMismatch;
   const reasons: string[] = [];
   const integrity = database.status === 'available' ? database.integrity.status : 'unavailable';
@@ -757,8 +758,8 @@ const inspectEntry = async (
   if (embeddings > 0 && capabilities.vectorSearch !== 'vector-index') {
     reasons.push('vector-index-unavailable');
   }
-  if (embeddingBearing && !embeddingRuntime.available) {
-    reasons.push(`embedding-query-${embeddingRuntime.reason ?? 'runtime-unavailable'}`);
+  if (embeddingBearing && embeddingRuntime?.available !== true) {
+    reasons.push(`embedding-query-${embeddingRuntime?.reason ?? 'runtime-unavailable'}`);
   }
   if (queryDimensionMismatch) reasons.push('embedding-query-dimensions-mismatch');
 
@@ -819,15 +820,20 @@ export async function buildRegistryDoctorReport(
       ...(options.showPaths ? { paths: items.map((item) => item.entry.path) } : {}),
     }));
 
+  let embeddingRuntimePromise: Promise<QueryEmbeddingRuntimeStatus> | undefined;
+  const getEmbeddingRuntime = (): Promise<QueryEmbeddingRuntimeStatus> => {
+    embeddingRuntimePromise ??= Promise.resolve(
+      (options.embeddingRuntimeProbe ?? getQueryEmbeddingRuntimeStatus)(),
+    );
+    return embeddingRuntimePromise;
+  };
+
   // Open at most one LadybugDB handle at a time. Registry diagnosis is an
   // operator preflight, not a throughput path, and concurrent read-only opens
   // across a large fleet would create avoidable native-runtime pressure.
-  const embeddingRuntime = await (
-    options.embeddingRuntimeProbe ?? getQueryEmbeddingRuntimeStatus
-  )();
   const reports: RegistryEntryDoctorReport[] = [];
   for (const { entry, entryPosition } of indexed) {
-    reports.push(await inspectEntry(entry, entryPosition, options, embeddingRuntime));
+    reports.push(await inspectEntry(entry, entryPosition, options, getEmbeddingRuntime));
   }
   const remoteCollisionPositions = new Set(
     remotes.flatMap((collision) => collision.entryPositions),
