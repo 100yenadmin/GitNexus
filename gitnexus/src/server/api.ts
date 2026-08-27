@@ -13,15 +13,19 @@ import cors from 'cors';
 import path from 'path';
 import fs from 'fs/promises';
 import { createRequire } from 'node:module';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import {
   canonicalizePath,
+  canonicalRepoLockKey,
+  canonicalRepoRootLockKey,
   cloneDirBelongsToEntry,
   loadMeta,
   saveMeta,
   registerRepo,
+  rollbackRegistryCommit,
   listRegisteredRepos,
   getStoragePath,
+  assertSafeStoragePath,
   registryPathEquals,
   type RegistryEntry,
   type RepoMeta,
@@ -34,9 +38,11 @@ import {
   flushWAL,
   getStrictLbugStats,
   closeLbug,
+  acquireLbugOwnership,
   withLbugReadOnlyNonRecovering,
   withLbugDb,
   isReadOnlyDbError,
+  type LbugOwnershipLease,
 } from '../core/lbug/lbug-adapter.js';
 import { isValidQueryParams } from '../core/lbug/query-params.js';
 import { NODE_TABLES, type GraphNode, type GraphRelationship } from 'gitnexus-shared';
@@ -66,6 +72,10 @@ import { assertCompletedCheckpointIdentity } from '../core/embeddings/checkpoint
 import type { EmbeddingIdentity } from '../core/embeddings/embedding-identity.js';
 import { EMBEDDABLE_LABELS } from '../core/embeddings/types.js';
 import { escapeCypherString } from '../core/lbug/cypher-escape.js';
+import {
+  AnalyzeOwnershipConflictError,
+  withAnalyzeOwnershipLock,
+} from '../core/staged-promotion.js';
 
 const _require = createRequire(import.meta.url);
 const pkg = _require('../../package.json');
@@ -85,6 +95,202 @@ const API_METADATA_DRIFT_CONTEXT =
 const embeddingMetaFingerprint = (meta: RepoMeta): string =>
   createHash('sha256').update(JSON.stringify(meta)).digest('hex');
 const FILE_PREFLIGHT_PAGE_SIZE = 256;
+
+type FrozenRegistryOwner = RegistryEntry & {
+  /** Captured synchronously before the registry read; never persisted. */
+  canonicalPath: string;
+  /** Captured synchronously before the registry read; never persisted. */
+  canonicalStoragePath: string;
+};
+
+type StorageObjectIdentity = { dev: number; ino: number; mode: number };
+
+const readStorageObjectIdentity = async (
+  storagePath: string,
+): Promise<StorageObjectIdentity | undefined> => {
+  try {
+    const stats = await fs.lstat(storagePath);
+    return {
+      dev: stats.dev,
+      ino: stats.ino,
+      mode: stats.mode,
+    };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    throw error;
+  }
+};
+
+const storageObjectMatches = (
+  left: StorageObjectIdentity | undefined,
+  right: StorageObjectIdentity | undefined,
+): boolean =>
+  left === undefined || right === undefined
+    ? left === right
+    : left.dev === right.dev && left.ino === right.ino && left.mode === right.mode;
+
+const restoreDetachedStorage = async (detachedPath: string, storagePath: string): Promise<void> => {
+  if ((await readStorageObjectIdentity(storagePath)) !== undefined) {
+    throw new Error(
+      `Cannot restore detached GitNexus storage because the original path is occupied: ${storagePath}`,
+    );
+  }
+  await fs.rename(detachedPath, storagePath);
+};
+
+const detachStorageForDeletion = async (
+  storagePath: string,
+  expected: StorageObjectIdentity | undefined,
+): Promise<string | undefined> => {
+  const current = await readStorageObjectIdentity(storagePath);
+  if (!storageObjectMatches(current, expected)) {
+    throw new Error('GitNexus storage identity changed before deletion; delete refused');
+  }
+  if (!expected) return undefined;
+
+  const detachedPath = path.join(
+    path.dirname(storagePath),
+    `${path.basename(storagePath)}.delete-${randomUUID()}`,
+  );
+  await fs.rename(storagePath, detachedPath);
+  const detached = await readStorageObjectIdentity(detachedPath);
+  if (!storageObjectMatches(detached, expected)) {
+    try {
+      await restoreDetachedStorage(detachedPath, storagePath);
+    } catch (rollbackError) {
+      throw new AggregateError(
+        [
+          new Error('GitNexus detached a replacement storage object; delete refused'),
+          rollbackError,
+        ],
+        `GitNexus storage detach identity failed and rollback was incomplete; preserved ${detachedPath}`,
+      );
+    }
+    throw new Error('GitNexus detached a replacement storage object; delete refused');
+  }
+  return detachedPath;
+};
+
+const freezeZeroClearRegistryOwner = (entry: RegistryEntry): FrozenRegistryOwner => {
+  if (!path.isAbsolute(entry.path) || !path.isAbsolute(entry.storagePath)) {
+    throw new Error(
+      'Cannot finalize zero-checkpoint embedding: path/storage identity is non-absolute or mismatched',
+    );
+  }
+  const canonicalPath = canonicalizePath(entry.path);
+  const canonicalStoragePath = canonicalizePath(entry.storagePath);
+  if (
+    !path.isAbsolute(canonicalPath) ||
+    !path.isAbsolute(canonicalStoragePath) ||
+    !registryPathEquals(canonicalStoragePath, canonicalizePath(getStoragePath(entry.path)))
+  ) {
+    throw new Error(
+      'Cannot finalize zero-checkpoint embedding: path/storage identity is non-absolute or mismatched',
+    );
+  }
+  return { ...entry, canonicalPath, canonicalStoragePath };
+};
+
+const assertZeroClearRegistryOwner = async (
+  entry: FrozenRegistryOwner,
+  clearedMeta: RepoMeta,
+): Promise<FrozenRegistryOwner> => {
+  // listRegisteredRepos() yields the current raw display fields. Recheck the
+  // path and storage identities after that await so a retarget during the
+  // preflight cannot reuse the original entry.
+  const relatedOwners = (await listRegisteredRepos()).filter((owner) => {
+    const ownerPath = path.isAbsolute(owner.path) ? canonicalizePath(owner.path) : undefined;
+    const ownerStoragePath = path.isAbsolute(owner.storagePath)
+      ? canonicalizePath(owner.storagePath)
+      : undefined;
+    return (
+      (ownerPath !== undefined && registryPathEquals(ownerPath, entry.canonicalPath)) ||
+      (ownerStoragePath !== undefined &&
+        registryPathEquals(ownerStoragePath, entry.canonicalStoragePath))
+    );
+  });
+  if (
+    !registryPathEquals(canonicalizePath(entry.path), entry.canonicalPath) ||
+    !registryPathEquals(canonicalizePath(entry.storagePath), entry.canonicalStoragePath) ||
+    !registryPathEquals(canonicalizePath(getStoragePath(entry.path)), entry.canonicalStoragePath) ||
+    !path.isAbsolute(clearedMeta.repoPath) ||
+    !registryPathEquals(canonicalizePath(clearedMeta.repoPath), entry.canonicalPath)
+  ) {
+    throw new Error(
+      'Cannot finalize zero-checkpoint embedding: path/storage identity is non-absolute or mismatched',
+    );
+  }
+  if (relatedOwners.length === 0) {
+    throw new Error(
+      'Cannot finalize zero-checkpoint embedding: canonical registry entry is missing',
+    );
+  }
+
+  const owners = relatedOwners.filter(
+    (owner) =>
+      path.isAbsolute(owner.path) &&
+      path.isAbsolute(owner.storagePath) &&
+      registryPathEquals(canonicalizePath(owner.path), entry.canonicalPath) &&
+      registryPathEquals(canonicalizePath(owner.storagePath), entry.canonicalStoragePath),
+  );
+  if (owners.length > 1) {
+    throw new Error(
+      'Cannot finalize zero-checkpoint embedding: canonical registry has duplicate entries',
+    );
+  }
+  if (owners.length !== 1 || relatedOwners.length !== 1) {
+    throw new Error(
+      'Cannot finalize zero-checkpoint embedding: path/storage identity is non-absolute or mismatched',
+    );
+  }
+
+  const owner = owners[0];
+  const clearedRemoteUrl = clearedMeta.remoteUrl?.trim() || undefined;
+  if (
+    owner.name !== entry.name ||
+    owner.path !== entry.path ||
+    owner.storagePath !== entry.storagePath ||
+    owner.remoteUrl !== entry.remoteUrl ||
+    (clearedRemoteUrl !== undefined && owner.remoteUrl !== clearedRemoteUrl) ||
+    owner.branch !== entry.branch ||
+    owner.branch !== clearedMeta.branch
+  ) {
+    throw new Error('Cannot finalize zero-checkpoint embedding: registry owner identity changed');
+  }
+  if (
+    owner.lastCommit !== entry.lastCommit ||
+    owner.indexedAt !== entry.indexedAt ||
+    owner.lastCommit !== clearedMeta.lastCommit ||
+    owner.indexedAt !== clearedMeta.indexedAt
+  ) {
+    throw new Error(
+      'Cannot finalize zero-checkpoint embedding: registry owner generation changed; retry after the current repository operation finishes',
+    );
+  }
+  return entry;
+};
+
+const assertFrozenZeroClearRegistryOwner = (
+  owner: FrozenRegistryOwner,
+  clearedMeta: RepoMeta,
+): string => {
+  if (
+    !path.isAbsolute(owner.path) ||
+    !path.isAbsolute(owner.storagePath) ||
+    !path.isAbsolute(clearedMeta.repoPath) ||
+    !path.isAbsolute(owner.canonicalPath) ||
+    !path.isAbsolute(owner.canonicalStoragePath) ||
+    !registryPathEquals(canonicalizePath(owner.path), owner.canonicalPath) ||
+    !registryPathEquals(canonicalizePath(owner.storagePath), owner.canonicalStoragePath) ||
+    !registryPathEquals(canonicalizePath(getStoragePath(owner.path)), owner.canonicalStoragePath) ||
+    !registryPathEquals(canonicalizePath(clearedMeta.repoPath), owner.canonicalPath)
+  ) {
+    throw new Error(
+      'Cannot finalize zero-checkpoint embedding: path/storage identity is non-absolute or mismatched',
+    );
+  }
+  return owner.canonicalStoragePath;
+};
 
 export type EmbedCommitPhase =
   | 'RUNNING'
@@ -971,16 +1177,17 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
   // which would corrupt LadybugDB (analyze calls closeLbug + initLbug while embed has queries in flight).
   const activeRepoPaths = new Set<string>();
 
-  const acquireRepoLock = (repoPath: string): string | null => {
-    if (activeRepoPaths.has(repoPath)) {
+  const acquireRepoLock = (...repoPaths: string[]): string | null => {
+    const keys = [...new Set(repoPaths)];
+    if (keys.some((repoPath) => activeRepoPaths.has(repoPath))) {
       return `Another job is already active for this repository`;
     }
-    activeRepoPaths.add(repoPath);
+    for (const repoPath of keys) activeRepoPaths.add(repoPath);
     return null;
   };
 
-  const releaseRepoLock = (repoPath: string): void => {
-    activeRepoPaths.delete(repoPath);
+  const releaseRepoLock = (...repoPaths: string[]): void => {
+    for (const repoPath of new Set(repoPaths)) activeRepoPaths.delete(repoPath);
   };
 
   // Launch the analyze worker for an already-resolved repo directory. Shared by
@@ -990,6 +1197,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
     backend,
     acquireRepoLock,
     releaseRepoLock,
+    acquireAnalyzeOwnership: acquireLbugOwnership,
     closeDbHandle: closeLbug,
   });
 
@@ -1184,70 +1392,157 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         return;
       }
 
-      // Acquire repo lock — prevents deleting while analyze/embed is in flight
-      const lockKey = getStoragePath(entry.path);
-      const lockErr = acquireRepoLock(lockKey);
+      // Acquire repo lock — prevents deleting while analyze/embed is in flight.
+      // Capture one physical repository root, then derive two deliberately
+      // different identities from it:
+      //   - real storage target for lock ownership;
+      //   - lexical `<physical-root>/.gitnexus` entry for recursive removal.
+      // `fs.rm` must never receive the realpath-derived lock key because the
+      // final `.gitnexus` component may itself be a symlink to unrelated data.
+      const lockedRepoRoot = canonicalizePath(entry.path);
+      const storageLockKey = canonicalRepoLockKey(lockedRepoRoot);
+      const rootLockKey = canonicalRepoRootLockKey(lockedRepoRoot);
+      const storagePath = getStoragePath(lockedRepoRoot);
+      assertSafeStoragePath(entry);
+      const observedStorageIdentity = await readStorageObjectIdentity(storagePath);
+      // realpath cannot canonicalize a missing final component (notably
+      // `/var` versus `/private/var` on macOS). The lexical safety check above
+      // already binds an absent entry to `<repo>/.gitnexus`, so use the frozen
+      // root-derived key until an object exists to canonicalize.
+      const registeredStorageLockKey = observedStorageIdentity
+        ? canonicalizePath(entry.storagePath)
+        : storageLockKey;
+      const ownerDrift = [
+        !registryPathEquals(registeredStorageLockKey, storageLockKey) && 'storage-owner',
+        !registryPathEquals(canonicalizePath(entry.path), lockedRepoRoot) && 'repository-root',
+      ].filter((value): value is string => typeof value === 'string');
+      if (ownerDrift.length > 0) {
+        throw new Error(
+          `GitNexus repository owner changed before deletion (${ownerDrift.join(', ')})`,
+        );
+      }
+      const lockErr = acquireRepoLock(storageLockKey, rootLockKey);
       if (lockErr) {
         res.status(409).json({ error: lockErr });
         return;
       }
+      const withDeleteOwnership = <T>(operation: () => Promise<T>): Promise<T> =>
+        withAnalyzeOwnershipLock(storageLockKey, operation, {
+          repoRoot: lockedRepoRoot,
+          createStoragePath: false,
+        });
 
+      let deletedRepoName: string | undefined;
       try {
-        // Close any open LadybugDB handle before deleting files
-        try {
-          await closeLbug();
-        } catch {}
-
-        // 1. Delete the .gitnexus index/storage directory
-        const storagePath = getStoragePath(entry.path);
-        await fs.rm(storagePath, { recursive: true, force: true }).catch(() => {});
-
-        // 2. Delete the cloned repo dir if it lives under ~/.gitnexus/repos/.
-        // getCloneDir now throws on names that are not filesystem-safe (e.g.
-        // local repos registered with names like "my project" or "org/repo").
-        // Such repos legitimately have no clone dir, so treat the rejection as
-        // "nothing to clean up" rather than letting it fail the delete handler.
-        let cloneDir: string | null = null;
-        try {
-          cloneDir = getCloneDir(entry.name);
-        } catch {
-          /* repo name not eligible for a clone dir (local repo) */
-        }
-        // Only remove the clone dir when it is *this* entry's path — a local
-        // repo registered under the same name would otherwise take a cloned
-        // sibling's checkout down with it (see cloneDirBelongsToEntry).
-        if (cloneDir && cloneDirBelongsToEntry(cloneDir, entry.path)) {
-          try {
-            const stat = await fs.stat(cloneDir);
-            if (stat.isDirectory()) {
-              await fs.rm(cloneDir, { recursive: true, force: true });
-            }
-          } catch {
-            /* clone dir may not exist */
+        deletedRepoName = await withDeleteOwnership(async () => {
+          if (
+            !storageObjectMatches(
+              await readStorageObjectIdentity(storagePath),
+              observedStorageIdentity,
+            )
+          ) {
+            throw new Error('GitNexus storage identity changed during lock acquisition');
           }
-        }
+          // Close any open LadybugDB handle before deleting files
+          try {
+            await closeLbug();
+          } catch {}
 
-        // 2b. Delete the uploaded repo dir if entry.path lives under
-        // UPLOAD_ROOT. Drive this off entry.path (not a name-rederived dir) so
-        // a same-named clone is never affected.
-        const resolvedEntry = path.resolve(entry.path);
-        if (resolvedEntry === UPLOAD_ROOT || resolvedEntry.startsWith(UPLOAD_ROOT + path.sep)) {
-          await fs.rm(resolvedEntry, { recursive: true, force: true }).catch(() => {});
-        }
+          const detachedStoragePath = await detachStorageForDeletion(
+            storagePath,
+            observedStorageIdentity,
+          );
 
-        // 3. Unregister from the global registry
-        const { unregisterRepo } = await import('../storage/repo-manager.js');
-        await unregisterRepo(entry.path);
+          const { unregisterRepo } = await import('../storage/repo-manager.js');
+          try {
+            await unregisterRepo(entry.path, {
+              expectedOwner: {
+                ...entry,
+                canonicalPath: lockedRepoRoot,
+                canonicalStoragePath: storageLockKey,
+              },
+            });
+          } catch (error) {
+            if (detachedStoragePath) {
+              try {
+                await restoreDetachedStorage(detachedStoragePath, storagePath);
+              } catch (rollbackError) {
+                throw new AggregateError(
+                  [error, rollbackError],
+                  `GitNexus unregister failed and detached storage rollback was incomplete; preserved ${detachedStoragePath}`,
+                );
+              }
+            }
+            throw error;
+          }
 
-        // 4. Reinitialize backend to reflect the removal
-        await backend.init().catch(() => {});
+          if (detachedStoragePath) {
+            try {
+              await fs.rm(detachedStoragePath, {
+                recursive: true,
+                force: true,
+                maxRetries: 2,
+                retryDelay: 100,
+              });
+            } catch (error) {
+              throw new Error(
+                `GitNexus unregistered the repository but could not remove detached storage; ` +
+                  `preserved ${detachedStoragePath}. Resolve the filesystem error and remove ` +
+                  `that exact path before retrying.`,
+                { cause: error },
+              );
+            }
+          }
 
-        res.json({ deleted: entry.name });
+          // 3. Delete the cloned repo dir if it lives under ~/.gitnexus/repos/.
+          // getCloneDir now throws on names that are not filesystem-safe (e.g.
+          // local repos registered with names like "my project" or "org/repo").
+          // Such repos legitimately have no clone dir, so treat the rejection as
+          // "nothing to clean up" rather than letting it fail the delete handler.
+          let cloneDir: string | null = null;
+          try {
+            cloneDir = getCloneDir(entry.name);
+          } catch {
+            /* repo name not eligible for a clone dir (local repo) */
+          }
+          // Only remove the clone dir when it is *this* entry's path — a local
+          // repo registered under the same name would otherwise take a cloned
+          // sibling's checkout down with it (see cloneDirBelongsToEntry).
+          if (cloneDir && cloneDirBelongsToEntry(cloneDir, entry.path)) {
+            try {
+              const stat = await fs.stat(cloneDir);
+              if (stat.isDirectory()) {
+                await fs.rm(cloneDir, { recursive: true, force: true });
+              }
+            } catch {
+              /* clone dir may not exist */
+            }
+          }
+
+          // 3b. Delete the uploaded repo dir if entry.path lives under
+          // UPLOAD_ROOT. Drive this off entry.path (not a name-rederived dir) so
+          // a same-named clone is never affected.
+          const resolvedEntry = path.resolve(entry.path);
+          if (resolvedEntry === UPLOAD_ROOT || resolvedEntry.startsWith(UPLOAD_ROOT + path.sep)) {
+            await fs.rm(resolvedEntry, { recursive: true, force: true }).catch(() => {});
+          }
+
+          // 4. Reinitialize backend to reflect the removal
+          await backend.init().catch(() => {});
+
+          return entry.name;
+        });
       } finally {
-        releaseRepoLock(lockKey);
+        releaseRepoLock(storageLockKey, rootLockKey);
       }
+      if (deletedRepoName === undefined) {
+        throw new Error('GitNexus deletion completed without a repository result');
+      }
+      res.json({ deleted: deletedRepoName });
     } catch (err: any) {
-      res.status(500).json({ error: err.message || 'Failed to delete repo' });
+      res
+        .status(err instanceof AnalyzeOwnershipConflictError ? 409 : 500)
+        .json({ error: err.message || 'Failed to delete repo' });
     }
   });
 
@@ -1776,7 +2071,6 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
 
             launchAnalysisWorker(job, targetPath, { force, embeddings, dropEmbeddings });
           } catch (err: any) {
-            if (targetPath) releaseRepoLock(getStoragePath(targetPath));
             jobManager.updateJob(job.id, {
               status: 'failed',
               error: err.message || 'Analysis failed',
@@ -1942,18 +2236,29 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
           res.status(404).json({ error: 'Repository not found' });
           return;
         }
+        const frozenOwner = freezeZeroClearRegistryOwner(entry);
+        // Freeze once, then use that same physical storage identity for both
+        // lock ownership and every embedding read/write. A second path
+        // canonicalization here would reopen the symlink-retarget window.
+        const repoLockPath = frozenOwner.canonicalStoragePath;
+        const repoRootLockPath = canonicalRepoRootLockKey(frozenOwner.canonicalPath);
 
         // Check shared repo lock — prevent concurrent analyze + embed on same repo
-        const repoLockPath = entry.storagePath;
-        const lockErr = acquireRepoLock(repoLockPath);
+        const lockErr = acquireRepoLock(repoLockPath, repoRootLockPath);
         if (lockErr) {
           res.status(409).json({ error: lockErr });
           return;
         }
 
-        const job = embedJobManager.createJob({ repoPath: entry.storagePath });
+        let job: ReturnType<JobManager['createJob']>;
+        try {
+          job = embedJobManager.createJob({ repoPath: repoLockPath });
+        } catch (err) {
+          releaseRepoLock(repoLockPath, repoRootLockPath);
+          throw err;
+        }
         embedJobManager.updateJob(job.id, {
-          repoName: entry.name,
+          repoName: frozenOwner.name,
           status: 'analyzing' as any,
           progress: { phase: 'analyzing', percent: 0, message: 'Starting embedding generation...' },
         });
@@ -1962,6 +2267,15 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         const barrier = createEmbedCommitBarrier();
         embedBarriers.set(job.id, barrier);
         embedAborters.set(job.id, () => embedController.abort());
+        let cancellationFailure: string | undefined;
+        const causedByAbort = (error: unknown): boolean => {
+          let current = error;
+          for (let depth = 0; depth < 4 && current instanceof Error; depth++) {
+            if (current.name === 'AbortError') return true;
+            current = current.cause;
+          }
+          return false;
+        };
         const cancelEmbedding = (reason: string): boolean => {
           const current = embedJobManager.getJob(job.id);
           if (!current || current.status === 'complete' || current.status === 'failed') {
@@ -1969,7 +2283,11 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
           }
           const outcome = requestEmbedCancellation(barrier, reason, () => embedController.abort());
           if (outcome === 'cancelled') {
-            embedJobManager.cancelJob(job.id, reason);
+            // Keep the durable job non-terminal until ownership cleanup has
+            // completed so a release failure can be reported with the
+            // cancellation instead of being dropped by JobManager's terminal
+            // state guard.
+            cancellationFailure ??= reason;
           }
           return true;
         };
@@ -1985,10 +2303,16 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
 
         // Run embedding pipeline asynchronously
         (async () => {
+          let ownershipLease: LbugOwnershipLease | undefined;
+          let failureMessage: string | undefined;
           try {
-            const lbugPath = path.join(entry.storagePath, 'lbug');
+            ownershipLease = await acquireLbugOwnership(
+              frozenOwner.canonicalStoragePath,
+              frozenOwner.canonicalPath,
+            );
+            const lbugPath = path.join(frozenOwner.canonicalStoragePath, 'lbug');
             const { inspectEmbeddingIntegrity } = await import('../core/lbug/lbug-adapter.js');
-            const tentativeMeta = await loadMeta(entry.storagePath);
+            const tentativeMeta = await loadMeta(frozenOwner.canonicalStoragePath);
             if (!tentativeMeta) {
               throw new Error('Repository metadata is missing; run gitnexus analyze first');
             }
@@ -1996,6 +2320,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
             const tentativeCheckpoint = tentativeMeta.embeddingCheckpoint;
             const tentativeLegacy = isEmptyLegacyCheckpoint(tentativeCheckpoint);
             let embeddingIdentity: EmbeddingIdentity | undefined;
+            let terminalOwnerMeta: RepoMeta | undefined;
             if (tentativeCheckpoint && !tentativeLegacy) {
               const { getActiveEmbeddingIdentity } = await import('../core/embeddings/embedder.js');
               embeddingIdentity = getActiveEmbeddingIdentity();
@@ -2015,7 +2340,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
             }
             if (tentativeLegacy) {
               await withLbugReadOnlyNonRecovering(lbugPath, async () => {
-                const embeddingMeta = await loadMeta(entry.storagePath);
+                const embeddingMeta = await loadMeta(frozenOwner.canonicalStoragePath);
                 if (
                   !embeddingMeta ||
                   embeddingMetaFingerprint(embeddingMeta) !== tentativeFingerprint ||
@@ -2039,8 +2364,10 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                 await hasEmbeddableNodes(executeQuery, embedController.signal);
               });
             }
-            await withLbugDb(lbugPath, async () => {
-              let embeddingMeta = await loadMeta(entry.storagePath);
+            const withOwnedLbugDb = <T>(operation: () => Promise<T>): Promise<T> =>
+              withLbugDb(lbugPath, operation);
+            await withOwnedLbugDb(async () => {
+              let embeddingMeta = await loadMeta(frozenOwner.canonicalStoragePath);
               const authoritativeLegacy = isEmptyLegacyCheckpoint(
                 embeddingMeta?.embeddingCheckpoint,
               );
@@ -2072,20 +2399,62 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                   embedController.signal.throwIfAborted();
                   const graphStats = await getStrictLbugStats();
                   embedController.signal.throwIfAborted();
-                  const clearedMeta = {
-                    ...embeddingMeta,
-                    stats: { ...embeddingMeta.stats, ...graphStats, embeddings: 0 },
-                    embeddingCheckpoint: undefined,
-                  };
-                  await commitEmbedMetadata(barrier, 'COMMITTING_TERMINAL', async () => {
-                    await registerRepo(entry.path, clearedMeta, {
-                      name: entry.name,
-                      allowDuplicateName: true,
+                  if (graphStats.nodes === 0 && graphStats.edges === 0) {
+                    const clearedMeta = {
+                      ...embeddingMeta,
+                      stats: { ...embeddingMeta.stats, ...graphStats, embeddings: 0 },
+                      embeddingCheckpoint: undefined,
+                    };
+                    await commitEmbedMetadata(barrier, 'COMMITTING_TERMINAL', async () => {
+                      const owner = await assertZeroClearRegistryOwner(frozenOwner, clearedMeta);
+                      const commitReceipt: import('../storage/repo-manager.js').RegistryCommitReceiptRef =
+                        {};
+                      await registerRepo(owner.path, clearedMeta, {
+                        name: owner.name,
+                        allowDuplicateName: true,
+                        expectedOwner: owner,
+                        commitReceipt,
+                      });
+                      let metadataCommitted = false;
+                      try {
+                        const provenStoragePath = assertFrozenZeroClearRegistryOwner(
+                          owner,
+                          clearedMeta,
+                        );
+                        await saveMeta(provenStoragePath, clearedMeta);
+                        metadataCommitted = true;
+                        // The display path can retarget while the async metadata
+                        // save succeeds. Revalidate after persistence so success
+                        // never advertises a different physical owner.
+                        await assertZeroClearRegistryOwner(owner, clearedMeta);
+                      } catch (error) {
+                        const rollbackErrors: unknown[] = [error];
+                        if (commitReceipt.value) {
+                          try {
+                            await rollbackRegistryCommit(commitReceipt.value);
+                          } catch (rollbackError) {
+                            rollbackErrors.push(rollbackError);
+                          }
+                        }
+                        if (metadataCommitted) {
+                          try {
+                            await saveMeta(owner.canonicalStoragePath, embeddingMeta);
+                          } catch (rollbackError) {
+                            rollbackErrors.push(rollbackError);
+                          }
+                        }
+                        if (rollbackErrors.length > 1) {
+                          throw new AggregateError(
+                            rollbackErrors,
+                            'Embedding metadata commit failed and transactional rollback was incomplete',
+                          );
+                        }
+                        throw error;
+                      }
                     });
-                    await saveMeta(entry.storagePath, clearedMeta);
-                  });
-                  embeddingMeta = clearedMeta;
-                  return;
+                    embeddingMeta = clearedMeta;
+                    return;
+                  }
                 }
                 // Keep the old checkpoint persisted until the fresh pipeline
                 // either records a new window or finalizes successfully.
@@ -2148,7 +2517,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                   },
                 };
                 await commitEmbedMetadata(barrier, 'COMMITTING_CHECKPOINT', () =>
-                  saveMeta(entry.storagePath, checkpointMeta),
+                  saveMeta(frozenOwner.canonicalStoragePath, checkpointMeta),
                 );
                 embeddingMeta = checkpointMeta;
               };
@@ -2167,8 +2536,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                 (p) => {
                   embedJobManager.updateJob(job.id, {
                     progress: {
-                      phase:
-                        p.phase === 'ready' ? 'complete' : p.phase === 'error' ? 'failed' : p.phase,
+                      phase: p.phase === 'ready' || p.phase === 'error' ? 'embedding' : p.phase,
                       percent: p.percent,
                       message:
                         p.phase === 'loading-model'
@@ -2224,33 +2592,88 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                 embeddingCheckpoint: undefined,
               };
               await commitEmbedMetadata(barrier, 'COMMITTING_TERMINAL', () =>
-                saveMeta(entry.storagePath, terminalMeta),
+                saveMeta(frozenOwner.canonicalStoragePath, terminalMeta),
               );
               embeddingMeta = terminalMeta;
+              terminalOwnerMeta = terminalMeta;
             });
 
-            // Don't overwrite 'failed' if the job was cancelled while the pipeline was running
-            const current = embedJobManager.getJob(job.id);
-            if (!current || current.status !== 'failed') {
-              barrier.phase = 'COMPLETE';
-              embedJobManager.updateJob(job.id, { status: 'complete' });
+            // Ordinary embedding completion must prove that the raw registry
+            // path still identifies the physical owner captured at admission.
+            // Keep this immediately before publishing success so a symlink
+            // retarget during the pipeline or terminal metadata save fails
+            // closed instead of advertising orphaned embeddings.
+            if (terminalOwnerMeta) {
+              await assertZeroClearRegistryOwner(frozenOwner, terminalOwnerMeta);
             }
-            barrier.publishTerminalOutcome();
+
+            // The terminal metadata commit and owner validation are complete;
+            // cancellation during ownership release is now an accepted
+            // finalization cancellation, not a deferred commit decision.
+            const cancellationRequestedBeforeRelease = barrier.cancelRequested;
+            barrier.phase = 'RUNNING';
+            await ownershipLease.release();
+            ownershipLease = undefined;
+
+            // Cancellation may be accepted while ownership release is pending.
+            // Preserve it as the terminal failure instead of overwriting it as complete.
+            const current = embedJobManager.getJob(job.id);
+            const acceptedCancellation =
+              cancellationFailure ??
+              (!cancellationRequestedBeforeRelease && barrier.cancelRequested
+                ? barrier.cancelReason
+                : undefined);
+            if (acceptedCancellation) {
+              barrier.phase = 'FAILED';
+              failureMessage = acceptedCancellation;
+            } else if (!current || current.status !== 'failed') {
+              barrier.phase = 'COMPLETE';
+              embedJobManager.updateJob(job.id, {
+                status: 'complete',
+                progress: { phase: 'complete', percent: 100, message: 'Complete' },
+              });
+            }
           } catch (err: any) {
             if (barrier.phase !== 'COMPLETE') barrier.phase = 'FAILED';
             const current = embedJobManager.getJob(job.id);
             if (!current || current.status !== 'failed') {
+              failureMessage =
+                cancellationFailure ??
+                (causedByAbort(err) && barrier.cancelReason
+                  ? barrier.cancelReason
+                  : err.message || 'Embedding generation failed');
+            }
+          } finally {
+            let releaseMessage: string | undefined;
+            if (ownershipLease) {
+              try {
+                await ownershipLease.release();
+              } catch (releaseError) {
+                releaseMessage = `Ownership lock release failed: ${
+                  releaseError instanceof Error ? releaseError.message : String(releaseError)
+                }`;
+              }
+            }
+            const current = embedJobManager.getJob(job.id);
+            const combinedFailure = [current?.error ?? failureMessage, releaseMessage]
+              .filter((message): message is string => Boolean(message))
+              .join('; ');
+            if (combinedFailure && (!current || current.status !== 'failed' || releaseMessage)) {
               embedJobManager.updateJob(job.id, {
                 status: 'failed',
-                error: err.message || 'Embedding generation failed',
+                error: combinedFailure,
+                progress: {
+                  phase: 'failed',
+                  percent: current?.progress.percent ?? 0,
+                  message: combinedFailure,
+                },
               });
             }
             barrier.publishTerminalOutcome();
-          } finally {
             clearTimeout(embedTimeout);
             embedBarriers.delete(job.id);
             embedAborters.delete(job.id);
-            releaseRepoLock(repoLockPath);
+            releaseRepoLock(repoLockPath, repoRootLockPath);
           }
         })();
 
@@ -2326,7 +2749,9 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         res.status(400).json({ error: `Job already ${settledJob.status}` });
         return;
       }
-      if (outcome === 'cancelled') embedJobManager.cancelJob(jobId, 'Cancelled by user');
+      // An immediate cancellation response is intentionally returned before
+      // the worker finishes cleanup. The worker publishes the durable failed
+      // state only after ownership release so cleanup failures remain visible.
     } else {
       embedJobManager.cancelJob(jobId, 'Cancelled by user');
     }
