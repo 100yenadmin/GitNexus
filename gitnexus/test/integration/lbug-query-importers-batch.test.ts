@@ -157,6 +157,12 @@ const strictStatsGraph = (includeRelation: boolean) =>
 
 withTestLbugDB('strict-native-counts', (handle) => {
   describe('getStrictLbugStats native count rows (#254)', () => {
+    it('returns zero counts from an empty LadybugDB', async () => {
+      const { getStrictLbugStats } = await import('../../src/core/lbug/lbug-adapter.js');
+
+      await expect(getStrictLbugStats()).resolves.toEqual({ nodes: 0, edges: 0 });
+    });
+
     it('returns safe nonnegative node and relation counts from LadybugDB', async () => {
       const { getStrictLbugStats, loadGraphToLbug } =
         await import('../../src/core/lbug/lbug-adapter.js');
