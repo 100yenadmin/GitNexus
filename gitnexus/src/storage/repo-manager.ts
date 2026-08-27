@@ -1033,9 +1033,7 @@ const hasValidRawRegistryStatsNumbers = (raw: string): boolean => {
         return;
       }
       const isEntryStatProperty =
-        jsonPath.length === 2 &&
-        typeof jsonPath[0] === 'number' &&
-        jsonPath[1] === 'stats';
+        jsonPath.length === 2 && typeof jsonPath[0] === 'number' && jsonPath[1] === 'stats';
       const isBranchStatProperty =
         jsonPath.length === 4 &&
         typeof jsonPath[0] === 'number' &&
