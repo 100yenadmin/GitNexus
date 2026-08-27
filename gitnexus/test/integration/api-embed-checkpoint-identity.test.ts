@@ -1842,6 +1842,8 @@ describe('POST /api/embed completed-checkpoint identity', () => {
   });
 
   it('runs the embedding pipeline when the strict recount becomes nonempty', async () => {
+    const enrichedRepo = { ...REPO, remoteUrl: 'https://example.invalid/enriched.git' };
+    state.listRegisteredRepos.mockResolvedValue([enrichedRepo]);
     state.currentMeta = makeMeta(LIVE_DIGEST);
     state.currentMeta.embeddingCheckpoint = {
       ...state.currentMeta.embeddingCheckpoint!,
@@ -1869,7 +1871,10 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     expect(state.runEmbeddingPipeline).toHaveBeenCalledOnce();
     expect(state.registerRepo).toHaveBeenCalledWith(
       REPO.path,
-      expect.objectContaining({ stats: { nodes: 4, edges: 5, embeddings: 0 } }),
+      expect.objectContaining({
+        remoteUrl: enrichedRepo.remoteUrl,
+        stats: { nodes: 4, edges: 5, embeddings: 0 },
+      }),
       expect.objectContaining({
         name: REPO.name,
         allowDuplicateName: true,
@@ -1877,6 +1882,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
       }),
     );
     expect(state.currentMeta.stats).toEqual({ nodes: 4, edges: 5, embeddings: 0 });
+    expect(state.currentMeta.remoteUrl).toBeUndefined();
     expect(state.currentMeta.embeddingCheckpoint).toBeUndefined();
   });
 

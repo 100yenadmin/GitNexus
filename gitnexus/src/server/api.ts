@@ -2415,12 +2415,18 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                       const owner = await assertZeroClearRegistryOwner(frozenOwner, clearedMeta);
                       const commitReceipt: import('../storage/repo-manager.js').RegistryCommitReceiptRef =
                         {};
-                      await registerRepo(owner.path, clearedMeta, {
-                        name: owner.name,
-                        allowDuplicateName: true,
-                        expectedOwner: owner,
-                        commitReceipt,
-                      });
+                      await registerRepo(
+                        owner.path,
+                        owner.remoteUrl === undefined
+                          ? clearedMeta
+                          : { ...clearedMeta, remoteUrl: owner.remoteUrl },
+                        {
+                          name: owner.name,
+                          allowDuplicateName: true,
+                          expectedOwner: owner,
+                          commitReceipt,
+                        },
+                      );
                       let metadataCommitted = false;
                       try {
                         const provenStoragePath = assertFrozenZeroClearRegistryOwner(
@@ -2607,12 +2613,18 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                   const owner = await assertZeroClearRegistryOwner(frozenOwner, terminalMeta);
                   const commitReceipt: import('../storage/repo-manager.js').RegistryCommitReceiptRef =
                     {};
-                  await registerRepo(owner.path, terminalMeta, {
-                    name: owner.name,
-                    allowDuplicateName: true,
-                    expectedOwner: owner,
-                    commitReceipt,
-                  });
+                  await registerRepo(
+                    owner.path,
+                    owner.remoteUrl === undefined
+                      ? terminalMeta
+                      : { ...terminalMeta, remoteUrl: owner.remoteUrl },
+                    {
+                      name: owner.name,
+                      allowDuplicateName: true,
+                      expectedOwner: owner,
+                      commitReceipt,
+                    },
+                  );
                   let metadataCommitted = false;
                   try {
                     const provenStoragePath = assertFrozenZeroClearRegistryOwner(
