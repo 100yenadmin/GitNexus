@@ -7,7 +7,7 @@ import path from 'path';
 import lbug from '@ladybugdb/core';
 import { closeQueryResults } from './query-result-utils.js';
 import { escapeCypherString } from './cypher-escape.js';
-import { isMissingColumnOrTableError } from './schema-errors.js';
+import { isExpectedMissingTableError, isMissingColumnOrTableError } from './schema-errors.js';
 import { withConnLock } from './conn-lock.js';
 import { isWalDriverActive } from './wal-driver-state.js';
 import { KnowledgeGraph } from '../graph/types.js';
@@ -16,14 +16,26 @@ import {
   REL_TABLE_NAME,
   SCHEMA_QUERIES,
   EMBEDDING_TABLE_NAME,
+  EMBEDDING_INDEX_NAME,
+  EMBEDDING_SCHEMA,
   CREATE_VECTOR_INDEX_QUERY,
+  DROP_VECTOR_INDEX_QUERY,
   STALE_HASH_SENTINEL,
+  EMBEDDING_DIMS,
   NodeTableName,
 } from './schema.js';
 import { streamAllCSVsToDisk, type StreamedCSVResult } from './csv-generator.js';
 import type { PdgEmitManifest } from './pdg-emit-sink.js';
 import { getNodeLabel as deriveNodeLabel, type WriteStreamFactory } from './rel-pair-routing.js';
 import { EMBEDDABLE_LABELS, type CachedEmbedding } from '../embeddings/types.js';
+import {
+  embeddingPhysicalRowDigest,
+  embeddingPhysicalRowsDigest,
+  embeddingPhysicalVectorInfo,
+  embeddingIdentitySetDigest,
+  embeddingSemanticIdentity,
+} from '../embeddings/identity-digest.js';
+import type { AnalyzeStorageOwnershipToken } from '../staged-promotion.js';
 import { extensionManager, type ExtensionEnsureOptions } from './extension-loader.js';
 import {
   classifyDeleteAllError,
@@ -684,6 +696,269 @@ export const initLbug = async (dbPath: string) => {
 };
 
 /**
+ * Open an existing database for a narrowly-scoped maintenance operation.
+ *
+ * Unlike {@link initLbug}, this path never creates/removes a database, runs
+ * schema DDL, quarantines sidecars, or attempts recovery. Callers must perform
+ * their own storage/metadata preflight before entering this function. The
+ * init lock only closes the race with another LadybugDB opener; it is not a
+ * recovery mechanism.
+ */
+export const initLbugForMaintenance = async (dbPath: string) =>
+  runWithSessionLock(async () => {
+    const releaseInitLock = await acquireInitLock(dbPath);
+    try {
+      if (conn || db) await safeClose();
+      resetOpenConnectionState();
+
+      const state = await fs.lstat(dbPath);
+      if (!state.isFile() || state.isSymbolicLink()) {
+        throw new Error(`Maintenance requires a regular, non-symlink database file at ${dbPath}`);
+      }
+
+      const sidecarState = await preflightLbugSidecars(dbPath, {
+        mode: 'write',
+        logger,
+        allowQuarantine: false,
+      });
+      if (sidecarState.kind !== 'clean') {
+        throw new Error(
+          `Maintenance refused: LadybugDB sidecar state is ${sidecarState.kind}; ` +
+            'close the active writer or recover the index before retrying.',
+        );
+      }
+
+      const opened = await openLbugConnection(lbug, dbPath);
+      db = opened.db;
+      conn = opened.conn;
+      currentDbPath = dbPath;
+      currentDbReadOnly = false;
+      return { db, conn };
+    } finally {
+      await releaseInitLock();
+    }
+  });
+
+/**
+ * Open an existing database for a byte-preserving maintenance preflight.
+ *
+ * This deliberately bypasses the normal read-only recovery path: it never
+ * quarantines a WAL, replays shadow pages through a writable handle, creates
+ * an init lock, or opens the database writable. Callers must close the shared
+ * handle with {@link closeLbug} when their bounded read is complete.
+ */
+async function runLbugReadOnlyNonRecovering(dbPath: string): Promise<LbugConnectionHandle>;
+async function runLbugReadOnlyNonRecovering<T>(
+  dbPath: string,
+  operation: () => Promise<T>,
+): Promise<T>;
+async function runLbugReadOnlyNonRecovering<T>(
+  dbPath: string,
+  operation?: () => Promise<T>,
+): Promise<LbugConnectionHandle | T> {
+  return runWithSessionLock(async () => {
+    if (conn || db) await safeClose();
+    resetOpenConnectionState();
+
+    const state = await fs.lstat(dbPath);
+    if (!state.isFile() || state.isSymbolicLink()) {
+      throw new Error(`Read-only preflight requires a regular database file at ${dbPath}`);
+    }
+
+    const sidecarState = await preflightLbugSidecars(dbPath, {
+      mode: 'read-only',
+      logger,
+      allowQuarantine: false,
+    });
+    if (sidecarState.kind !== 'clean') {
+      throw new Error(
+        `Read-only preflight refused: LadybugDB sidecar state is ${sidecarState.kind}; ` +
+          'recover the index before retrying.',
+      );
+    }
+
+    const opened = await openLbugConnection(lbug, dbPath, {
+      readOnly: true,
+      throwOnWalReplayFailure: true,
+    });
+    try {
+      await queryAndDrain(opened.conn, READ_ONLY_SHADOW_REPLAY_PROBE);
+    } catch (error) {
+      await closeLbugConnection(opened).catch(() => {});
+      throw error;
+    }
+
+    db = opened.db;
+    conn = opened.conn;
+    currentDbPath = dbPath;
+    currentDbReadOnly = true;
+    if (!operation) return opened;
+    try {
+      return await operation();
+    } finally {
+      await safeClose().finally(resetOpenConnectionState);
+    }
+  });
+}
+
+export const initLbugReadOnlyNonRecovering = (dbPath: string) =>
+  runLbugReadOnlyNonRecovering(dbPath);
+
+export const withLbugReadOnlyNonRecovering = async <T>(
+  dbPath: string,
+  operation: () => Promise<T>,
+): Promise<T> => runLbugReadOnlyNonRecovering(dbPath, operation);
+
+export interface LbugOwnershipLease {
+  /** Acquire the exact re-frozen physical storage boundary while retaining the companion lease. */
+  acquireStorage(storagePath: string): Promise<void>;
+  release(): Promise<void>;
+  /** Attach a forked analyzer generation before it receives its start IPC. */
+  attachWorker(workerPid: number): Promise<void>;
+}
+
+export const acquireLbugOwnership = async (
+  storagePath: string,
+  repoRoot: string,
+): Promise<LbugOwnershipLease> => {
+  let releaseGate!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    releaseGate = resolve;
+  });
+  let markEntered!: () => void;
+  let markFailed!: (reason?: unknown) => void;
+  const entered = new Promise<void>((resolve, reject) => {
+    markEntered = resolve;
+    markFailed = reject;
+  });
+  const { analyzeStorageOwnershipIsHeld, withAnalyzeOwnershipLock } =
+    await import('../staged-promotion.js');
+  const { attachAnalyzeOwnershipWorker } = await import('../staged-promotion.js');
+  let initialStorageOwnership: AnalyzeStorageOwnershipToken | undefined;
+  const ownership = withAnalyzeOwnershipLock(
+    storagePath,
+    async () => {
+      markEntered();
+      await gate;
+    },
+    {
+      repoRoot,
+      createStoragePath: false,
+      onStorageOwnershipAcquired: (token) => {
+        initialStorageOwnership = token;
+      },
+    },
+  );
+  void ownership.catch(markFailed);
+  await entered;
+  let released = false;
+  let frozenStoragePath: string | undefined;
+  let frozenStorageOwnership: AnalyzeStorageOwnershipToken | undefined;
+  let storageOwnership: Promise<void> | undefined;
+  let storageReady: Promise<void> | undefined;
+  let releaseStorageGate: (() => void) | undefined;
+  return {
+    acquireStorage: async (nextStoragePath: string) => {
+      if (released) throw new Error('Analyze ownership was released before storage acquisition');
+      const resolvedStoragePath = path.resolve(nextStoragePath);
+      if (
+        initialStorageOwnership &&
+        analyzeStorageOwnershipIsHeld(resolvedStoragePath, initialStorageOwnership)
+      ) {
+        frozenStoragePath = resolvedStoragePath;
+        frozenStorageOwnership = initialStorageOwnership;
+        return;
+      }
+      if (frozenStoragePath !== undefined) {
+        if (frozenStoragePath === resolvedStoragePath) {
+          await storageReady;
+          return;
+        }
+        throw new Error('Analyze storage ownership is already frozen to a different target');
+      }
+      frozenStoragePath = resolvedStoragePath;
+      const acquisition = (async () => {
+        let markStorageEntered!: () => void;
+        let markStorageFailed!: (reason?: unknown) => void;
+        const storageEntered = new Promise<void>((resolve, reject) => {
+          markStorageEntered = resolve;
+          markStorageFailed = reject;
+        });
+        const storageGate = new Promise<void>((resolve) => {
+          releaseStorageGate = resolve;
+        });
+        let acquiredStorageOwnership: AnalyzeStorageOwnershipToken | undefined;
+        storageOwnership = withAnalyzeOwnershipLock(
+          resolvedStoragePath,
+          async () => {
+            markStorageEntered();
+            await storageGate;
+          },
+          {
+            createStoragePath: false,
+            onStorageOwnershipAcquired: (token) => {
+              acquiredStorageOwnership = token;
+            },
+          },
+        );
+        void storageOwnership.catch(markStorageFailed);
+        await storageEntered;
+        if (!acquiredStorageOwnership) {
+          throw new Error(
+            `Analyze storage path does not exist or disappeared before ownership: ${resolvedStoragePath}`,
+          );
+        }
+        frozenStorageOwnership = acquiredStorageOwnership;
+      })();
+      storageReady = acquisition;
+      try {
+        await acquisition;
+      } catch (error) {
+        releaseStorageGate?.();
+        await storageOwnership.catch(() => undefined);
+        storageOwnership = undefined;
+        releaseStorageGate = undefined;
+        frozenStoragePath = undefined;
+        frozenStorageOwnership = undefined;
+        throw error;
+      } finally {
+        storageReady = undefined;
+      }
+    },
+    attachWorker: async (workerPid: number) => {
+      if (released) throw new Error('Analyze ownership was released before worker attachment');
+      const attachedStoragePath = frozenStoragePath ?? path.resolve(storagePath);
+      const attachedStorageOwnership = frozenStorageOwnership ?? initialStorageOwnership;
+      if (
+        !attachedStorageOwnership ||
+        !analyzeStorageOwnershipIsHeld(attachedStoragePath, attachedStorageOwnership)
+      ) {
+        throw new Error('Analyze storage ownership must be acquired before worker attachment');
+      }
+      await attachAnalyzeOwnershipWorker(
+        attachedStoragePath,
+        repoRoot,
+        workerPid,
+        attachedStorageOwnership,
+      );
+    },
+    release: async () => {
+      if (!released) {
+        released = true;
+        releaseStorageGate?.();
+        releaseGate();
+      }
+      const failures: unknown[] = [];
+      if (storageOwnership) await storageOwnership.catch((error) => failures.push(error));
+      await ownership.catch((error) => failures.push(error));
+      if (failures.length === 1) throw failures[0];
+      if (failures.length > 1)
+        throw new AggregateError(failures, 'Analyze ownership release failed');
+    },
+  };
+};
+
+/**
  * Execute multiple queries against one repo DB atomically.
  * While the callback runs, no other request can switch the active DB.
  *
@@ -694,8 +969,20 @@ export const initLbug = async (dbPath: string) => {
 export const withLbugDb = async <T>(
   dbPath: string,
   operation: () => Promise<T>,
-  options: { readOnly?: boolean } = {},
+  options: {
+    readOnly?: boolean;
+    ownershipStoragePath?: string;
+    ownershipRepoRoot?: string;
+  } = {},
 ): Promise<T> => {
+  if (options.ownershipStoragePath) {
+    const { withAnalyzeOwnershipLock } = await import('../staged-promotion.js');
+    return withAnalyzeOwnershipLock(
+      options.ownershipStoragePath,
+      () => withLbugDb(dbPath, operation, { readOnly: options.readOnly }),
+      { repoRoot: options.ownershipRepoRoot },
+    );
+  }
   let lastError: unknown;
   const readOnly = options.readOnly === true;
   for (let attempt = 1; attempt <= DB_LOCK_RETRY_ATTEMPTS; attempt++) {
@@ -890,7 +1177,7 @@ const doInitLbug = async (dbPath: string, readOnly: boolean = false) => {
 export type LbugProgressCallback = (message: string) => void;
 
 /**
- * Run a COPY, retrying once with IGNORE_ERRORS=true (which skips row-level
+ * Run a relationship COPY, retrying once with IGNORE_ERRORS=true (which skips row-level
  * errors) on first failure. On a second failure, hand the RAW retry error to
  * `onError` — each call site formats + slices its own message (#2226 F5: node
  * COPY slices to 200 chars and throws; relationship COPY slices to 80 and warns,
@@ -921,9 +1208,11 @@ const copyCsvWithRetry = async (
  * Bulk-COPY every node CSV sequentially on the single writable connection
  * (LadybugDB allows one write txn at a time). Extracted from loadGraphToLbug so
  * it can run either at the node-phase boundary — overlapping the relationship
- * emit pass (#2203) — or after emit in the serial escape-hatch path. Each COPY
- * keeps the IGNORE_ERRORS=true retry; a hard failure throws (no node rows ⇒ the
- * relationship COPY would dangle on missing endpoints).
+ * emit pass (#2203) — or after emit in the serial escape-hatch path. Node data
+ * is identity-bearing and has no proven rollback after a partial COPY, so any
+ * COPY failure aborts the generation. In particular, never retry node COPY
+ * with IGNORE_ERRORS=true: that converted native row corruption into a
+ * superficially successful but incomplete graph.
  */
 export interface LbugLoadHooks {
   onNodeCopyCommitted?: (table: NodeTableName, index: number, total: number) => void;
@@ -942,10 +1231,12 @@ const copyNodeCSVs = async (
     log(`Loading nodes ${stepsDone}/${totalSteps}: ${table} (${rows.toLocaleString()} rows)`);
 
     const copyQuery = getCopyQuery(table, normalizeCopyPath(csvPath));
-    await copyCsvWithRetry(targetConn, copyQuery, (retryErr) => {
-      const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr);
-      throw new Error(`COPY failed for ${table}: ${retryMsg.slice(0, 200)}`);
-    });
+    try {
+      await queryAndDrain(targetConn, copyQuery);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`COPY failed for ${table}: ${message.slice(0, 200)}`);
+    }
     hooks?.onNodeCopyCommitted?.(table, stepsDone - 1, totalSteps);
   }
 };
@@ -1692,6 +1983,61 @@ export const getLbugStats = async (): Promise<{ nodes: number; edges: number }> 
   return { nodes: totalNodes, edges: totalEdges };
 };
 
+type StrictCountRow = { cnt?: unknown; 0?: unknown };
+type StrictCountQuery = (cypher: string) => Promise<StrictCountRow[]>;
+
+const queryStrictCount = async (
+  tableName: string,
+  cypher: string,
+  runQuery: StrictCountQuery,
+): Promise<number> => {
+  try {
+    const rows = await runQuery(cypher);
+    const row = rows.length === 1 ? rows[0] : undefined;
+    const rawCount = row?.cnt ?? row?.[0];
+    if (typeof rawCount !== 'number' && typeof rawCount !== 'bigint') {
+      throw new Error(`Invalid graph count returned for ${tableName}`);
+    }
+    const count = Number(rawCount);
+    if (!Number.isSafeInteger(count) || count < 0) {
+      throw new Error(`Invalid graph count returned for ${tableName}`);
+    }
+    return count;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (isExpectedMissingTableError(message, tableName)) return 0;
+    throw error;
+  }
+};
+
+/** Fail-closed graph counts for the /api/embed zero-checkpoint commit path. */
+export const getStrictLbugStats = async (
+  queryOverride?: StrictCountQuery,
+): Promise<{ nodes: number; edges: number }> => {
+  let runQuery = queryOverride;
+  if (!runQuery) {
+    const c = conn;
+    if (!c) throw new Error('LadybugDB not initialized. Call initLbug first.');
+    runQuery = (cypher: string) => withConnLock(async () => readQueryRows(await c.query(cypher)));
+  }
+
+  let nodes = 0;
+  for (const tableName of NODE_TABLES) {
+    nodes += await queryStrictCount(
+      tableName,
+      `MATCH (n:${escapeTableName(tableName)}) RETURN count(n) AS cnt`,
+      runQuery,
+    );
+    if (!Number.isSafeInteger(nodes)) throw new Error('Invalid total graph node count');
+  }
+  const edges = await queryStrictCount(
+    REL_TABLE_NAME,
+    `MATCH ()-[r:${REL_TABLE_NAME}]->() RETURN count(r) AS cnt`,
+    runQuery,
+  );
+  return { nodes, edges };
+};
+
 /**
  * Load cached embeddings from LadybugDB before a rebuild.
  * Returns all embedding vectors so they can be re-inserted after the graph is reloaded,
@@ -1705,6 +2051,580 @@ export interface LoadCachedEmbeddingsOptions {
   /** Hard-capped at 256 so a 2,048-dimensional index stays bounded. */
   batchSize?: number;
 }
+
+export interface EmbeddingIntegrityReport {
+  tablePresent: boolean;
+  physicalRows: number;
+  validRows: number;
+  recoverableRows: number;
+  emptyIdRows: number;
+  emptyNodeIdRows: number;
+  invalidChunkRows: number;
+  noncanonicalIdRows: number;
+  duplicateIdRows: number;
+  duplicateSemanticRows: number;
+  orphanRows: number;
+  wrongDimensionRows: number;
+  recoverableIdentitySha256: string;
+  physicalRowsSha256: string;
+}
+
+const projectionField = (row: any, name: string, index: number): unknown =>
+  row && name in row ? row[name] : row?.[index];
+const normalizedText = (value: unknown): string =>
+  value === null || value === undefined ? '' : String(value);
+const strictInteger = (value: unknown): number =>
+  Number.isSafeInteger(value)
+    ? (value as number)
+    : typeof value === 'bigint' &&
+        Number.isSafeInteger(Number(value)) &&
+        BigInt(Number(value)) === value
+      ? Number(value)
+      : Number.NaN;
+const ownerLabelForNodeId = (nodeId: string): string => {
+  const separator = nodeId.indexOf(':');
+  return separator > 0 ? nodeId.slice(0, separator) : '';
+};
+export const isMissingContentHashError = (error: unknown): boolean =>
+  /^Binder exception:\s*Cannot find property contentHash(?: for e)?\.?$/.test(
+    error instanceof Error ? error.message : String(error),
+  );
+const MAX_STORED_EMBEDDING_DIMENSIONS = 65_536;
+
+/** Read the vector width declared by this database's embedding table. */
+export const getStoredEmbeddingDimensions = async (): Promise<number> => {
+  const c = conn;
+  if (!c) throw new Error('LadybugDB not initialized. Call initLbug first.');
+  const rows = await withConnLock(async () =>
+    readQueryRows(await c.query(`CALL TABLE_INFO('${EMBEDDING_TABLE_NAME}') RETURN *`)),
+  );
+  const embedding = rows.find((row) => row.name === 'embedding');
+  const match =
+    typeof embedding?.type === 'string' && /^FLOAT\[([1-9][0-9]*)\]$/.exec(embedding.type);
+  const dimensions = match ? Number(match[1]) : NaN;
+  if (!Number.isSafeInteger(dimensions) || dimensions > MAX_STORED_EMBEDDING_DIMENSIONS) {
+    throw new Error('Stored embedding dimension is unavailable or invalid.');
+  }
+  return dimensions;
+};
+
+interface EmbeddingPreservationObservation {
+  id: string;
+  nodeId: string;
+  chunkIndex: number;
+  dimensions: number;
+  finite: boolean;
+}
+
+export type EmbeddingPreservationRow = CachedEmbedding & { id: string };
+
+export interface EmbeddingPreservationScanOptions {
+  onBatch?: (batch: readonly EmbeddingPreservationRow[]) => void | Promise<void>;
+  batchSize?: number;
+}
+
+export interface EmbeddingPreservationScan {
+  tablePresent: boolean;
+  physicalRows: number;
+  acceptedRows: number;
+  rejectedRows: number;
+  implicatedOwnerIds: string[];
+  missingOwnerLabels: string[];
+}
+
+export const scanEmbeddingPreservationRows = async (
+  options: EmbeddingPreservationScanOptions = {},
+): Promise<EmbeddingPreservationScan> => {
+  const c = conn;
+  if (!c) throw new Error('LadybugDB not initialized. Call initLbug first.');
+  const batchSize = options.batchSize ?? 256;
+  if (!Number.isSafeInteger(batchSize) || batchSize <= 0 || batchSize > 256) {
+    throw new Error('Embedding preservation batchSize must be an integer in [1, 256]');
+  }
+
+  return withConnLock(async () => {
+    const ownerLabels = new Set<string>([...EMBEDDABLE_LABELS, 'File']);
+    const observations: EmbeddingPreservationObservation[] = [];
+    const idCounts = new Map<string, number>();
+    const semanticCounts = new Map<string, number>();
+    const ownerIdsByLabel = new Map<string, Set<string>>();
+    const ownerLabel = (nodeId: string): string => {
+      const separator = nodeId.indexOf(':');
+      return separator > 0 ? nodeId.slice(0, separator) : '';
+    };
+    const semanticKey = (nodeId: string, chunkIndex: number): string =>
+      nodeId.trim() && Number.isSafeInteger(chunkIndex) && chunkIndex >= 0
+        ? embeddingSemanticIdentity(nodeId, chunkIndex)
+        : '';
+    let hasContentHash = true;
+    let physicalRows = 0;
+    const empty = (tablePresent: boolean): EmbeddingPreservationScan => ({
+      tablePresent,
+      physicalRows: 0,
+      acceptedRows: 0,
+      rejectedRows: 0,
+      implicatedOwnerIds: [],
+      missingOwnerLabels: [],
+    });
+    const readRows = async (
+      query: string,
+      accept: (row: any) => void | Promise<void>,
+    ): Promise<void> => {
+      const raw = await c.query(query);
+      const results = Array.isArray(raw) ? raw : [raw];
+      let failed = false;
+      try {
+        for (const result of results) {
+          while (await result.hasNext()) await accept(await result.getNext());
+        }
+      } catch (error) {
+        failed = true;
+        throw error;
+      } finally {
+        try {
+          await drainQueryResult(results);
+        } catch (error) {
+          if (!failed) throw error;
+        }
+      }
+    };
+    const readFirstPass = async (withHash: boolean): Promise<void> => {
+      const hashProjection = withHash ? ', e.contentHash AS contentHash' : '';
+      await readRows(
+        `MATCH (e:${EMBEDDING_TABLE_NAME}) RETURN e.id AS id, e.nodeId AS nodeId, ` +
+          `e.chunkIndex AS chunkIndex, e.startLine AS startLine, e.endLine AS endLine, ` +
+          `e.embedding AS embedding${hashProjection}`,
+        async (row) => {
+          const id = normalizedText(projectionField(row, 'id', 0));
+          const nodeId = normalizedText(projectionField(row, 'nodeId', 1));
+          const rawChunk = projectionField(row, 'chunkIndex', 2);
+          const chunkIndex = strictInteger(rawChunk);
+          const vector = projectionField(row, 'embedding', 5);
+          const vectorInfo = embeddingPhysicalVectorInfo(vector);
+          const observation: EmbeddingPreservationObservation = {
+            id,
+            nodeId,
+            chunkIndex,
+            dimensions: vectorInfo.dimensions,
+            finite: vectorInfo.finite === 'finite',
+          };
+          observations.push(observation);
+          physicalRows++;
+          idCounts.set(id, (idCounts.get(id) ?? 0) + 1);
+          const key = semanticKey(nodeId, chunkIndex);
+          if (key) semanticCounts.set(key, (semanticCounts.get(key) ?? 0) + 1);
+          const label = ownerLabelForNodeId(nodeId);
+          if (ownerLabels.has(label)) {
+            let ids = ownerIdsByLabel.get(label);
+            if (!ids) ownerIdsByLabel.set(label, (ids = new Set()));
+            ids.add(nodeId);
+          }
+        },
+      );
+    };
+
+    try {
+      await readFirstPass(true);
+    } catch (error) {
+      if (isMissingEmbeddingTableError(error)) return empty(false);
+      const message = error instanceof Error ? error.message : String(error);
+      if (
+        !isMissingColumnOrTableError(message) &&
+        !message.includes('Cannot find property contentHash')
+      ) {
+        throw error;
+      }
+      observations.length = 0;
+      idCounts.clear();
+      semanticCounts.clear();
+      ownerIdsByLabel.clear();
+      physicalRows = 0;
+      hasContentHash = false;
+      try {
+        await readFirstPass(false);
+      } catch (fallbackError) {
+        if (isMissingEmbeddingTableError(fallbackError)) return empty(false);
+        throw fallbackError;
+      }
+    }
+
+    const liveOwners = new Map<string, Set<string>>();
+    const missingOwnerLabels = new Set<string>();
+    for (const [label, candidates] of ownerIdsByLabel) {
+      const ids = new Set<string>();
+      liveOwners.set(label, ids);
+      try {
+        const sorted = [...candidates].sort();
+        for (let offset = 0; offset < sorted.length; offset += 256) {
+          const literal = sorted
+            .slice(offset, offset + 256)
+            .map((id) => `'${escapeCypherString(id)}'`)
+            .join(', ');
+          await readRows(
+            `MATCH (n:${escapeTableName(label)}) WHERE n.id IN [${literal}] RETURN n.id AS id`,
+            (row) => void ids.add(String(row.id ?? row[0] ?? '')),
+          );
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (!isMissingColumnOrTableError(message)) throw error;
+        missingOwnerLabels.add(label);
+      }
+    }
+
+    const implicated = new Set<string>();
+    const acceptedIds = new Set<string>();
+    for (const row of observations) {
+      const label = ownerLabel(row.nodeId);
+      const chunkValid = Number.isSafeInteger(row.chunkIndex) && row.chunkIndex >= 0;
+      const semantic = semanticKey(row.nodeId, row.chunkIndex);
+      const ownerPresent =
+        ownerLabels.has(label) &&
+        !missingOwnerLabels.has(label) &&
+        liveOwners.get(label)?.has(row.nodeId) === true;
+      const canonical =
+        row.id.trim() !== '' &&
+        row.nodeId.trim() !== '' &&
+        chunkValid &&
+        row.id === `${row.nodeId}:${row.chunkIndex}`;
+      const defective =
+        !canonical || !row.finite || row.dimensions !== EMBEDDING_DIMS || !ownerPresent;
+      if (
+        row.nodeId.trim() &&
+        (defective ||
+          (idCounts.get(row.id) ?? 0) > 1 ||
+          (semantic !== '' && (semanticCounts.get(semantic) ?? 0) > 1))
+      ) {
+        implicated.add(row.nodeId);
+      }
+    }
+    for (const row of observations) {
+      const label = ownerLabel(row.nodeId);
+      const chunkValid = Number.isSafeInteger(row.chunkIndex) && row.chunkIndex >= 0;
+      const semantic = semanticKey(row.nodeId, row.chunkIndex);
+      if (
+        row.id.trim() !== '' &&
+        row.nodeId.trim() !== '' &&
+        chunkValid &&
+        row.finite &&
+        row.dimensions === EMBEDDING_DIMS &&
+        row.id === `${row.nodeId}:${row.chunkIndex}` &&
+        (idCounts.get(row.id) ?? 0) === 1 &&
+        (semanticCounts.get(semantic) ?? 0) === 1 &&
+        ownerLabels.has(label) &&
+        !missingOwnerLabels.has(label) &&
+        liveOwners.get(label)?.has(row.nodeId) === true &&
+        !implicated.has(row.nodeId)
+      )
+        acceptedIds.add(row.id);
+    }
+
+    let pending: EmbeddingPreservationRow[] = [];
+    let acceptedRows = 0;
+    const hashProjection = hasContentHash ? ', e.contentHash AS contentHash' : '';
+    await readRows(
+      `MATCH (e:${EMBEDDING_TABLE_NAME}) RETURN e.id AS id, e.nodeId AS nodeId, ` +
+        `e.chunkIndex AS chunkIndex, e.startLine AS startLine, e.endLine AS endLine, ` +
+        `e.embedding AS embedding${hashProjection} ORDER BY e.id`,
+      async (row) => {
+        const id = normalizedText(projectionField(row, 'id', 0));
+        if (!acceptedIds.has(id)) return;
+        const vector = row.embedding ?? row[5];
+        const embedding =
+          Array.isArray(vector) || ArrayBuffer.isView(vector)
+            ? Array.from(vector as ArrayLike<number>)
+            : [];
+        const hash = hasContentHash ? (row.contentHash ?? row[6]) : undefined;
+        pending.push({
+          id,
+          nodeId: normalizedText(projectionField(row, 'nodeId', 1)),
+          chunkIndex: strictInteger(projectionField(row, 'chunkIndex', 2)),
+          startLine: strictInteger(projectionField(row, 'startLine', 3)),
+          endLine: strictInteger(projectionField(row, 'endLine', 4)),
+          embedding,
+          ...(hash === null || hash === undefined ? {} : { contentHash: String(hash) }),
+        });
+        acceptedRows++;
+        if (pending.length === batchSize) {
+          await options.onBatch?.(pending);
+          pending = [];
+        }
+      },
+    );
+    if (pending.length > 0) await options.onBatch?.(pending);
+    return {
+      tablePresent: true,
+      physicalRows,
+      acceptedRows,
+      rejectedRows: physicalRows - acceptedRows,
+      implicatedOwnerIds: [...implicated].sort(),
+      missingOwnerLabels: [...missingOwnerLabels].sort(),
+    };
+  });
+};
+
+/**
+ * Scan embedding identity without materializing vectors. This deliberately uses
+ * streamed projections instead of primary-key equality: corrupted LadybugDB
+ * artifacts can expose blank keys during a scan while `WHERE e.id = ''`
+ * incorrectly reports zero matches.
+ */
+export const inspectEmbeddingIntegrity = async (
+  expectedDimensions: number = EMBEDDING_DIMS,
+  fullDigest = false,
+): Promise<EmbeddingIntegrityReport> => {
+  const c = conn;
+  if (!c) throw new Error('LadybugDB not initialized. Call initLbug first.');
+
+  return withConnLock(async () => {
+    type IdentityRow = {
+      id: string;
+      nodeId: string;
+      chunkIndex: number;
+      dimensions: number;
+      semanticKey: string;
+    };
+    const rows: IdentityRow[] = [];
+    const idCounts = new Map<string, number>();
+    const semanticCounts = new Map<string, number>();
+    const ownerCandidates = new Set<string>();
+    let emptyIdRows = 0;
+    let emptyNodeIdRows = 0;
+    let invalidChunkRows = 0;
+    let noncanonicalIdRows = 0;
+    let duplicateIdRows = 0;
+    let duplicateSemanticRows = 0;
+    let wrongDimensionRows = 0;
+
+    const stream = async (query: string, accept: (row: any) => void): Promise<void> => {
+      const raw = await c.query(query);
+      const results = Array.isArray(raw) ? raw : [raw];
+      let streamError: unknown;
+      try {
+        for (const result of results) {
+          while (await result.hasNext()) accept(await result.getNext());
+        }
+      } catch (error) {
+        streamError = error;
+        throw error;
+      } finally {
+        try {
+          await drainQueryResult(results);
+        } catch (error) {
+          if (streamError === undefined) throw error;
+        }
+      }
+    };
+
+    try {
+      await stream(
+        `MATCH (e:${EMBEDDING_TABLE_NAME}) RETURN e.id AS id, e.nodeId AS nodeId, ` +
+          `e.chunkIndex AS chunkIndex, size(e.embedding) AS dimensions`,
+        (row) => {
+          const id = normalizedText(projectionField(row, 'id', 0));
+          const nodeId = normalizedText(projectionField(row, 'nodeId', 1));
+          const chunkIndex = strictInteger(projectionField(row, 'chunkIndex', 2));
+          const dimensions = Number(projectionField(row, 'dimensions', 3) ?? -1);
+          const idEmpty = id.trim().length === 0;
+          const nodeIdEmpty = nodeId.trim().length === 0;
+          const chunkInvalid = !Number.isSafeInteger(chunkIndex) || chunkIndex < 0;
+          const semanticKey =
+            !nodeIdEmpty && !chunkInvalid ? embeddingSemanticIdentity(nodeId, chunkIndex) : '';
+          if (idEmpty) emptyIdRows++;
+          if (nodeIdEmpty) emptyNodeIdRows++;
+          if (chunkInvalid) invalidChunkRows++;
+          if (!idEmpty && !nodeIdEmpty && !chunkInvalid && id !== `${nodeId}:${chunkIndex}`) {
+            noncanonicalIdRows++;
+          }
+          idCounts.set(id, (idCounts.get(id) ?? 0) + 1);
+          if (semanticKey)
+            semanticCounts.set(semanticKey, (semanticCounts.get(semanticKey) ?? 0) + 1);
+          if (dimensions !== expectedDimensions) wrongDimensionRows++;
+          if (!nodeIdEmpty) ownerCandidates.add(`${ownerLabelForNodeId(nodeId)}\0${nodeId}`);
+          rows.push({ id, nodeId, chunkIndex, dimensions, semanticKey });
+        },
+      );
+    } catch (error) {
+      if (isMissingEmbeddingTableError(error)) {
+        return {
+          tablePresent: false,
+          physicalRows: 0,
+          validRows: 0,
+          recoverableRows: 0,
+          emptyIdRows: 0,
+          emptyNodeIdRows: 0,
+          invalidChunkRows: 0,
+          noncanonicalIdRows: 0,
+          duplicateIdRows: 0,
+          duplicateSemanticRows: 0,
+          orphanRows: 0,
+          wrongDimensionRows: 0,
+          recoverableIdentitySha256: embeddingIdentitySetDigest(new Set()),
+          physicalRowsSha256: embeddingPhysicalRowsDigest(false, 0, []),
+        };
+      }
+      throw error;
+    }
+
+    duplicateIdRows = [...idCounts.values()].reduce(
+      (total, count) => total + Math.max(0, count - 1),
+      0,
+    );
+    duplicateSemanticRows = [...semanticCounts.values()].reduce(
+      (total, count) => total + Math.max(0, count - 1),
+      0,
+    );
+    const missingOwnerLabels = new Set<string>();
+    for (const label of [...EMBEDDABLE_LABELS, 'File'] as const) {
+      try {
+        await stream(`MATCH (n:${escapeTableName(label)}) RETURN n.id AS id`, (row) => {
+          const id = normalizedText(projectionField(row, 'id', 0));
+          if (id) ownerCandidates.delete(`${label}\0${id}`);
+        });
+      } catch (error) {
+        if (isMissingEmbeddingOwnerTableError(error, label)) missingOwnerLabels.add(label);
+        else throw error;
+      }
+    }
+
+    let orphanRows = 0;
+    let validRows = 0;
+    const recoverable = new Set<string>();
+    const validIds = new Set<string>();
+    const validSemantic = new Set<string>();
+    for (const row of rows) {
+      const idEmpty = row.id.trim().length === 0;
+      const nodeIdEmpty = row.nodeId.trim().length === 0;
+      const chunkInvalid = !Number.isSafeInteger(row.chunkIndex) || row.chunkIndex < 0;
+      const ownerMissing =
+        !nodeIdEmpty && ownerCandidates.has(`${ownerLabelForNodeId(row.nodeId)}\0${row.nodeId}`);
+      if (ownerMissing) orphanRows++;
+      if (!nodeIdEmpty && !chunkInvalid && row.dimensions === expectedDimensions && !ownerMissing) {
+        recoverable.add(row.semanticKey);
+      }
+      if (
+        !idEmpty &&
+        !nodeIdEmpty &&
+        !chunkInvalid &&
+        row.dimensions === expectedDimensions &&
+        !ownerMissing &&
+        row.id === `${row.nodeId}:${row.chunkIndex}` &&
+        !validIds.has(row.id) &&
+        !validSemantic.has(row.semanticKey)
+      ) {
+        validRows++;
+        validIds.add(row.id);
+        validSemantic.add(row.semanticKey);
+      }
+    }
+
+    const physicalDigestRows = async (withHash: boolean): Promise<string[]> => {
+      if (!fullDigest) return [];
+      const digests: string[] = [];
+      const hashProjection = withHash ? ', e.contentHash AS contentHash' : '';
+      await stream(
+        `MATCH (e:${EMBEDDING_TABLE_NAME}) RETURN e.id AS id, e.nodeId AS nodeId, ` +
+          `e.chunkIndex AS chunkIndex, e.startLine AS startLine, e.endLine AS endLine, ` +
+          `e.embedding AS embedding${hashProjection}`,
+        (row) => {
+          const rawId = projectionField(row, 'id', 0);
+          const rawNodeId = projectionField(row, 'nodeId', 1);
+          const rawChunkIndex = projectionField(row, 'chunkIndex', 2);
+          const id = normalizedText(rawId);
+          const nodeId = normalizedText(rawNodeId);
+          const chunkIndex = strictInteger(rawChunkIndex);
+          const vector = embeddingPhysicalVectorInfo(projectionField(row, 'embedding', 5));
+          const label = ownerLabelForNodeId(nodeId);
+          const supported = label === 'File' || EMBEDDABLE_LABELS.includes(label as any);
+          const ownerState = !supported
+            ? 'unsupported-label'
+            : missingOwnerLabels.has(label)
+              ? 'missing-table'
+              : ownerCandidates.has(`${label}\0${nodeId}`)
+                ? 'missing-row'
+                : 'present';
+          const reasons = new Set<string>();
+          const emptyId = !id.trim();
+          const emptyNode = !nodeId.trim();
+          const badChunk = !Number.isSafeInteger(chunkIndex) || chunkIndex < 0;
+          if (emptyId) reasons.add('id-empty');
+          if (emptyNode) reasons.add('node-id-empty');
+          if (badChunk) reasons.add('chunk-index-invalid');
+          if (!emptyId && !emptyNode && !badChunk && id !== `${nodeId}:${chunkIndex}`) {
+            reasons.add('id-noncanonical');
+          }
+          if (vector.finite !== 'finite') reasons.add(`vector-${vector.finite}`);
+          if (vector.dimensions !== expectedDimensions) reasons.add('wrong-dimensions');
+          if (ownerState !== 'present') reasons.add(`owner-${ownerState}`);
+          if ((idCounts.get(id) ?? 0) > 1) reasons.add('duplicate-id');
+          const semantic =
+            !emptyNode && !badChunk ? embeddingSemanticIdentity(nodeId, chunkIndex) : '';
+          if (semantic && (semanticCounts.get(semantic) ?? 0) > 1)
+            reasons.add('duplicate-semantic');
+          if (reasons.size === 0) physicalValidRows++;
+          digests.push(
+            embeddingPhysicalRowDigest({
+              rawId,
+              id,
+              rawNodeId,
+              nodeId,
+              rawChunkIndex,
+              chunkIndex,
+              rawStartLine: projectionField(row, 'startLine', 3),
+              startLine: strictInteger(projectionField(row, 'startLine', 3)),
+              rawEndLine: projectionField(row, 'endLine', 4),
+              endLine: strictInteger(projectionField(row, 'endLine', 4)),
+              contentHashPresent: withHash && projectionField(row, 'contentHash', 6) !== undefined,
+              rawContentHash: withHash ? projectionField(row, 'contentHash', 6) : undefined,
+              vector,
+              ownerLabel: label,
+              ownerState,
+              rejectionReasons: [...reasons],
+            }),
+          );
+        },
+      );
+      return digests;
+    };
+    let physicalValidRows = fullDigest ? 0 : validRows;
+    let rowDigests: string[] = [];
+    try {
+      rowDigests = await physicalDigestRows(true);
+    } catch (error) {
+      if (!isMissingContentHashError(error)) throw error;
+      physicalValidRows = 0;
+      rowDigests = await physicalDigestRows(false);
+    }
+    return {
+      tablePresent: true,
+      physicalRows: rows.length,
+      validRows: Math.min(validRows, physicalValidRows),
+      recoverableRows: recoverable.size,
+      emptyIdRows,
+      emptyNodeIdRows,
+      invalidChunkRows,
+      noncanonicalIdRows,
+      duplicateIdRows,
+      duplicateSemanticRows,
+      orphanRows,
+      wrongDimensionRows,
+      recoverableIdentitySha256: embeddingIdentitySetDigest(recoverable),
+      physicalRowsSha256: fullDigest
+        ? embeddingPhysicalRowsDigest(true, rows.length, rowDigests)
+        : '',
+    };
+  });
+};
+
+export const embeddingIntegrityFailures = (report: EmbeddingIntegrityReport): number =>
+  report.emptyIdRows +
+  report.emptyNodeIdRows +
+  report.invalidChunkRows +
+  report.noncanonicalIdRows +
+  report.duplicateIdRows +
+  report.duplicateSemanticRows +
+  report.orphanRows +
+  report.wrongDimensionRows;
 
 export const loadCachedEmbeddings = async (
   options: LoadCachedEmbeddingsOptions = {},
@@ -1731,15 +2651,24 @@ export const loadCachedEmbeddings = async (
     const embeddingNodeIds = new Set<string>();
     const embeddings: CachedEmbedding[] = [];
     let pendingBatch: CachedEmbedding[] = [];
+    let unreadableIdentityRows = 0;
+    let unreadableVectorRows = 0;
 
     const acceptRow = async (row: any, hasContentHash: boolean): Promise<void> => {
       const nodeId = String(row.nodeId ?? row[0] ?? '');
-      if (!nodeId) return;
+      const chunkIndex = Number(row.chunkIndex ?? row[1]);
+      if (!nodeId.trim() || !Number.isSafeInteger(chunkIndex) || chunkIndex < 0) {
+        unreadableIdentityRows++;
+        return;
+      }
       const embedding = row.embedding ?? row[4];
-      if (!embedding) return;
+      if (!embedding) {
+        unreadableVectorRows++;
+        return;
+      }
       const cached: CachedEmbedding = {
         nodeId,
-        chunkIndex: Number(row.chunkIndex ?? row[1] ?? 0),
+        chunkIndex,
         startLine: Number(row.startLine ?? row[2] ?? 0),
         endLine: Number(row.endLine ?? row[3] ?? 0),
         embedding: Array.isArray(embedding)
@@ -1809,6 +2738,12 @@ export const loadCachedEmbeddings = async (
         } else {
           throw err;
         }
+      }
+      if (unreadableIdentityRows > 0 || unreadableVectorRows > 0) {
+        throw new Error(
+          `Embedding cache scan found ${unreadableIdentityRows} unreadable identity row(s) and ` +
+            `${unreadableVectorRows} unreadable vector row(s); refusing a lossy snapshot.`,
+        );
       }
       if (options.onBatch && pendingBatch.length > 0) await options.onBatch(pendingBatch);
     } catch (error: any) {
@@ -2243,6 +3178,18 @@ const embeddableLabelMatch = (): string =>
 const isMissingEmbeddingTableError = (err: unknown): boolean => {
   const msg = err instanceof Error ? err.message : String(err);
   return msg.includes(`Table ${EMBEDDING_TABLE_NAME} does not exist`);
+};
+
+/**
+ * Tolerate only LadybugDB's exact binder contract for a missing owner label.
+ * Runtime/query failures and a binder error for another label must propagate.
+ */
+export const isMissingEmbeddingOwnerTableError = (error: unknown, label: string): boolean => {
+  const message = (error instanceof Error ? error.message : String(error)).trim();
+  const escapedLabel = label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`^Binder exception:\\s*Table\\s+${escapedLabel}\\s+does not exist\\.?$`).test(
+    message,
+  );
 };
 
 /**
@@ -2893,6 +3840,67 @@ export const createVectorIndex = async (): Promise<boolean> => {
     if (isReadOnlyDbError(e)) return false;
     throw e;
   }
+};
+
+/**
+ * Drop the HNSW index before replacing rows from an interrupted staged
+ * embedding window. LadybugDB can keep a deleted primary key live in a loaded
+ * HNSW index long enough for an immediate same-key CREATE to fail. Removing the
+ * staged generation's index makes the bounded delete/reinsert window ordinary
+ * table mutation; the embedding pipeline rebuilds HNSW after all rows land.
+ *
+ * Returns true when the index is absent after the call (including when it was
+ * already absent), and false when VECTOR cannot be loaded or the DB is
+ * read-only. Other failures propagate so resume remains fail-closed.
+ */
+export const dropVectorIndex = async (opts: ExtensionEnsureOptions = {}): Promise<boolean> => {
+  if (!conn) {
+    throw new Error('LadybugDB not initialized. Call initLbug first.');
+  }
+  const indexes = await executeQuery('CALL SHOW_INDEXES() RETURN *');
+  const exists = indexes.some(
+    (row: Record<string, unknown>) =>
+      row.index_name === EMBEDDING_INDEX_NAME && row.table_name === EMBEDDING_TABLE_NAME,
+  );
+  if (!exists) {
+    vectorIndexEnsured = false;
+    return true;
+  }
+  if (!(await loadVectorExtension(undefined, opts))) return false;
+
+  try {
+    await queryAndDrain(conn, DROP_VECTOR_INDEX_QUERY);
+    vectorIndexEnsured = false;
+    return true;
+  } catch (error) {
+    if (isReadOnlyDbError(error)) return false;
+    throw error;
+  }
+};
+
+/**
+ * Recreate the embedding table after taking a complete, validated snapshot of
+ * an interrupted staged generation. This is intentionally a low-level helper:
+ * callers must prove they are operating on disposable staged storage and must
+ * restore the snapshot before promotion.
+ */
+export const recreateCodeEmbeddingTable = async (
+  opts: ExtensionEnsureOptions = {},
+): Promise<void> => {
+  if (!conn) {
+    throw new Error('LadybugDB not initialized. Call initLbug first.');
+  }
+  if (!(await dropVectorIndex(opts))) {
+    throw new Error('Cannot recreate CodeEmbedding because its VECTOR index could not be dropped.');
+  }
+
+  try {
+    await queryAndDrain(conn, `DROP TABLE ${EMBEDDING_TABLE_NAME}`);
+  } catch (error) {
+    if (!isMissingEmbeddingTableError(error)) throw error;
+  }
+  await queryAndDrain(conn, EMBEDDING_SCHEMA);
+  vectorIndexEnsured = false;
 };
 
 /**

@@ -46,6 +46,7 @@ describe('#2112: analyze-worker IPC projection', () => {
       repoPath: '/repos/demo',
       stats: { files: 3, nodes: 1, edges: 0 },
       alreadyUpToDate: false,
+      recoveredPromotionOnly: undefined,
       ftsRepairedOnly: undefined,
       ftsSkipped: true,
     });
@@ -59,6 +60,19 @@ describe('#2112: analyze-worker IPC projection', () => {
     const roundTripped = JSON.parse(JSON.stringify(projected));
     expect(roundTripped.repoName).toBe('demo');
     expect(roundTripped.stats.nodes).toBe(1);
+  });
+
+  it('preserves the recovery-only discriminator across the worker IPC boundary', () => {
+    const projected = projectAnalyzeResultForIpc({
+      repoName: 'demo',
+      repoPath: '/repos/demo',
+      stats: {},
+      recoveredPromotionOnly: true,
+    });
+    expect(JSON.parse(JSON.stringify(projected))).toMatchObject({
+      repoName: 'demo',
+      recoveredPromotionOnly: true,
+    });
   });
 
   it('anchors the hazard: serializing the RAW result throws (the bug the projection prevents)', () => {

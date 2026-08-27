@@ -50,6 +50,18 @@ describe('fetchExistingEmbeddingHashes', () => {
     expect(result?.get('Function:src/main.ts:foo')).toBe(STALE_HASH_SENTINEL);
     expect(execQuery).toHaveBeenCalledTimes(2);
   });
+
+  it('accepts LadybugDB direct missing-property grammar for legacy rows', async () => {
+    const execQuery = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('Binder exception: Cannot find property chunkIndex for e.'))
+      .mockResolvedValueOnce([{ nodeId: 'Function:src/main.ts:foo' }]);
+
+    const result = await fetchExistingEmbeddingHashes(execQuery);
+
+    expect(result?.get('Function:src/main.ts:foo')).toBe(STALE_HASH_SENTINEL);
+    expect(execQuery).toHaveBeenCalledTimes(2);
+  });
 });
 
 describe('fetchExistingEmbeddingHashesForNodeIds', () => {
@@ -76,5 +88,17 @@ describe('fetchExistingEmbeddingHashesForNodeIds', () => {
       ),
     ).rejects.toThrow('exceeds 512');
     expect(execQuery).not.toHaveBeenCalled();
+  });
+
+  it('returns an empty bounded page for direct missing-property grammar', async () => {
+    const execQuery = vi
+      .fn()
+      .mockRejectedValueOnce(
+        new Error('Binder exception: Cannot find property contentHash for e.'),
+      );
+
+    await expect(fetchExistingEmbeddingHashesForNodeIds(execQuery, ['node-1'])).resolves.toEqual(
+      new Map(),
+    );
   });
 });

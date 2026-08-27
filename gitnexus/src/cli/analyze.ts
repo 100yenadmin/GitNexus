@@ -615,6 +615,7 @@ export interface AnalyzeOptions {
   /** Refuse any analyze path that would require a full DB rebuild. */
   incrementalOnly?: boolean;
   repairFts?: boolean;
+  repairVector?: boolean;
   /**
    * Embedding generation toggle. Commander parses `--embeddings [limit]` as:
    *   - `undefined` when the flag is omitted
@@ -893,6 +894,28 @@ const analyzeCommandImpl = async (
     cliError(`  ${msg}\n`, { recoveryHint: 'gitnexusrc-invalid' });
     process.exitCode = 1;
     return;
+  }
+
+  // Reject repair-only conflicts before any embedding runtime setup or
+  // endpoint mutation. Commander represents --embeddings N as a string, so
+  // every defined value except explicit false is a conflicting request.
+  if (options.repairVector) {
+    const conflicts = [
+      options.force && '--force',
+      options.staged && '--staged',
+      options.incrementalOnly && '--incremental-only',
+      options.repairFts && '--repair-fts',
+      options.embeddings !== undefined && options.embeddings !== false && '--embeddings',
+      options.dropEmbeddings && '--drop-embeddings',
+      options.skills && '--skills',
+      options.pdg && '--pdg',
+      options.branch && '--branch',
+    ].filter((value): value is string => typeof value === 'string');
+    if (conflicts.length > 0) {
+      cliError(`  Cannot combine \`--repair-vector\` with ${conflicts.join(', ')}.\n`);
+      process.exitCode = 1;
+      return;
+    }
   }
 
   if (options.verbose) {
@@ -1177,9 +1200,16 @@ const analyzeCommandImpl = async (
     return;
   }
 
-  if (options.incrementalOnly && (options.force || options.repairFts || options.skills)) {
+  if (
+    options.incrementalOnly &&
+    (options.force ||
+      options.repairFts ||
+      options.repairVector ||
+      options.dropEmbeddings ||
+      options.skills)
+  ) {
     cliError(
-      '  Cannot combine `--incremental-only` with `--force`, `--repair-fts`, or `--skills`. ' +
+      '  Cannot combine `--incremental-only` with `--force`, `--repair-fts`, `--repair-vector`, `--drop-embeddings`, or `--skills`. ' +
         'The preservation contract refuses every option that can require a full rebuild.\n',
     );
     process.exitCode = 1;
@@ -1390,6 +1420,7 @@ const analyzeCommandImpl = async (
         staged: options.staged,
         incrementalOnly: options.incrementalOnly,
         repairFts: options.repairFts,
+        repairVector: options.repairVector,
         embeddings: embeddingsEnabled,
         embeddingsNodeLimit,
         dropEmbeddings: options.dropEmbeddings,
@@ -1441,6 +1472,27 @@ const analyzeCommandImpl = async (
       },
     );
 
+    if (result.recoveredPromotionOnly) {
+      await assertAnalysisFinalized(repoPath);
+      clearInterval(elapsedTimer);
+      process.removeListener('SIGINT', sigintHandler);
+      process.removeListener('SIGTERM', sigtermHandler);
+      await emitResourceEvent('complete', 'recovered-promotion-only', 100);
+      await closeResourceLog();
+      console.log = origLog;
+      // eslint-disable-next-line no-console -- restoring after intentional progress-bar routing
+      console.warn = origWarn;
+      // eslint-disable-next-line no-console -- restoring after intentional progress-bar routing
+      console.error = origError;
+      bar.stop();
+      console.log('  Recovered the previous staged promotion.');
+      console.log('  The current checkout was not analyzed in this recovery-only run.');
+      console.log(
+        '  Run `gitnexus analyze --staged --drop-embeddings` to build and promote a clean generation for the current checkout.\n',
+      );
+      return;
+    }
+
     if (result.alreadyUpToDate) {
       // Even the fast path must prove the repo is discoverable. A prior
       // run can write meta.json and then fail before registerRepo(); in
@@ -1486,8 +1538,10 @@ const analyzeCommandImpl = async (
           `  Updated base_ref to "${resolvedDefaultBranch}" in ${baseRefRefreshed.join(', ')}\n`,
         );
       }
-      // Safe to return without process.exit(0) — the early-return path in
-      // runFullAnalysis never opens LadybugDB, so no native handles prevent exit.
+      // The fast path now performs a read-only embedding-integrity scan and can
+      // initialize LadybugDB native handles. Give the outer lifecycle guard an
+      // explicit success code; otherwise it must conservatively default to 1.
+      if (isLbugReady()) process.exitCode ??= 0;
       return;
     }
 
@@ -1504,6 +1558,30 @@ const analyzeCommandImpl = async (
       console.error = origError;
       bar.stop();
       console.log('  FTS indexes repaired successfully\n');
+      return;
+    }
+
+    if (result.vectorRepairStatus) {
+      clearInterval(elapsedTimer);
+      process.removeListener('SIGINT', sigintHandler);
+      process.removeListener('SIGTERM', sigtermHandler);
+      await emitResourceEvent('complete', 'vector-repair', 100);
+      await closeResourceLog();
+      console.log = origLog;
+      // eslint-disable-next-line no-console -- restoring after intentional progress-bar routing
+      console.warn = origWarn;
+      // eslint-disable-next-line no-console -- restoring after intentional progress-bar routing
+      console.error = origError;
+      bar.stop();
+      if (result.vectorRepairStatus === 'not-indexed') {
+        console.log(
+          '  VECTOR: not-indexed (database has zero embeddings; no mutation performed)\n',
+        );
+      } else if (result.vectorRepairStatus === 'healthy') {
+        console.log('  VECTOR index already healthy; counts reconciled successfully\n');
+      } else {
+        console.log('  VECTOR index repaired and verified successfully\n');
+      }
       return;
     }
 

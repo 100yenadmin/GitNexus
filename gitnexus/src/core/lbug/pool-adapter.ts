@@ -53,10 +53,38 @@ interface PoolEntry {
   }>;
   lastUsed: number;
   dbPath: string;
+  dbIdentity: DbIdentity | null;
   /** Set to true when the pool entry is closed — checkin will close orphaned connections */
   closed: boolean;
   /** Optional search capabilities available on every connection in this pool. */
   capabilities: PoolCapabilities;
+}
+
+export interface DbIdentity {
+  ino: number;
+  mtimeMs: number;
+  size: number;
+}
+
+export async function statDbIdentity(dbPath: string): Promise<DbIdentity | null> {
+  try {
+    const stat = await fs.stat(dbPath);
+    return { ino: stat.ino, mtimeMs: stat.mtimeMs, size: stat.size };
+  } catch {
+    return null;
+  }
+}
+
+export function dbIdentityChanged(
+  previous: DbIdentity | null,
+  current: DbIdentity | null,
+): boolean {
+  if (!previous || !current) return false;
+  return (
+    previous.ino !== current.ino ||
+    previous.mtimeMs !== current.mtimeMs ||
+    previous.size !== current.size
+  );
 }
 
 export interface PoolCapabilities {
@@ -103,6 +131,7 @@ interface SharedDB {
   db: lbug.Database;
   refCount: number;
   ftsLoaded: boolean;
+  dbIdentity?: DbIdentity | null;
   /** When true, closeOne skips db.close() — the Database is owned externally. */
   external?: boolean;
 }
@@ -400,7 +429,11 @@ setInterval(() => {
 function createConnection(db: lbug.Database): lbug.Connection {
   silenceStdout();
   try {
-    return new lbug.Connection(db);
+    const connection = new lbug.Connection(db);
+    if (typeof connection.setQueryTimeout === 'function') {
+      connection.setQueryTimeout(QUERY_TIMEOUT_MS);
+    }
+    return connection;
   } finally {
     restoreStdout();
   }
@@ -633,18 +666,34 @@ const initPromises = new Map<string, Promise<void>>();
  * Concurrent calls for the same repoId are deduplicated — the second caller
  * awaits the first's in-progress init rather than starting a redundant one.
  */
-export const initLbug = async (repoId: string, dbPath: string): Promise<void> => {
+export const initLbug = async (
+  repoId: string,
+  dbPath: string,
+  options: { forceReopen?: boolean } = {},
+): Promise<boolean> => {
   const existing = pool.get(repoId);
   if (existing) {
     existing.lastUsed = Date.now();
-    return;
+    const currentIdentity = await statDbIdentity(dbPath);
+    if (!options.forceReopen && !dbIdentityChanged(existing.dbIdentity, currentIdentity)) {
+      return false;
+    }
+    const aliases = [...pool.entries()].filter(([, entry]) => entry.dbPath === dbPath);
+    // Never retire a shared native Database under any in-flight alias.
+    // Keep serving the complete old generation and retry rollover once every
+    // pool entry for this physical path becomes idle.
+    if (aliases.some(([, entry]) => entry.checkedOut > 0)) return false;
+    for (const [aliasId] of aliases) closeOne(aliasId);
   }
 
   // Deduplicate concurrent init calls for the same repoId —
   // prevents double-init race when multiple parallel tool calls
   // trigger initialization for the same repo simultaneously.
   const pending = initPromises.get(repoId);
-  if (pending) return pending;
+  if (pending) {
+    await pending;
+    return true;
+  }
 
   const promise = doInitLbug(repoId, dbPath);
   initPromises.set(repoId, promise);
@@ -653,6 +702,7 @@ export const initLbug = async (repoId: string, dbPath: string): Promise<void> =>
   } finally {
     initPromises.delete(repoId);
   }
+  return true;
 };
 
 /**
@@ -751,7 +801,12 @@ async function doInitLbug(
           options.allowRecovery === false
             ? await openReadOnlyDatabaseNonRecovering(dbPath)
             : await openReadOnlyDatabase(dbPath);
-        shared = { db, refCount: 0, ftsLoaded: false };
+        shared = {
+          db,
+          refCount: 0,
+          ftsLoaded: false,
+          dbIdentity: await statDbIdentity(dbPath),
+        };
         dbCache.set(dbPath, shared);
         break;
       } catch (err: any) {
@@ -761,7 +816,12 @@ async function doInitLbug(
           if (options.allowRecovery === false) throw lastError;
           try {
             const db = await tryQuarantineAndReopen(dbPath, repoId);
-            shared = { db, refCount: 0, ftsLoaded: false };
+            shared = {
+              db,
+              refCount: 0,
+              ftsLoaded: false,
+              dbIdentity: await statDbIdentity(dbPath),
+            };
             dbCache.set(dbPath, shared);
             break;
           } catch (retryErr) {
@@ -826,6 +886,7 @@ async function doInitLbug(
     waiters: [],
     lastUsed: Date.now(),
     dbPath,
+    dbIdentity: await statDbIdentity(dbPath),
     closed: false,
     capabilities,
   });
@@ -861,7 +922,13 @@ export async function initLbugWithDb(
   // closeOne() respects the external flag and skips db.close().
   let shared = dbCache.get(dbPath);
   if (!shared) {
-    shared = { db: existingDb, refCount: 0, ftsLoaded: false, external: true };
+    shared = {
+      db: existingDb,
+      refCount: 0,
+      ftsLoaded: false,
+      dbIdentity: null,
+      external: true,
+    };
     dbCache.set(dbPath, shared);
   }
   shared.refCount++;
@@ -886,6 +953,7 @@ export async function initLbugWithDb(
     waiters: [],
     lastUsed: Date.now(),
     dbPath,
+    dbIdentity: null,
     closed: false,
     capabilities,
   });

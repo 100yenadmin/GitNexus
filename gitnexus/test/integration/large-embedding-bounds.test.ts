@@ -16,6 +16,28 @@ vi.mock('../../src/core/embeddings/embedder.js', () => ({
 vi.mock('../../src/core/lbug/lbug-adapter.js', () => ({
   loadVectorExtension: vi.fn(async () => true),
   createVectorIndex: createVectorIndexMock,
+  inspectEmbeddingIntegrity: vi.fn(async () => ({
+    tablePresent: true,
+    physicalRows: 25_000,
+    validRows: 25_000,
+    recoverableRows: 25_000,
+    emptyIdRows: 0,
+    emptyNodeIdRows: 0,
+    invalidChunkRows: 0,
+    noncanonicalIdRows: 0,
+    duplicateIdRows: 0,
+    duplicateSemanticRows: 0,
+    orphanRows: 0,
+    wrongDimensionRows: 0,
+    recoverableIdentitySha256: '0'.repeat(64),
+    physicalRowsSha256: '0'.repeat(64),
+  })),
+  embeddingIntegrityFailures: vi.fn(() => 0),
+}));
+
+vi.mock('../../src/core/lbug/schema.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../src/core/lbug/schema.js')>()),
+  EMBEDDING_DIMS: 2_048,
 }));
 
 import { runEmbeddingPipeline } from '../../src/core/embeddings/embedding-pipeline.js';
@@ -44,7 +66,7 @@ describe('25k x 2,048 bounded embedding integration', () => {
     createVectorIndexMock.mockClear();
   });
 
-  it('holds node pages at 512, checkpoint windows at 5,000, and vectors at 8', async () => {
+  it('holds node pages at 512, checkpoint windows at 5,000, vectors at 8, and writes one identity at a time', async () => {
     const queryPageSizes: number[] = [];
     const identityPageSizes: number[] = [];
     const checkpointWindowSizes: number[] = [];
@@ -103,7 +125,7 @@ describe('25k x 2,048 bounded embedding integration', () => {
     expect(Math.max(...queryPageSizes)).toBeLessThanOrEqual(PAGE_SIZE);
     expect(Math.max(...identityPageSizes)).toBeLessThanOrEqual(PAGE_SIZE);
     expect(Math.max(...embedBatchMock.mock.calls.map(([texts]) => texts.length))).toBe(8);
-    expect(maxInsertBatch).toBe(8);
+    expect(maxInsertBatch).toBe(1);
     expect(maxHeapUsed - startHeapUsed).toBeLessThan(512 * 1024 * 1024);
   });
 });

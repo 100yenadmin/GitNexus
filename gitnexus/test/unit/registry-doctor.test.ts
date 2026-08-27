@@ -11,6 +11,7 @@ vi.mock('../../src/cli/doctor-pool-probe.js', () => doctorPoolMocks);
 
 import {
   buildRegistryDoctorReport,
+  isLegacyMissingChunkIndexError,
   probeRegistryDatabaseCounts,
   type RegistryDatabaseCounts,
 } from '../../src/cli/registry-doctor.js';
@@ -30,6 +31,24 @@ const CAPABILITIES: NonNullable<RepoMeta['capabilities']> = {
     exactScanLimit: 5000,
   },
 };
+
+const cleanIntegrity = (rows: number) => ({
+  status: 'clean' as const,
+  tablePresent: true,
+  physicalRows: rows,
+  validRows: rows,
+  recoverableRows: rows,
+  emptyIdRows: 0,
+  emptyNodeIdRows: 0,
+  invalidChunkRows: 0,
+  noncanonicalIdRows: 0,
+  duplicateIdRows: 0,
+  duplicateSemanticRows: 0,
+  orphanRows: 0,
+  wrongDimensionRows: 0,
+  recoverableIdentitySha256: 'a'.repeat(64),
+  physicalRowsSha256: 'a'.repeat(64),
+});
 
 interface FixtureEntry {
   entry: RegistryEntry;
@@ -111,6 +130,14 @@ describe('doctor --registry read-only report (#133)', () => {
     await fixture.cleanup();
   });
 
+  it('rejects prefixed runtime errors as legacy chunkIndex compatibility', () => {
+    expect(
+      isLegacyMissingChunkIndexError(
+        new Error('Runtime exception: Binder exception: Column chunkIndex does not exist'),
+      ),
+    ).toBe(false);
+  });
+
   it('reports canonical remote and alias collisions, count drift, and local-only entries', async () => {
     const alpha = await createEntry(
       fixture.dbPath,
@@ -171,6 +198,13 @@ describe('doctor --registry read-only report (#133)', () => {
       registryVsDatabase: ['nodes'],
     });
     expect(report.entries[0]?.countComparison.status).toBe('match');
+    expect(report.entries[0]?.health.state).toBe('quarantined');
+    expect(report.entries[1]?.health.state).toBe('quarantined');
+    expect(report.entries[0]?.health.semantic_ready).toBe(false);
+    expect(report.entries[1]?.health.semantic_ready).toBe(false);
+    expect(report.entries[0]?.health.reasons).toEqual(
+      expect.arrayContaining(['remote-collision', 'alias-collision']),
+    );
     expect(report.entries[2]?.identity).toEqual({ kind: 'local-path' });
     expect(report.entries[2]?.name).toBe('<path-like-alias>');
     expect(report.entries[0]?.capabilities.source).toBe('active-probe');
@@ -200,6 +234,82 @@ describe('doctor --registry read-only report (#133)', () => {
     expect(await snapshotFiles(fixture.dbPath)).toEqual(before);
   });
 
+  it('reports exact commit identities and deterministic freshness states', async () => {
+    const indexed = await createEntry(
+      fixture.dbPath,
+      'head-states',
+      'HeadStates',
+      'https://github.com/owner/head-states.git',
+      { nodes: 1, edges: 0, embeddings: 1 },
+    );
+    const databaseProbe = async () => ({
+      nodes: 1,
+      edges: 0,
+      embeddings: 1,
+      integrity: cleanIntegrity(1),
+    });
+    const current = await buildRegistryDoctorReport({
+      entries: [indexed.entry],
+      databaseProbe,
+      headProbe: () => 'a'.repeat(40),
+    });
+    expect(current.entries[0]).toMatchObject({
+      indexed_sha: 'a'.repeat(40),
+      registry_sha: 'a'.repeat(40),
+      head_sha: 'a'.repeat(40),
+      health: { state: 'healthy', freshness: 'current', count_alignment: 'aligned' },
+    });
+
+    indexed.entry.lastCommit = 'b'.repeat(40);
+    const drifted = await buildRegistryDoctorReport({
+      entries: [indexed.entry],
+      databaseProbe,
+      headProbe: () => 'b'.repeat(40),
+    });
+    expect(drifted.entries[0]?.health).toMatchObject({
+      state: 'degraded',
+      freshness: 'drifted',
+      reasons: ['freshness-drifted'],
+    });
+
+    const unknown = await buildRegistryDoctorReport({
+      entries: [indexed.entry],
+      databaseProbe,
+      headProbe: () => '',
+    });
+    expect(unknown.entries[0]?.health).toMatchObject({
+      state: 'degraded',
+      freshness: 'unknown',
+      reasons: ['freshness-unknown'],
+    });
+  });
+
+  it('keeps a graph-only index healthy when the embedding table is absent', async () => {
+    const indexed = await createEntry(
+      fixture.dbPath,
+      'graph-only',
+      'GraphOnly',
+      'https://github.com/owner/graph-only.git',
+      { nodes: 1, edges: 0, embeddings: 0 },
+    );
+    const report = await buildRegistryDoctorReport({
+      entries: [indexed.entry],
+      databaseProbe: async () => ({
+        nodes: 1,
+        edges: 0,
+        embeddings: 0,
+        integrity: { ...cleanIntegrity(0), tablePresent: false },
+      }),
+      headProbe: () => 'a'.repeat(40),
+    });
+    expect(report.entries[0]?.health).toMatchObject({
+      state: 'healthy',
+      semantic_ready: false,
+      freshness: 'current',
+      count_alignment: 'aligned',
+    });
+  });
+
   it('does not open a database when WAL recovery state is present', async () => {
     const indexed = await createEntry(
       fixture.dbPath,
@@ -226,6 +336,151 @@ describe('doctor --registry read-only report (#133)', () => {
     expect(report.entries[0]?.countComparison.status).toBe('partial');
     expect(report.summary.recoveryStateEntries).toBe(1);
     expect(await snapshotFiles(fixture.dbPath)).toEqual(before);
+  });
+
+  it('does not claim semantic readiness while an embedding checkpoint is present', async () => {
+    const indexed = await createEntry(
+      fixture.dbPath,
+      'checkpoint-health',
+      'CheckpointHealth',
+      'https://github.com/owner/checkpoint-health.git',
+      { nodes: 1, edges: 0, embeddings: 3 },
+    );
+    const metaPath = path.join(indexed.entry.storagePath, INDEX_METADATA_FILE);
+    const meta = JSON.parse(await fs.readFile(metaPath, 'utf8'));
+    const databaseProbe = async () => ({
+      nodes: 1,
+      edges: 0,
+      embeddings: 3,
+      embeddingDimensions: 384,
+      integrity: cleanIntegrity(3),
+    });
+    for (const embeddingCheckpoint of [
+      { nodesProcessed: 1, totalNodes: 3, dimensions: 384 },
+      { nodesProcessed: 3, totalNodes: 3, dimensions: 384 },
+    ]) {
+      await fs.writeFile(metaPath, JSON.stringify({ ...meta, embeddingCheckpoint }));
+      const report = await buildRegistryDoctorReport({
+        entries: [indexed.entry],
+        databaseProbe,
+        headProbe: () => 'a'.repeat(40),
+      });
+      expect(report.entries[0]?.health).toMatchObject({
+        state: 'degraded',
+        semantic_ready: false,
+        reasons: ['embedding-checkpoint-present'],
+      });
+    }
+  });
+
+  it('marks partial and total-loss durable checkpoints malformed', async () => {
+    const indexed = await createEntry(
+      fixture.dbPath,
+      'checkpoint-integrity',
+      'CheckpointIntegrity',
+      'https://github.com/owner/checkpoint-integrity.git',
+      { nodes: 1, edges: 0, embeddings: 3 },
+    );
+    const metaPath = path.join(indexed.entry.storagePath, INDEX_METADATA_FILE);
+    const meta = JSON.parse(await fs.readFile(metaPath, 'utf8'));
+    const databaseProbe = async () => ({
+      nodes: 1,
+      edges: 0,
+      embeddings: 3,
+      embeddingDimensions: 384,
+      integrity: cleanIntegrity(3),
+    });
+
+    await fs.writeFile(
+      metaPath,
+      JSON.stringify({
+        ...meta,
+        embeddingCheckpoint: { dimensions: 384, physicalRows: 3 },
+      }),
+    );
+    const partial = await buildRegistryDoctorReport({ entries: [indexed.entry], databaseProbe });
+    expect(partial.entries[0]?.database).toMatchObject({
+      status: 'available',
+      counts: { nodes: 1, edges: 0, embeddings: 3 },
+      integrity: { status: 'malformed' },
+    });
+
+    await fs.writeFile(
+      metaPath,
+      JSON.stringify({
+        ...meta,
+        embeddingCheckpoint: {
+          nodesProcessed: 3,
+          totalNodes: 3,
+          dimensions: 384,
+          physicalRows: 3,
+          validRows: 3,
+          recoverableIdentitySha256: 'a'.repeat(64),
+          physicalRowsSha256: 'b'.repeat(64),
+        },
+      }),
+    );
+    const physicalDrift = await buildRegistryDoctorReport({
+      entries: [indexed.entry],
+      databaseProbe,
+    });
+    expect(physicalDrift.entries[0]?.database).toMatchObject({
+      status: 'available',
+      integrity: { status: 'malformed' },
+    });
+
+    await fs.writeFile(
+      metaPath,
+      JSON.stringify({
+        ...meta,
+        embeddingCheckpoint: {
+          nodesProcessed: 2,
+          totalNodes: 3,
+          dimensions: 384,
+          physicalRows: 3,
+          validRows: 3,
+          recoverableIdentitySha256: 'a'.repeat(64),
+        },
+      }),
+    );
+    const intermediate = await buildRegistryDoctorReport({
+      entries: [indexed.entry],
+      databaseProbe,
+    });
+    expect(intermediate.entries[0]?.database).toMatchObject({
+      status: 'available',
+      integrity: { status: 'clean' },
+    });
+
+    await fs.writeFile(
+      metaPath,
+      JSON.stringify({
+        ...meta,
+        embeddingCheckpoint: {
+          nodesProcessed: 1,
+          totalNodes: 1,
+          dimensions: 384,
+          physicalRows: 0,
+          validRows: 0,
+          recoverableIdentitySha256: 'a'.repeat(64),
+          physicalRowsSha256: 'a'.repeat(64),
+        },
+      }),
+    );
+    const totalLoss = await buildRegistryDoctorReport({
+      entries: [indexed.entry],
+      databaseProbe: async () => ({
+        nodes: 1,
+        edges: 0,
+        embeddings: 0,
+        embeddingDimensions: 384,
+        integrity: cleanIntegrity(0),
+      }),
+    });
+    expect(totalLoss.entries[0]?.database).toMatchObject({
+      status: 'available',
+      integrity: { status: 'malformed' },
+    });
   });
 
   it('does not open a database while a lock sidecar is present', async () => {
@@ -391,6 +646,39 @@ describe('doctor --registry read-only report (#133)', () => {
     });
   });
 
+  it('reports a readable zero-embedding database as not-indexed', async () => {
+    const indexed = await createEntry(
+      fixture.dbPath,
+      'zero-embeddings',
+      'ZeroEmbeddings',
+      'https://github.com/owner/zero-embeddings.git',
+      { nodes: 1, edges: 0, embeddings: 0 },
+    );
+    const capabilityProbe = vi.fn(async () => ({
+      fts: true,
+      vector: true,
+      vectorIndex: false,
+      vectorIndexReason: 'vector-index-missing-or-unqueryable' as const,
+      exercisedConnections: 8,
+      connectionCount: 8,
+      reason: null,
+    }));
+
+    const report = await buildRegistryDoctorReport({
+      entries: [indexed.entry],
+      databaseProbe: async () => ({ nodes: 1, edges: 0, embeddings: 0 }),
+      capabilityProbe,
+    });
+
+    expect(report.entries[0]?.capabilities).toEqual({
+      source: 'active-probe',
+      graph: 'available',
+      fts: 'available',
+      vectorSearch: 'not-indexed',
+      vectorSearchReason: null,
+    });
+  });
+
   it('lets a failed default live probe override optimistic recorded metadata', async () => {
     const indexed = await createEntry(
       fixture.dbPath,
@@ -465,11 +753,26 @@ describe('doctor --registry read-only report (#133)', () => {
     }
 
     const before = await snapshotFiles(fixture.dbPath);
-    await expect(probeRegistryDatabaseCounts(lbugPath)).resolves.toEqual({
+    await expect(probeRegistryDatabaseCounts(lbugPath)).resolves.toMatchObject({
       nodes: 1,
       edges: 0,
       embeddings: 0,
+      integrity: { status: 'clean', physicalRows: 0, validRows: 0 },
     });
     expect(await snapshotFiles(fixture.dbPath)).toEqual(before);
+
+    await adapter.initLbug(lbugPath);
+    try {
+      await adapter.executeQuery('DROP TABLE CodeEmbedding');
+    } finally {
+      await adapter.closeLbug();
+    }
+    await expect(probeRegistryDatabaseCounts(lbugPath)).resolves.toMatchObject({
+      embeddings: 0,
+      integrity: { status: 'clean', tablePresent: false, physicalRows: 0, validRows: 0 },
+    });
+
+    await fs.writeFile(`${lbugPath}.wal`, 'unmatched wal');
+    await expect(probeRegistryDatabaseCounts(lbugPath)).rejects.toThrow(/sidecar state/i);
   });
 });

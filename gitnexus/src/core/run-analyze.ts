@@ -16,6 +16,9 @@ import { runPipelineFromRepo } from './ingestion/pipeline.js';
 import { resetDegradedParseCounter } from './tree-sitter/safe-parse.js';
 import {
   initLbug,
+  initLbugForMaintenance,
+  initLbugReadOnlyNonRecovering,
+  withLbugReadOnlyNonRecovering,
   loadGraphToLbug,
   getLbugStats,
   executeQuery,
@@ -31,10 +34,17 @@ import {
   deleteAllInjects,
   queryImportersBatch,
   loadFTSExtension,
+  recreateCodeEmbeddingTable,
+  loadVectorExtension,
+  createVectorIndex,
+  dropVectorIndex,
   wipeLbugDbFiles,
   LbugWipeError,
   DELETE_FILES_CHUNK_SIZE,
+  inspectEmbeddingIntegrity,
+  type EmbeddingIntegrityReport,
 } from './lbug/lbug-adapter.js';
+import { estimateBufferPool, setBufferPoolSizeHint } from './lbug/lbug-config.js';
 import { escapeCypherString } from './lbug/cypher-escape.js';
 import {
   createSearchFTSIndexes,
@@ -57,6 +67,7 @@ import { quarantineSidecarsForDirtyRecovery } from './lbug/sidecar-recovery.js';
 import {
   getStoragePaths,
   resolveBranchPlacement,
+  branchSlug,
   saveMeta,
   loadMeta,
   ensureGitNexusIgnored,
@@ -68,6 +79,8 @@ import {
   cleanupOldKuzuFiles,
   reconcileMetadataFiles,
   isMissingFilesystemError,
+  canonicalizePath,
+  registryPathEquals,
   INDEX_METADATA_FILE,
   INCREMENTAL_SCHEMA_VERSION,
   type RepoMeta,
@@ -89,6 +102,12 @@ import {
 import { DEFAULT_PDG_MAX_INTERPROC_EDGES } from './ingestion/taint/interproc-emit.js';
 import { taintModelVersion } from './ingestion/taint/typescript-model.js';
 import { parseTruthyEnv, parsePositiveIntEnv } from './ingestion/utils/env.js';
+import {
+  assertCompletedCheckpointIdentity,
+  assertEmbeddingIntegrity,
+  embeddingIntegrityIsClean,
+  embeddingIntegritySummary,
+} from './embeddings/checkpoint-identity.js';
 import { computeFileHashes, diffFileHashes } from '../storage/file-hash.js';
 import {
   extractChangedSubgraph,
@@ -121,15 +140,24 @@ import {
   readEmbeddingSnapshot,
   removeEmbeddingSnapshot,
   validateEmbeddingSnapshot,
+  embeddingSnapshotMatchesIdentityDigest,
   type EmbeddingSnapshotInfo,
 } from './embeddings/cache-snapshot.js';
+import {
+  removeEmbeddingTableRebuildMarker,
+  validateEmbeddingTableRebuildMarker,
+  writeEmbeddingTableRebuildMarker,
+} from './embeddings/rebuild-marker.js';
+import type { EmbeddingIdentity } from './embeddings/embedding-identity.js';
 import { generateAIContextFiles } from '../cli/ai-context.js';
 import { sanitizeDetectedBranch } from '../cli/analyze-config.js';
 import { EMBEDDING_TABLE_NAME, STALE_HASH_SENTINEL } from './lbug/schema.js';
+import { isMissingColumnOrTableError } from './lbug/schema-errors.js';
 import {
   discardStagedWorkspace,
   getStagedAnalyzePaths,
   hasPendingPromotion,
+  inspectStagedWorkspaceSource,
   prepareStagedWorkspace,
   promoteStagedGeneration,
   validateStagedGeneration,
@@ -154,6 +182,18 @@ export interface AnalyzeCallbacks {
 
 export interface AnalyzeOptions {
   /**
+   * Internal server-only display path. Filesystem work stays bound to the
+   * canonical `repoPath` argument while metadata and registry projections keep
+   * the stable path the operator registered.
+   */
+  registryPath?: string;
+  /**
+   * Internal server-only physical storage target captured before the shared
+   * repository lock is acquired. Never canonicalize this value again: doing
+   * so after a `.gitnexus` symlink retarget would escape the held lock.
+   */
+  analyzeStoragePath?: string;
+  /**
    * Force a full re-index of the pipeline. Callers may OR this with
    * other flags that imply re-analysis (e.g. `--skills`), so the value
    * here is the PIPELINE-force signal, NOT the registry-collision
@@ -170,6 +210,8 @@ export interface AnalyzeOptions {
   incrementalOnly?: boolean;
   /** Repair only search indexes without re-running full parsing/indexing. */
   repairFts?: boolean;
+  /** Rebuild only the named HNSW index while preserving every embedding row. */
+  repairVector?: boolean;
   /** Emit per-index FTS create logs. */
   verbose?: boolean;
   embeddings?: boolean;
@@ -301,20 +343,138 @@ export interface AnalyzeOptions {
   skipNativeCloseOnExit?: boolean;
 }
 
-interface EmbeddingIdentity {
-  model: string;
-  dimensions: number;
-}
-
 const resolveEmbeddingIdentity = async (): Promise<EmbeddingIdentity> => {
-  const [{ getEmbeddingDimensions }, { resolveEmbeddingConfig }] = await Promise.all([
-    import('./embeddings/embedder.js'),
-    import('./embeddings/config.js'),
-  ]);
-  return {
-    model: process.env.GITNEXUS_EMBEDDING_MODEL ?? resolveEmbeddingConfig().modelId,
-    dimensions: getEmbeddingDimensions(),
-  };
+  const { getActiveEmbeddingIdentity } = await import('./embeddings/embedder.js');
+  return getActiveEmbeddingIdentity();
+};
+
+export const shouldRecreateStagedEmbeddingTableForResume = (
+  rebuild: boolean,
+  snapshotInfo: EmbeddingSnapshotInfo | undefined,
+): snapshotInfo is EmbeddingSnapshotInfo => rebuild && snapshotInfo !== undefined;
+
+const pathKind = (state: Awaited<ReturnType<typeof fs.lstat>>): string => {
+  if (state.isSymbolicLink()) return 'a symbolic link';
+  if (state.isDirectory()) return 'a directory';
+  if (state.isSocket()) return 'a socket';
+  if (state.isFIFO()) return 'a FIFO';
+  if (state.isBlockDevice()) return 'a block device';
+  if (state.isCharacterDevice()) return 'a character device';
+  return 'not a regular file';
+};
+
+const lstatIfPresent = async (targetPath: string) => {
+  try {
+    return await fs.lstat(targetPath);
+  } catch (error) {
+    if (isMissingFilesystemError(error)) return null;
+    throw error;
+  }
+};
+
+/**
+ * Read-only gate for VECTOR maintenance. It deliberately runs before the
+ * analyzer ownership lock creates any file, and refuses rather than recovering
+ * stale state. A second writer that appears after this check is still excluded
+ * by the ownership/init/database locks.
+ */
+export const assertVectorRepairPreflight = async (
+  repoPath: string,
+  options: { allowAnalyzeOwnershipLock?: boolean } = {},
+): Promise<RepoMeta> => {
+  const paths = getStoragePaths(repoPath);
+  const storageState = await lstatIfPresent(paths.storagePath);
+  if (!storageState) {
+    throw new Error('Cannot repair VECTOR: this repository has not been analyzed yet.');
+  }
+  if (!storageState.isDirectory() || storageState.isSymbolicLink()) {
+    throw new Error(
+      `Cannot repair VECTOR: storage at ${paths.storagePath} is ${pathKind(storageState)}; ` +
+        'expected a regular directory.',
+    );
+  }
+
+  const databaseState = await lstatIfPresent(paths.lbugPath);
+  if (!databaseState) {
+    throw new Error(`Cannot repair VECTOR: graph store at ${paths.lbugPath} is missing.`);
+  }
+  if (!databaseState.isFile() || databaseState.isSymbolicLink()) {
+    throw new Error(
+      `Cannot repair VECTOR: graph store at ${paths.lbugPath} is ${pathKind(databaseState)}; ` +
+        'expected a regular file.',
+    );
+  }
+
+  const promotion = getStagedAnalyzePaths(paths.lbugPath, path.dirname(paths.metaPath));
+  const blockedArtifacts = [
+    !options.allowAnalyzeOwnershipLock && path.join(paths.storagePath, 'analyze-staged.lock'),
+    `${paths.lbugPath}.init.lock`,
+    `${paths.lbugPath}.lock`,
+    `${paths.lbugPath}.wal`,
+    `${paths.lbugPath}.shadow`,
+    `${paths.lbugPath}.wal.checkpoint`,
+    promotion.journalPath,
+    promotion.stageIntentPath,
+    promotion.stageRoot,
+    promotion.backupLbugPath,
+  ].filter((artifact): artifact is string => typeof artifact === 'string');
+  for (const artifact of blockedArtifacts) {
+    if (await lstatIfPresent(artifact)) {
+      throw new Error(
+        `Cannot repair VECTOR while lock or recovery state is present at ${artifact}. ` +
+          'Resolve it with the normal analyze/recovery workflow first.',
+      );
+    }
+  }
+
+  const meta = await loadMeta(path.dirname(paths.metaPath));
+  if (!meta) throw new Error('Cannot repair VECTOR: index metadata is missing.');
+  // A checkpoint whose window is fully persisted (all nodes processed, no
+  // pending window) only means the run died between the last embedding write
+  // and finalize — the embedding table is complete, and the repair path still
+  // verifies it via inspectEmbeddingIntegrity before, during, and after the
+  // rebuild. Refusing it forces a full re-embed for an index that is already
+  // whole (#132). A pending window may hold partially persisted chunk rows, so
+  // it stays blocking, as does any in-progress incremental write.
+  const checkpoint = meta.embeddingCheckpoint;
+  const checkpointComplete =
+    checkpoint !== undefined &&
+    checkpoint.nodesProcessed === checkpoint.totalNodes &&
+    !checkpoint.pendingNodeIds?.length;
+  if (meta.incrementalInProgress || (checkpoint && !checkpointComplete)) {
+    throw new Error(
+      'Cannot repair VECTOR while index metadata records an incomplete analysis or embedding checkpoint.',
+    );
+  }
+  if (checkpoint && checkpointComplete) {
+    if (
+      checkpoint.provider === undefined &&
+      checkpoint.totalNodes === 0 &&
+      checkpoint.chunksProcessed === 0
+    ) {
+      return meta;
+    }
+    // The checkpoint is the only durable record of which model produced the
+    // stored vectors. The resume path refuses a model/dimension mismatch, and
+    // repair clears the checkpoint on success — so repairing through a
+    // mismatched identity would build HNSW over incompatible rows AND erase
+    // the evidence. Mirror the resume-path guard before allowing either.
+    const identity = await resolveEmbeddingIdentity();
+    if (
+      checkpoint.provider === undefined ||
+      checkpoint.provider !== identity.provider ||
+      checkpoint.model !== identity.model ||
+      checkpoint.dimensions !== identity.dimensions
+    ) {
+      throw new Error(
+        `Cannot repair VECTOR: the completed embedding checkpoint records ${checkpoint.provider ?? 'unknown-provider'} / ` +
+          `${checkpoint.model} at ${checkpoint.dimensions} dimensions, but this run resolves ` +
+          `${identity.provider} / ${identity.model} at ${identity.dimensions}. Restore the matching ` +
+          'embedding configuration, or rebuild with analyze --drop-embeddings --embeddings 0.',
+      );
+    }
+  }
+  return meta;
 };
 
 export interface AnalyzeResult {
@@ -329,10 +489,18 @@ export interface AnalyzeResult {
     embeddings?: number;
   };
   alreadyUpToDate?: boolean;
+  /**
+   * True when this invocation only completed a previously journaled staged
+   * promotion. The recovered generation is durable and registered, but the
+   * current checkout was deliberately not analyzed in the same invocation.
+   */
+  recoveredPromotionOnly?: boolean;
   /** The raw pipeline result — only populated when needed by callers (e.g. skill generation). */
   pipelineResult?: any;
   /** True when analyze only repaired FTS indexes and skipped pipeline re-analysis. */
   ftsRepairedOnly?: boolean;
+  /** Terminal outcome for a VECTOR-only maintenance run. */
+  vectorRepairStatus?: 'repaired' | 'healthy' | 'not-indexed';
   /**
    * True when the FTS extension was unavailable so search-index creation was
    * skipped (offline-first degradation). The graph is fully queryable; only
@@ -365,6 +533,10 @@ const FTS_UNAVAILABLE_MESSAGE =
   'Full-text/BM25 search will be disabled until the LadybugDB FTS extension is ' +
   'installed once with network access (GITNEXUS_LBUG_EXTENSION_INSTALL=auto) or ' +
   'pre-installed for offline use. Run `gitnexus doctor` for details.';
+const CLI_CHECKPOINT_CONTEXT =
+  'Cannot resume embedding checkpoint. Manual recovery required: do not retry ' +
+  '`gitnexus analyze`. ' +
+  'Run `gitnexus analyze --force --drop-embeddings --embeddings 0`.';
 
 // Re-export the pure flag-derivation helper so external callers (and tests)
 // keep importing from this module's stable surface.
@@ -619,6 +791,14 @@ const runFullAnalysisImpl = async (
     callbacks.onProgress(phase, percent, message);
 
   const { repoHasGit, remoteUrl: repositoryRemoteUrl } = repositoryIdentity;
+  const persistedRepoPath = options.registryPath ?? repoPath;
+  const expectedPersistedCanonicalPath = canonicalizePath(repoPath);
+  const frozenRegistryIdentity = {
+    expectedCanonicalPath: expectedPersistedCanonicalPath,
+    ...(options.analyzeStoragePath
+      ? { expectedCanonicalStoragePath: options.analyzeStoragePath }
+      : {}),
+  };
 
   // Resolve + validate operator-provided FTS config once, before the expensive
   // parse/load phases. A typo fails here in ms; createSearchFTSIndexes reuses
@@ -645,7 +825,7 @@ const runFullAnalysisImpl = async (
   // `storagePath` is ALWAYS the flat `.gitnexus` — content-addressed caches
   // (parse-cache, parsedfile-store) and the kuzu-migration cleanup live there
   // and are shared across branches (#2106 KTD7).
-  const { storagePath } = getStoragePaths(repoPath);
+  const storagePath = options.analyzeStoragePath ?? getStoragePaths(repoPath).storagePath;
 
   const currentCommit = repoHasGit ? getCurrentCommit(repoPath) : '';
 
@@ -675,25 +855,441 @@ const runFullAnalysisImpl = async (
   });
   const branchLabel = options.branch ?? checkedOutBranch;
   const placement = options.branch ? await resolveBranchPlacement(repoPath, branchLabel) : {};
-  const canonicalPaths = getStoragePaths(repoPath, placement.branch);
+  const canonicalPaths = options.analyzeStoragePath
+    ? {
+        storagePath,
+        lbugPath: path.join(
+          placement.branch
+            ? path.join(storagePath, 'branches', branchSlug(placement.branch))
+            : storagePath,
+          'lbug',
+        ),
+        metaPath: path.join(
+          placement.branch
+            ? path.join(storagePath, 'branches', branchSlug(placement.branch))
+            : storagePath,
+          INDEX_METADATA_FILE,
+        ),
+      }
+    : getStoragePaths(repoPath, placement.branch);
+  // Prevent a previous analyze in the same process from leaking its graph hint
+  // into any pre-pipeline database open in this run.
+  setBufferPoolSizeHint(undefined);
   const canonicalMetaDir = path.dirname(canonicalPaths.metaPath);
   const promotionPaths = getStagedAnalyzePaths(canonicalPaths.lbugPath, canonicalMetaDir);
   const stagedPaths: StagedAnalyzePaths | undefined = options.staged ? promotionPaths : undefined;
 
-  const commitStagedMetadataAndRegistry = async (meta: RepoMeta): Promise<string> => {
-    await saveMeta(canonicalMetaDir, meta);
-    return registerRepo(repoPath, meta, {
+  // A plain analyze of the flat slot may be switching its informational
+  // branch label. Until registry adoption commits, every durable metadata
+  // projection retains exactly the branch property that existed at entry
+  // (including property absence). This keeps checkpoints and ordinary or
+  // recovered staged promotions retryable after any partial failure.
+  const implicitFlatBranch =
+    !options.branch && !placement.branch && branchLabel ? branchLabel : null;
+  const canonicalMetaBeforeAdoption = implicitFlatBranch ? await loadMeta(canonicalMetaDir) : null;
+  let canonicalBranchExistedBeforeAdoption =
+    canonicalMetaBeforeAdoption !== null &&
+    Object.prototype.hasOwnProperty.call(canonicalMetaBeforeAdoption, 'branch');
+  let canonicalBranchBeforeAdoption = canonicalMetaBeforeAdoption?.branch;
+  let implicitFlatBranchAdoptionPending =
+    implicitFlatBranch !== null &&
+    (!canonicalBranchExistedBeforeAdoption || canonicalBranchBeforeAdoption !== implicitFlatBranch);
+  const refreshPreAdoptionBranch = (meta: RepoMeta | null): void => {
+    canonicalBranchExistedBeforeAdoption =
+      meta !== null && Object.prototype.hasOwnProperty.call(meta, 'branch');
+    canonicalBranchBeforeAdoption = meta?.branch;
+    implicitFlatBranchAdoptionPending =
+      implicitFlatBranch !== null &&
+      (!canonicalBranchExistedBeforeAdoption ||
+        canonicalBranchBeforeAdoption !== implicitFlatBranch);
+  };
+  const preservePreAdoptionBranch = (meta: RepoMeta): RepoMeta => {
+    if (!implicitFlatBranch) return meta;
+    const protectedMeta = { ...meta };
+    if (canonicalBranchExistedBeforeAdoption) protectedMeta.branch = canonicalBranchBeforeAdoption;
+    else delete protectedMeta.branch;
+    return protectedMeta;
+  };
+  const markPendingImplicitFlatAdoption = (meta: RepoMeta): RepoMeta => {
+    const protectedMeta = preservePreAdoptionBranch(meta);
+    if (!implicitFlatBranchAdoptionPending || protectedMeta.incrementalInProgress) {
+      return protectedMeta;
+    }
+    const now = Date.now();
+    return {
+      ...protectedMeta,
+      incrementalInProgress: {
+        startedAt: now,
+        updatedAt: now,
+        targetCommit: meta.lastCommit,
+        phase: 'branch-adoption',
+        toWriteCount: 0,
+      },
+    };
+  };
+  const savePreAdoptionMeta = (metaDir: string, meta: RepoMeta): Promise<void> =>
+    saveMeta(metaDir, markPendingImplicitFlatAdoption(meta));
+  const adoptAndRestampImplicitFlatBranch = async (meta: RepoMeta): Promise<RepoMeta> => {
+    if (!implicitFlatBranch) return meta;
+    const outcome = options.analyzeStoragePath
+      ? await adoptFlatBranchLabel(repoPath, implicitFlatBranch, storagePath)
+      : await adoptFlatBranchLabel(repoPath, implicitFlatBranch);
+    if (outcome !== 'ADOPTED') {
+      log(
+        `Warning: workspace branch adoption returned ${outcome}; ` +
+          'retaining the prior branch label and retry protection.',
+      );
+      return preservePreAdoptionBranch(meta);
+    }
+    // The staged commit callback may have persisted a protected copy that is
+    // not the same object as `meta`. Inspect the canonical file itself before
+    // taking the coherent-state shortcut, so a staged adoption marker cannot
+    // survive just because the caller's copy was unmarked.
+    const persistedMeta = await loadMeta(canonicalMetaDir);
+    if (
+      persistedMeta &&
+      Object.prototype.hasOwnProperty.call(persistedMeta, 'branch') &&
+      persistedMeta.branch === implicitFlatBranch &&
+      persistedMeta.incrementalInProgress?.phase !== 'branch-adoption'
+    ) {
+      return meta;
+    }
+    const canonicalMeta = persistedMeta ?? meta;
+    const dirtyPhase = canonicalMeta.incrementalInProgress;
+    const adoptedMeta: RepoMeta = {
+      ...canonicalMeta,
+      ...meta,
+      branch: implicitFlatBranch,
+      incrementalInProgress:
+        dirtyPhase?.phase === 'branch-adoption'
+          ? undefined
+          : (meta.incrementalInProgress ?? dirtyPhase),
+    };
+    await saveMeta(canonicalMetaDir, adoptedMeta);
+    return adoptedMeta;
+  };
+
+  const commitStagedMetadataAndRegistry = async (
+    meta: RepoMeta,
+    pendingFlatAdoption = false,
+  ): Promise<string> => {
+    const protectedMeta = pendingFlatAdoption
+      ? markPendingImplicitFlatAdoption(meta)
+      : preservePreAdoptionBranch(meta);
+    await saveMeta(canonicalMetaDir, protectedMeta);
+    return registerRepo(persistedRepoPath, protectedMeta, {
       name: options.registryName,
       allowDuplicateName: options.allowDuplicateName,
       branch: placement.branch,
+      ...frozenRegistryIdentity,
     });
   };
 
+  // ── VECTOR-only repair path ──────────────────────────────────────────
+  // The outer entry point has already performed the read-only storage,
+  // recovery, lock, and metadata preflight before acquiring our ownership
+  // lock. This branch intentionally precedes staged-promotion recovery so a
+  // maintenance command never mutates or chooses between recovery artifacts.
+  if (options.repairVector) {
+    const existingMeta = await loadMeta(canonicalMetaDir);
+    if (!existingMeta) throw new Error('Cannot repair VECTOR: index metadata is missing.');
+
+    const { probeDoctorPool, EXPECTED_POOL_CONNECTIONS } =
+      await import('../cli/doctor-pool-probe.js');
+    const readEmbeddingCount = async (): Promise<number> => {
+      let rows: Awaited<ReturnType<typeof executeQuery>>;
+      try {
+        rows = await executeQuery(`MATCH (e:${EMBEDDING_TABLE_NAME}) RETURN count(e) AS cnt`);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (isMissingColumnOrTableError(message)) return 0;
+        throw error;
+      }
+      const row = rows[0];
+      const count = Number(row?.cnt ?? row?.[0] ?? 0);
+      if (!Number.isSafeInteger(count) || count < 0) {
+        throw new Error('Cannot repair VECTOR: database returned an invalid embedding count.');
+      }
+      return count;
+    };
+    let stats: { nodes: number; edges: number } = { nodes: 0, edges: 0 };
+    let embeddingCountBefore = 0;
+    let repairStatus: AnalyzeResult['vectorRepairStatus'] = 'healthy';
+
+    // A writable LadybugDB open can change database bytes even when no Cypher
+    // mutation is issued. Validate the source table through a native read-only
+    // connection first so malformed and empty indexes fail/return without
+    // touching the database file.
+    let readOnlyPreflight: {
+      stats: { nodes: number; edges: number };
+      embeddingCount: number;
+      integrity: EmbeddingIntegrityReport;
+    };
+    try {
+      await initLbugReadOnlyNonRecovering(canonicalPaths.lbugPath);
+      const embeddingCount = await readEmbeddingCount();
+      readOnlyPreflight = {
+        stats: await getLbugStats(),
+        embeddingCount,
+        integrity: await inspectEmbeddingIntegrity(
+          undefined,
+          existingMeta.embeddingCheckpoint?.physicalRowsSha256 !== undefined,
+        ),
+      };
+    } finally {
+      await closeLbug().catch(() => {});
+    }
+
+    stats = readOnlyPreflight.stats;
+    embeddingCountBefore = readOnlyPreflight.embeddingCount;
+    if (existingMeta.embeddingCheckpoint) {
+      if (existingMeta.embeddingCheckpoint.provider === undefined && embeddingCountBefore > 0) {
+        throw new Error(
+          'Cannot repair VECTOR: the completed embedding checkpoint has unknown-provider ' +
+            'provenance while the table contains rows. Re-run analyze with ' +
+            '--force --drop-embeddings --embeddings 0.',
+        );
+      }
+      assertCompletedCheckpointIdentity(
+        existingMeta.embeddingCheckpoint,
+        readOnlyPreflight.integrity,
+        'Cannot repair VECTOR: completed embedding checkpoint',
+      );
+    }
+
+    // A completed checkpoint passed the preflight, so repair will clear it —
+    // but the integrity scan only proves the live rows are well-formed, not
+    // that none went missing after the final checkpoint (a dirty-recovery
+    // discard can drop committed rows). stats.embeddings cannot serve as the
+    // expectation: it is stale-low across the supported crash window (it is
+    // finalized at run end) and stale-high when re-embedding legitimately
+    // shrinks a node's chunk count (the server producer never persists a
+    // count at all) — review on #192 produced counterexamples in both
+    // directions. The only loss provable from the checkpoint alone is TOTAL
+    // loss: it records embedded nodes, so an empty table is wrong in every
+    // history. Refuse that here — before the zero-row branch below would
+    // report a successful `not-indexed` — and leave partial-loss detection
+    // to a persisted per-checkpoint row count (#194).
+    if (
+      existingMeta.embeddingCheckpoint &&
+      existingMeta.embeddingCheckpoint.totalNodes > 0 &&
+      embeddingCountBefore === 0
+    ) {
+      throw new Error(
+        `Cannot repair VECTOR: the completed embedding checkpoint recorded ` +
+          `${existingMeta.embeddingCheckpoint.totalNodes} embedded nodes but the table holds no ` +
+          'rows. The embedding table was lost after the checkpoint; re-run analyze --embeddings 0 ' +
+          'to regenerate it.',
+      );
+    }
+
+    if (embeddingCountBefore === 0) {
+      // Only a zero-node completed checkpoint reaches here (a populated one
+      // threw above). Clear it before returning, or an empty repository stays
+      // permanently marked as interrupted and later repair/resume keeps
+      // observing stale recovery state.
+      let projectName =
+        options.registryName ??
+        getInferredRepoName(repoPath) ??
+        path.basename(resolveRepoIdentityRoot(repoPath));
+      let resultStats = {
+        ...existingMeta.stats,
+        nodes: stats.nodes,
+        edges: stats.edges,
+        embeddings: 0,
+      };
+      if (existingMeta.embeddingCheckpoint) {
+        const clearedMeta = {
+          ...existingMeta,
+          stats: { ...existingMeta.stats, nodes: stats.nodes, edges: stats.edges, embeddings: 0 },
+          embeddingCheckpoint: undefined,
+          incrementalInProgress: undefined,
+        };
+        if (await isRepoRegistered(repoPath)) {
+          projectName = await commitStagedMetadataAndRegistry(clearedMeta);
+        } else {
+          await savePreAdoptionMeta(canonicalMetaDir, clearedMeta);
+        }
+        resultStats = {
+          ...clearedMeta.stats,
+          nodes: stats.nodes,
+          edges: stats.edges,
+          embeddings: 0,
+        };
+      }
+      progress('done', 100, 'No embeddings are indexed; VECTOR repair was not needed.');
+      return {
+        repoName: projectName,
+        repoPath,
+        stats: resultStats,
+        vectorRepairStatus: 'not-indexed',
+      };
+    }
+
+    assertEmbeddingIntegrity(
+      readOnlyPreflight.integrity,
+      'Cannot repair VECTOR: source table',
+      embeddingCountBefore,
+    );
+
+    const beforeProbe = await probeDoctorPool(canonicalPaths.lbugPath);
+
+    try {
+      await initLbugForMaintenance(canonicalPaths.lbugPath);
+      stats = await getLbugStats();
+      const writableEmbeddingCount = await readEmbeddingCount();
+      if (writableEmbeddingCount !== embeddingCountBefore) {
+        throw new Error(
+          `Cannot repair VECTOR: embedding rows changed after read-only preflight ` +
+            `(${embeddingCountBefore} before, ${writableEmbeddingCount} current).`,
+        );
+      }
+
+      assertEmbeddingIntegrity(
+        await inspectEmbeddingIntegrity(),
+        'Cannot repair VECTOR: source table',
+        embeddingCountBefore,
+      );
+
+      if (beforeProbe.reason || !beforeProbe.vector) {
+        throw new Error(
+          'Cannot repair VECTOR: the production pool could not prove VECTOR availability ' +
+            `(${beforeProbe.vectorIndexReason ?? beforeProbe.reason ?? 'vector-extension-unavailable'}).`,
+        );
+      }
+
+      const vectorAvailable = await loadVectorExtension(undefined, {
+        policy: resolveAnalyzeInstallPolicy(),
+      });
+      if (!vectorAvailable) {
+        const rawReason = getExtensionCapabilities().find((c) => c.name === 'vector')?.reason;
+        throw new Error(
+          'Cannot repair VECTOR: the LadybugDB VECTOR extension is unavailable' +
+            (rawReason ? ` — ${rawReason.replace(/\.$/, '')}` : '') +
+            '.',
+        );
+      }
+
+      if (!beforeProbe.vectorIndex) {
+        progress('vector', 85, 'Rebuilding the HNSW vector index...');
+        if (!(await dropVectorIndex())) {
+          throw new Error('Cannot repair VECTOR: the existing HNSW index could not be removed.');
+        }
+        if (!(await createVectorIndex())) {
+          throw new Error('Cannot repair VECTOR: the HNSW index could not be created.');
+        }
+        repairStatus = 'repaired';
+      }
+
+      const embeddingCountAfter = await readEmbeddingCount();
+      if (embeddingCountAfter !== embeddingCountBefore) {
+        throw new Error(
+          `VECTOR repair changed embedding rows (${embeddingCountBefore} before, ` +
+            `${embeddingCountAfter} after); metadata and registry were not updated.`,
+        );
+      }
+    } finally {
+      await closeLbug().catch(() => {});
+    }
+
+    const afterProbe = await probeDoctorPool(canonicalPaths.lbugPath);
+    if (
+      afterProbe.reason ||
+      !afterProbe.vector ||
+      !afterProbe.vectorIndex ||
+      afterProbe.connectionCount !== EXPECTED_POOL_CONNECTIONS ||
+      afterProbe.exercisedConnections !== EXPECTED_POOL_CONNECTIONS
+    ) {
+      throw new Error(
+        'VECTOR repair did not pass the eight-connection production-pool probe; ' +
+          `metadata and registry were not updated (${afterProbe.vectorIndexReason ?? afterProbe.reason ?? 'pool-probe-unavailable'}).`,
+      );
+    }
+
+    const { getRuntimeCapabilities } = await import('./platform/capabilities.js');
+    const runtimeCapabilities = getRuntimeCapabilities();
+    let repairedMeta: RepoMeta;
+    let projectName: string;
+    await initLbugForMaintenance(canonicalPaths.lbugPath);
+    try {
+      const committedStats = await getLbugStats();
+      const committedEmbeddingCount = await readEmbeddingCount();
+      if (committedEmbeddingCount !== embeddingCountBefore) {
+        throw new Error(
+          `VECTOR repair database changed before metadata commit (${embeddingCountBefore} ` +
+            `verified, ${committedEmbeddingCount} current); metadata and registry were not updated.`,
+        );
+      }
+      assertEmbeddingIntegrity(
+        await inspectEmbeddingIntegrity(),
+        'Cannot commit VECTOR repair metadata: repaired table',
+        committedEmbeddingCount,
+      );
+      repairedMeta = {
+        ...existingMeta,
+        // A completed embedding checkpoint may pass the preflight (see
+        // assertVectorRepairPreflight); a successful repair must not persist
+        // the stale marker, or the next repair/resume re-enters recovery.
+        embeddingCheckpoint: undefined,
+        incrementalInProgress: undefined,
+        repoPath: persistedRepoPath,
+        remoteUrl: repositoryRemoteUrl ?? existingMeta.remoteUrl,
+        stats: {
+          ...existingMeta.stats,
+          nodes: committedStats.nodes,
+          edges: committedStats.edges,
+          embeddings: committedEmbeddingCount,
+        },
+        capabilities: {
+          graph: { provider: 'ladybugdb', status: 'available' },
+          fts: {
+            provider: 'ladybugdb-fts',
+            status: afterProbe.fts ? 'available' : 'unavailable',
+          },
+          vectorSearch: {
+            provider: 'ladybugdb-vector',
+            status: 'vector-index',
+            exactScanLimit: runtimeCapabilities.exactScanLimit,
+          },
+        },
+      };
+      repairedMeta = preservePreAdoptionBranch(repairedMeta);
+      await saveMeta(canonicalMetaDir, repairedMeta);
+      projectName = await registerRepo(persistedRepoPath, repairedMeta, {
+        name: options.registryName,
+        allowDuplicateName: options.allowDuplicateName,
+        ...frozenRegistryIdentity,
+      });
+    } finally {
+      await closeLbug().catch(() => {});
+    }
+    progress('done', 100, 'VECTOR index verified through all eight pooled connections.');
+    return {
+      repoName: projectName,
+      repoPath,
+      stats: repairedMeta.stats ?? {},
+      vectorRepairStatus: repairStatus,
+    };
+  }
+
   const promoteValidatedStage = async (paths: StagedAnalyzePaths): Promise<string | undefined> => {
     const stagedMeta = await validateStagedGeneration(paths);
-    const stagedStats = await withLbugDb(paths.stagedLbugPath, getLbugStats, {
-      readOnly: true,
-    });
+    let stagedValidation: {
+      stats: Awaited<ReturnType<typeof getLbugStats>>;
+      integrity: EmbeddingIntegrityReport;
+    };
+    try {
+      stagedValidation = await withLbugDb(
+        paths.stagedLbugPath,
+        async () => ({ stats: await getLbugStats(), integrity: await inspectEmbeddingIntegrity() }),
+        { readOnly: true },
+      );
+    } finally {
+      // Promotion renames this file. Windows refuses the rename while the
+      // singleton read-only handle remains open.
+      await closeLbug().catch(() => {});
+    }
+    const stagedStats = stagedValidation.stats;
     if (
       (stagedMeta.stats?.nodes !== undefined && stagedMeta.stats.nodes !== stagedStats.nodes) ||
       (stagedMeta.stats?.edges !== undefined && stagedMeta.stats.edges !== stagedStats.edges)
@@ -704,11 +1300,48 @@ const runFullAnalysisImpl = async (
           `but the readable DB contains ${stagedStats.nodes} nodes/${stagedStats.edges} edges.`,
       );
     }
+    assertEmbeddingIntegrity(
+      stagedValidation.integrity,
+      'Staged DB validation',
+      stagedMeta.stats?.embeddings,
+    );
     return (
-      await promoteStagedGeneration(paths, commitStagedMetadataAndRegistry, {
+      await promoteStagedGeneration(paths, (meta) => commitStagedMetadataAndRegistry(meta, true), {
         readRepositoryIdentity,
       })
     ).projectName;
+  };
+
+  const validatePendingPromotionEmbeddingCandidate = async (
+    paths: StagedAnalyzePaths,
+  ): Promise<void> => {
+    const stagedState = await lstatIfPresent(paths.stagedLbugPath);
+    const candidatePath = stagedState?.isFile() ? paths.stagedLbugPath : paths.canonicalLbugPath;
+    const candidateState = await lstatIfPresent(candidatePath);
+    if (!candidateState?.isFile() || candidateState.isSymbolicLink()) {
+      throw new Error(
+        'Pending staged promotion has no unambiguous regular candidate database; refusing recovery.',
+      );
+    }
+    const stagedRootState = await lstatIfPresent(paths.stageRoot);
+    const candidateMeta = await loadMeta(
+      stagedRootState ? paths.stagedMetaDir : paths.canonicalMetaDir,
+    );
+    if (!candidateMeta) {
+      throw new Error('Pending staged promotion has no readable candidate metadata.');
+    }
+    try {
+      const integrity = await withLbugDb(candidatePath, inspectEmbeddingIntegrity, {
+        readOnly: true,
+      });
+      assertEmbeddingIntegrity(
+        integrity,
+        'Pending staged promotion candidate',
+        candidateMeta.stats?.embeddings,
+      );
+    } finally {
+      await closeLbug().catch(() => {});
+    }
   };
 
   // Every analyze mode owns the same canonical slot and must resolve its
@@ -722,16 +1355,80 @@ const runFullAnalysisImpl = async (
       );
     }
     progress('lbug', 1, 'Recovering staged promotion...');
-    await promoteStagedGeneration(promotionPaths, commitStagedMetadataAndRegistry, {
-      readRepositoryIdentity,
-    });
+    await validatePendingPromotionEmbeddingCandidate(promotionPaths);
+    const recoveredPromotion = await promoteStagedGeneration(
+      promotionPaths,
+      (meta) => commitStagedMetadataAndRegistry(meta, true),
+      {
+        readRepositoryIdentity,
+      },
+    );
     log('Recovered and completed the previous staged promotion.');
+    let recoveredMeta = await loadMeta(canonicalMetaDir);
+    if (!recoveredMeta) {
+      throw new Error('Recovered staged promotion is missing canonical metadata.');
+    }
+    if (implicitFlatBranch) {
+      try {
+        recoveredMeta = await adoptAndRestampImplicitFlatBranch(recoveredMeta);
+      } catch (error) {
+        log(
+          `Warning: could not sync the recovered workspace branch label ` +
+            `(${(error as Error).message}); will retry on the next run.`,
+        );
+      }
+    }
+    const recoveredRepoName =
+      recoveredPromotion.projectName ??
+      options.registryName ??
+      getInferredRepoName(repoPath) ??
+      path.basename(resolveRepoIdentityRoot(repoPath));
+
+    // Recovery completes the same canonical promotion as the normal finalize
+    // path, so finish its source-side bookkeeping before returning the explicit
+    // recovery-only result. Context generation is best-effort, matching the
+    // ordinary successful path.
+    await ensureGitNexusIgnored(repoPath, storagePath);
+    if (!placement.branch) {
+      try {
+        await generateAIContextFiles(
+          repoPath,
+          storagePath,
+          recoveredRepoName,
+          {
+            files: recoveredMeta.stats?.files,
+            nodes: recoveredMeta.stats?.nodes,
+            edges: recoveredMeta.stats?.edges,
+            communities: recoveredMeta.stats?.communities,
+            processes: recoveredMeta.stats?.processes,
+          },
+          undefined,
+          {
+            skipAgentsMd: options.skipAgentsMd,
+            skipSkills: options.skipSkills,
+            noStats: options.noStats,
+            defaultBranch: options.defaultBranch,
+            hasPdg: recoveredMeta.pdg !== undefined,
+          },
+        );
+      } catch {
+        // Best-effort — the recovered canonical index remains valid.
+      }
+    }
+    progress('done', 100, 'Recovered staged promotion');
+    return {
+      repoName: recoveredRepoName,
+      repoPath,
+      stats: recoveredMeta.stats ?? {},
+      recoveredPromotionOnly: true,
+      isPrimaryBranch: !placement.branch,
+    };
   }
 
-  // Analyze indexes the working tree, not an arbitrary ref. Recover a pending
-  // staged promotion first so a crash cannot leave the canonical pathname
-  // absent merely because the user switched branches before retrying. Once
-  // recovery is complete, refuse to start a new build for a mismatched label.
+  // Analyze indexes the working tree, not an arbitrary ref. A journal recovery
+  // above is intentionally terminal: combining crash recovery with a second
+  // source build recreates the ambiguous lifecycle that staged mode is meant to
+  // avoid. The caller must start a fresh explicit analyze for the current tree.
   if (options.branch && checkedOutBranch && options.branch !== checkedOutBranch) {
     throw new Error(
       `--branch "${options.branch}" does not match the checked-out branch "${checkedOutBranch}". ` +
@@ -743,9 +1440,44 @@ const runFullAnalysisImpl = async (
     throw new Error('`--staged` cannot be combined with `--repair-fts`; repair is in-place only.');
   }
 
+  let stagedWorkspaceExisted = false;
+  let canonicalDatabaseExistedAtStageStart = false;
+  let canonicalMetaAtStageStart: RepoMeta | null = null;
   if (stagedPaths) {
-    const canonicalMeta = await loadMeta(canonicalMetaDir);
-    const prepared = await prepareStagedWorkspace(stagedPaths, canonicalMeta, repositorySource);
+    canonicalMetaAtStageStart = await loadMeta(canonicalMetaDir);
+    const stagedSourceAtStart = await inspectStagedWorkspaceSource(
+      stagedPaths,
+      canonicalMetaAtStageStart,
+      repositorySource,
+    );
+    const canonicalDatabaseStateAtStart = await lstatIfPresent(canonicalPaths.lbugPath);
+    stagedWorkspaceExisted = stagedSourceAtStart.exists;
+    canonicalDatabaseExistedAtStageStart = canonicalDatabaseStateAtStart !== null;
+
+    if (stagedWorkspaceExisted && !options.dropEmbeddings) {
+      throw new Error(
+        'An unjournaled staged generation already exists. It was left untouched for forensics ' +
+          'and will not be promoted or resumed automatically. Re-run with `--drop-embeddings` ' +
+          'only when replacing that derived stage with a clean isolated generation is intentional.',
+      );
+    }
+    if (
+      !stagedWorkspaceExisted &&
+      canonicalDatabaseExistedAtStageStart &&
+      !options.dropEmbeddings
+    ) {
+      throw new Error(
+        'Starting staged work from an existing canonical database requires explicit ' +
+          '`--drop-embeddings`. The canonical index is unchanged. Semantic refreshes must use ' +
+          '`--staged --embeddings --drop-embeddings`; graph-only rebuilds must use ' +
+          '`--staged --drop-embeddings`.',
+      );
+    }
+    const prepared = await prepareStagedWorkspace(
+      stagedPaths,
+      canonicalMetaAtStageStart,
+      repositorySource,
+    );
     log(
       prepared.resumed
         ? 'Resuming the existing staged generation; the canonical index remains untouched.'
@@ -764,6 +1496,18 @@ const runFullAnalysisImpl = async (
   // stores, inspect via LadybugDB, or touch sidecars until every invariant
   // needed for a surgical incremental write is established.
   let existingMeta = await loadMeta(metaDir);
+  if (stagedPaths) {
+    // electric.4-.7 proved that restoring or resuming embedding rows inside a
+    // staged copy is not a safe compatibility surface. Keep the useful part of
+    // staged analyze (isolated full generation + validated promotion). Every
+    // replacement of existing derived state is explicit and starts clean.
+    if (options.dropEmbeddings || (options.embeddings && !existingMeta)) {
+      // The target is the isolated staged DB. Forcing a full write wipes only
+      // that disposable copy; the canonical generation stays readable until
+      // the final integrity scan and journaled promotion both succeed.
+      options = { ...options, force: true };
+    }
+  }
   if (options.incrementalOnly) {
     if (!existingMeta) {
       incrementalOnlyStop('no existing index metadata is available');
@@ -835,13 +1579,17 @@ const runFullAnalysisImpl = async (
     // before the rename must keep doing so.
     if (!options.staged) {
       try {
-        await reconcileMetadataFiles(repoPath);
+        await reconcileMetadataFiles(repoPath, storagePath);
       } catch (err) {
         const code = (err as NodeJS.ErrnoException)?.code;
         log(`Metadata reconciliation failed (non-critical${code ? `, ${code}` : ''}); continuing.`);
       }
     }
     existingMeta = await loadMeta(metaDir);
+    // Reconciliation may select a fresher legacy mirror. All later adoption-
+    // protected writes must preserve that reconciled branch projection, not
+    // the stale primary file observed before reconciliation.
+    if (implicitFlatBranch) refreshPreAdoptionBranch(existingMeta);
   }
 
   // ── FTS-only repair path ────────────────────────────────────────────
@@ -944,7 +1692,7 @@ const runFullAnalysisImpl = async (
             'if that also fails, verify FTS extension availability via `gitnexus doctor`.',
         );
       }
-      await ensureGitNexusIgnored(repoPath);
+      await ensureGitNexusIgnored(repoPath, storagePath);
       progress('fts', 90, 'Search indexes ready');
       progress('done', 100, 'Done');
       return {
@@ -964,22 +1712,31 @@ const runFullAnalysisImpl = async (
   let resumeEmbeddingCheckpoint = false;
   let pendingEmbeddingNodeIds = new Set<string>();
   let embeddingIdentityForRun: EmbeddingIdentity | undefined;
+  const isEmptyLegacyCheckpoint = (checkpoint: NonNullable<RepoMeta['embeddingCheckpoint']>) =>
+    checkpoint.provider === undefined &&
+    checkpoint.nodesProcessed === 0 &&
+    checkpoint.totalNodes === 0 &&
+    checkpoint.chunksProcessed === 0 &&
+    !checkpoint.pendingNodeIds?.length;
   if (existingMeta?.embeddingCheckpoint) {
     if (options.dropEmbeddings) {
       log('Discarding the interrupted embedding checkpoint (--drop-embeddings).');
       options = { ...options, force: true };
-    } else {
+    } else if (!isEmptyLegacyCheckpoint(existingMeta.embeddingCheckpoint)) {
       embeddingIdentityForRun = await resolveEmbeddingIdentity();
       const checkpoint = existingMeta.embeddingCheckpoint;
       if (
+        checkpoint.provider === undefined ||
+        checkpoint.provider !== embeddingIdentityForRun.provider ||
         checkpoint.model !== embeddingIdentityForRun.model ||
         checkpoint.dimensions !== embeddingIdentityForRun.dimensions
       ) {
         throw new Error(
-          `Cannot resume embedding checkpoint: it uses ${checkpoint.model} at ` +
-            `${checkpoint.dimensions} dimensions, but this run resolves ` +
-            `${embeddingIdentityForRun.model} at ${embeddingIdentityForRun.dimensions}. ` +
-            'Restore the matching embedding configuration or pass --drop-embeddings to rebuild without it.',
+          `Cannot resume embedding checkpoint: it uses ${checkpoint.provider ?? 'unknown-provider'} / ` +
+            `${checkpoint.model} at ${checkpoint.dimensions} dimensions, but this run resolves ` +
+            `${embeddingIdentityForRun.provider} / ${embeddingIdentityForRun.model} at ` +
+            `${embeddingIdentityForRun.dimensions}. ` +
+            'Restore the matching embedding configuration or pass --drop-embeddings --embeddings 0 to rebuild without it.',
         );
       }
       resumeEmbeddingCheckpoint = true;
@@ -1069,6 +1826,64 @@ const runFullAnalysisImpl = async (
           "Cannot start dirty-state recovery — the interrupted run's LadybugDB sidecars " +
           'could neither be moved aside nor removed:',
       });
+    }
+  }
+
+  const legacyCheckpoint = existingMeta?.embeddingCheckpoint;
+  if (!options.dropEmbeddings && legacyCheckpoint && isEmptyLegacyCheckpoint(legacyCheckpoint)) {
+    const integrity = await withLbugReadOnlyNonRecovering(lbugPath, inspectEmbeddingIntegrity);
+    if (integrity.physicalRows > 0) {
+      throw new Error(
+        'Cannot resume embedding checkpoint: it uses unknown-provider while the table contains ' +
+          'rows. Restore the matching embedding configuration or pass --drop-embeddings --embeddings 0 to rebuild without it.',
+      );
+    }
+    assertCompletedCheckpointIdentity(legacyCheckpoint, integrity, CLI_CHECKPOINT_CONTEXT);
+    if (options.incrementalOnly) {
+      incrementalOnlyStop('the provider-less empty checkpoint requires a metadata restamp');
+    }
+    existingMeta = {
+      ...existingMeta,
+      stats: { ...existingMeta.stats, embeddings: 0 },
+      embeddingCheckpoint: undefined,
+    };
+    if (stagedPaths || !(await isRepoRegistered(repoPath))) {
+      await savePreAdoptionMeta(metaDir, existingMeta);
+    } else {
+      await commitStagedMetadataAndRegistry(existingMeta);
+    }
+  }
+
+  // Checkpoint windows are durable boundaries even before the final window.
+  // Validate any completed (no-pending) window that carries identity proof,
+  // but only after dirty-recovery sidecars have been quarantined: opening the
+  // database before that point can replay a poisoned interrupted WAL.
+  const checkpointToVerify = existingMeta?.embeddingCheckpoint;
+  if (
+    resumeEmbeddingCheckpoint &&
+    checkpointToVerify &&
+    !checkpointToVerify.pendingNodeIds?.length &&
+    [
+      checkpointToVerify.physicalRows,
+      checkpointToVerify.validRows,
+      checkpointToVerify.recoverableIdentitySha256,
+      checkpointToVerify.physicalRowsSha256,
+    ].some((value) => value !== undefined)
+  ) {
+    try {
+      const completedIntegrity = await withLbugDb(
+        lbugPath,
+        () =>
+          inspectEmbeddingIntegrity(undefined, checkpointToVerify.physicalRowsSha256 !== undefined),
+        { readOnly: true },
+      );
+      assertCompletedCheckpointIdentity(
+        checkpointToVerify,
+        completedIntegrity,
+        'Completed embedding checkpoint',
+      );
+    } finally {
+      await closeLbug();
     }
   }
 
@@ -1205,7 +2020,49 @@ const runFullAnalysisImpl = async (
       const healUnregistered =
         options.allowDuplicateName === true && !(await isRepoRegistered(repoPath));
       if (!dirty && !healUnregistered) {
-        let promotedProjectName: string | undefined;
+        const recordedEmbeddingCount = existingMeta.stats?.embeddings;
+        let fastPathIntegrity: EmbeddingIntegrityReport;
+        try {
+          fastPathIntegrity = await withLbugDb(canonicalPaths.lbugPath, inspectEmbeddingIntegrity, {
+            readOnly: true,
+          });
+          assertEmbeddingIntegrity(fastPathIntegrity, 'Already-up-to-date index');
+        } finally {
+          // This return precedes the main pipeline's close-protected block.
+          // This path is read-only, so it does not carry the large-write
+          // destructor risk that requires closeLbugBeforeExit elsewhere.
+          // Close for real so the next process never inherits shadow pages
+          // that a read-only query cannot replay.
+          await closeLbug();
+        }
+        if ((recordedEmbeddingCount ?? 0) > 0 && fastPathIntegrity.validRows === 0) {
+          throw new Error(
+            'Already-up-to-date index lost all recorded embeddings; re-run analyze --embeddings 0.',
+          );
+        }
+        let fastPathMeta = existingMeta;
+        if (
+          fastPathIntegrity.validRows > 0 &&
+          recordedEmbeddingCount !== fastPathIntegrity.validRows
+        ) {
+          if (options.incrementalOnly) {
+            incrementalOnlyStop('the verified embedding count requires a metadata restamp');
+          }
+          fastPathMeta = {
+            ...existingMeta,
+            stats: { ...existingMeta.stats, embeddings: fastPathIntegrity.validRows },
+          };
+          try {
+            await savePreAdoptionMeta(metaDir, fastPathMeta);
+          } catch (err) {
+            if (!isReadOnlyFilesystemError(err)) throw err;
+            log(
+              `Warning: could not restamp the verified embedding count ` +
+                `(${(err as Error).message} — storage may be read-only (#1549)); ` +
+                'using the verified live count for this read-only run.',
+            );
+          }
+        }
         // ── #2354: restamp the workspace label on a same-commit branch flip ──
         // The flat slot follows the checked-out working tree; a branch switch
         // at the SAME commit with a clean tree changes nothing the pipeline
@@ -1215,9 +2072,8 @@ const runFullAnalysisImpl = async (
         // stamp, mirroring the end-of-run meta write.
         if (
           !stagedPaths &&
-          !placement.branch &&
-          branchLabel &&
-          existingMeta.branch !== branchLabel
+          implicitFlatBranch &&
+          (!options.incrementalOnly || existingMeta.branch !== implicitFlatBranch)
         ) {
           if (options.incrementalOnly) {
             incrementalOnlyStop('the flat index branch label requires a metadata restamp');
@@ -1233,8 +2089,7 @@ const runFullAnalysisImpl = async (
           // date" run must not fail over it; read-only storage — the
           // documented Docker :ro workflow (#1549) — degrades to a warning.
           try {
-            await adoptFlatBranchLabel(repoPath, branchLabel);
-            await saveMeta(metaDir, { ...existingMeta, branch: branchLabel });
+            fastPathMeta = await adoptAndRestampImplicitFlatBranch(fastPathMeta);
           } catch (err) {
             // EACCES/EPERM also arise from ownership problems and transient
             // Windows locks, so keep the real error visible alongside the
@@ -1248,35 +2103,20 @@ const runFullAnalysisImpl = async (
           }
         }
         if (stagedPaths) {
-          const canonicalMeta = await loadMeta(canonicalMetaDir);
-          const stageWasFinalizedAfterItsCanonicalSource =
-            !canonicalMeta ||
-            canonicalMeta.lastCommit !== existingMeta.lastCommit ||
-            canonicalMeta.indexedAt !== existingMeta.indexedAt;
-          if (stageWasFinalizedAfterItsCanonicalSource) {
-            // The prior process can die after finalizing the staged DB/meta but
-            // before writing the promotion journal. A resumed run then reaches
-            // this same-commit fast path. Promote that validated generation
-            // instead of silently discarding completed work.
-            progress('lbug', 99, 'Promoting completed staged generation...');
-            promotedProjectName = await promoteValidatedStage(stagedPaths);
-          } else {
-            await discardStagedWorkspace(stagedPaths);
-          }
+          await discardStagedWorkspace(stagedPaths);
         } else if (!options.incrementalOnly) {
-          await ensureGitNexusIgnored(repoPath);
+          await ensureGitNexusIgnored(repoPath, storagePath);
         }
         return {
           // `resolveRepoIdentityRoot` collapses worktree roots to the
           // canonical repo basename (#1259) but leaves arbitrary subdirs
           // and `--skip-git` paths unchanged (#1232/#1233 intent preserved).
           repoName:
-            promotedProjectName ??
             options.registryName ??
             getInferredRepoName(repoPath) ??
             path.basename(resolveRepoIdentityRoot(repoPath)),
           repoPath,
-          stats: existingMeta.stats ?? {},
+          stats: fastPathMeta.stats ?? {},
           alreadyUpToDate: true,
           isPrimaryBranch: !placement.branch,
         };
@@ -1300,12 +2140,20 @@ const runFullAnalysisImpl = async (
   // post-commit hook) safe: a multi-minute embedding pass is no longer
   // silently dropped just because the caller omitted `--embeddings`.
   const embeddingSnapshotPath = path.join(metaDir, EMBEDDING_SNAPSHOT_FILE);
+  const embeddingTableRebuildMarkerPath = path.join(metaDir, 'embedding-table-rebuild.json');
   const embeddingSnapshotSource = {
     lastCommit: existingMeta?.lastCommit,
-    indexedAt: existingMeta?.indexedAt,
+    indexedAt: resumeEmbeddingCheckpoint ? undefined : existingMeta?.indexedAt,
   };
+  const embeddingSnapshotValidationOptions =
+    stagedPaths && resumeEmbeddingCheckpoint
+      ? { allowSourceIndexedAtDriftForCheckpointResume: true as const }
+      : undefined;
   let embeddingSnapshotInfo: EmbeddingSnapshotInfo | undefined;
   let embeddingSnapshotAvailable = false;
+  let embeddingTableRebuildStarted = false;
+  let rebuildStagedEmbeddingTableForResume =
+    Boolean(stagedPaths) && resumeEmbeddingCheckpoint && pendingEmbeddingNodeIds.size > 0;
 
   const existingEmbeddingCount = existingMeta?.stats?.embeddings ?? 0;
   const {
@@ -1320,7 +2168,7 @@ const runFullAnalysisImpl = async (
   if (options.dropEmbeddings && existingEmbeddingCount > 0) {
     log(
       `Dropping ${existingEmbeddingCount} existing embeddings (--drop-embeddings). ` +
-        `Re-run with --embeddings to regenerate.`,
+        `Re-run with --embeddings 0 to regenerate.`,
     );
   } else if (forceRegenerateEmbeddings) {
     log(
@@ -1358,7 +2206,54 @@ const runFullAnalysisImpl = async (
         embeddingSnapshotPath,
         embeddingSnapshotSource,
         expectedSnapshotCount,
+        embeddingSnapshotValidationOptions,
       );
+      if (stagedPaths && resumeEmbeddingCheckpoint) {
+        embeddingTableRebuildStarted = await validateEmbeddingTableRebuildMarker(
+          embeddingTableRebuildMarkerPath,
+          embeddingSnapshotSource,
+          embeddingSnapshotInfo,
+        );
+        if (embeddingTableRebuildStarted) rebuildStagedEmbeddingTableForResume = true;
+        // Once a matching marker exists, the validated snapshot is the only
+        // authority: the table may already be empty or partially restored.
+        // Before the first destructive rebuild, prefer a clean live table so a
+        // checkpoint row written after an older snapshot is not lost. A known
+        // malformed native table is recoverable only when the pre-existing,
+        // checksummed snapshot covers every unique live-owner identity and has
+        // no duplicates. That is the narrow ClawSweeper recovery seam.
+        if (!embeddingTableRebuildStarted && embeddingSnapshotInfo) {
+          const sourceIntegrity = await withLbugDb(lbugPath, inspectEmbeddingIntegrity, {
+            readOnly: true,
+          });
+          if (embeddingIntegrityIsClean(sourceIntegrity)) {
+            embeddingSnapshotInfo = undefined;
+          } else {
+            const snapshotAuthorizesRecovery =
+              (embeddingSnapshotInfo.duplicateRows ?? 0) === 0 &&
+              embeddingSnapshotInfo.count === sourceIntegrity.recoverableRows &&
+              embeddingSnapshotMatchesIdentityDigest(
+                embeddingSnapshotInfo,
+                sourceIntegrity.recoverableIdentitySha256,
+              ) &&
+              sourceIntegrity.orphanRows === 0 &&
+              sourceIntegrity.invalidChunkRows === 0 &&
+              sourceIntegrity.wrongDimensionRows === 0;
+            if (!snapshotAuthorizesRecovery) {
+              throw new Error(
+                `Interrupted staged table is malformed and its preservation snapshot ` +
+                  `does not cover every recoverable identity (${embeddingIntegritySummary(sourceIntegrity)}).`,
+              );
+            }
+            rebuildStagedEmbeddingTableForResume = true;
+            log(
+              `The interrupted staged embedding table is malformed; its validated ` +
+                `${embeddingSnapshotInfo.count}-row preservation snapshot will be made ` +
+                `authoritative before isolated recreation.`,
+            );
+          }
+        }
+      }
       if (embeddingSnapshotInfo) {
         embeddingSnapshotAvailable = true;
         log(
@@ -1366,6 +2261,15 @@ const runFullAnalysisImpl = async (
             `(${embeddingSnapshotInfo.count} vectors).`,
         );
       } else {
+        if (rebuildStagedEmbeddingTableForResume) {
+          log('Refreshing the staged embedding snapshot before checkpoint resume.');
+        }
+        if (stagedPaths && resumeEmbeddingCheckpoint) {
+          const sourceIntegrity = await withLbugDb(lbugPath, inspectEmbeddingIntegrity, {
+            readOnly: true,
+          });
+          assertEmbeddingIntegrity(sourceIntegrity, 'Embedding preservation source');
+        }
         embeddingSnapshotInfo = await createEmbeddingSnapshot(
           embeddingSnapshotPath,
           embeddingSnapshotSource,
@@ -1389,6 +2293,14 @@ const runFullAnalysisImpl = async (
         );
         embeddingSnapshotAvailable = true;
         await closeLbug();
+      }
+      if (rebuildStagedEmbeddingTableForResume && !embeddingTableRebuildStarted) {
+        await writeEmbeddingTableRebuildMarker(
+          embeddingTableRebuildMarkerPath,
+          embeddingSnapshotSource,
+          embeddingSnapshotInfo,
+        );
+        embeddingTableRebuildStarted = true;
       }
       if (
         !resumeEmbeddingCheckpoint &&
@@ -1507,7 +2419,7 @@ const runFullAnalysisImpl = async (
     // success at the meta-save step. Scoped to this branch's meta.json.
     if (!options.incrementalOnly) {
       const now = Date.now();
-      await saveMeta(metaDir, {
+      await savePreAdoptionMeta(metaDir, {
         ...existingMeta!,
         incrementalInProgress: {
           startedAt: now,
@@ -1530,7 +2442,7 @@ const runFullAnalysisImpl = async (
     // toWriteCount: 0 is the full-path sentinel (no incremental write set).
     if (existingMeta) {
       const now = Date.now();
-      await saveMeta(metaDir, {
+      await savePreAdoptionMeta(metaDir, {
         ...existingMeta,
         incrementalInProgress: {
           startedAt: now,
@@ -1551,6 +2463,18 @@ const runFullAnalysisImpl = async (
     // a still-populated DB this run believes it wiped.
     await wipeLbugDbFiles(lbugPath);
   }
+
+  const streamedPdgRows = pipelineResult.pdgEmitManifest
+    ? [
+        ...pipelineResult.pdgEmitManifest.nodeFiles.values(),
+        ...pipelineResult.pdgEmitManifest.relsByPair.values(),
+      ].reduce((total, entry) => total + entry.rows, 0)
+    : 0;
+  setBufferPoolSizeHint(
+    estimateBufferPool(
+      pipelineResult.graph.nodeCount + pipelineResult.graph.relationshipCount + streamedPdgRows,
+    ),
+  );
 
   if (options.incrementalOnly) {
     await withLbugDb(lbugPath, async () => undefined, { readOnly: true });
@@ -1646,7 +2570,7 @@ const runFullAnalysisImpl = async (
         extra: Partial<NonNullable<RepoMeta['incrementalInProgress']>> = {},
       ): Promise<void> => {
         if (!incrementalMutationAuthorized) return;
-        await saveMeta(metaDir, {
+        await savePreAdoptionMeta(metaDir, {
           ...existingMeta!,
           incrementalInProgress: {
             startedAt: dirtyStartedAt,
@@ -2047,7 +2971,7 @@ const runFullAnalysisImpl = async (
     // would finalize metadata with fewer vectors than the preserved snapshot.
     let restoredEmbeddingCount = 0;
     let skippedPendingEmbeddingRows = 0;
-    // Keep only restored row identities and one hash per owner node; vectors
+    // Keep exact known row identities and one restored hash per owner node; vectors
     // still stream through the bounded 256-row snapshot batches above. The
     // exact row IDs are required because LadybugDB can make freshly restored
     // non-PK nodeId predicates temporarily miss rows even while the PK sees
@@ -2055,6 +2979,29 @@ const runFullAnalysisImpl = async (
     // row that already exists and fail with a duplicate primary key (#155).
     const restoredEmbeddingHashes = new Map<string, string>();
     const restoredEmbeddingRowIds = new Map<string, string[]>();
+    if (
+      shouldRecreateStagedEmbeddingTableForResume(
+        rebuildStagedEmbeddingTableForResume,
+        embeddingSnapshotInfo,
+      )
+    ) {
+      if (embeddingSnapshotInfo.count > 0) {
+        const { EMBEDDING_DIMS } = await import('./lbug/schema.js');
+        if (embeddingSnapshotInfo.dimensions !== EMBEDDING_DIMS) {
+          throw new Error(
+            `Cannot recreate the staged embedding table from a ` +
+              `${embeddingSnapshotInfo.dimensions}-dimensional snapshot; this run requires ` +
+              `${EMBEDDING_DIMS} dimensions.`,
+          );
+        }
+      }
+      progress('embeddings', 87, 'Recreating the isolated staged embedding table...');
+      const { resolveEmbeddingInstallPolicy } = await import('./embeddings/embedding-pipeline.js');
+      await recreateCodeEmbeddingTable({ policy: resolveEmbeddingInstallPolicy() });
+      // The table is now empty even if graph writeback was surgical. Restore
+      // every live non-pending snapshot row, not only changed-file rows.
+      deletedFilePathsForRestore = null;
+    }
     if (embeddingSnapshotInfo && embeddingSnapshotInfo.count > 0) {
       const cachedDims = embeddingSnapshotInfo.dimensions;
       const { EMBEDDING_DIMS } = await import('./lbug/schema.js');
@@ -2086,6 +3033,14 @@ const runFullAnalysisImpl = async (
               // force-selected by runEmbeddingPipeline before finalization.
               if (resumeEmbeddingCheckpoint && pendingEmbeddingNodeIds.has(embedding.nodeId)) {
                 skippedPendingEmbeddingRows += 1;
+                // The staged database can already contain this row from the
+                // interrupted window even though its non-PK nodeId lookup is
+                // temporarily invisible behind LadybugDB's live VECTOR index.
+                // Carry the exact primary key without its reusable hash so the
+                // pipeline deletes it immediately before regenerating the batch.
+                const rowIds = restoredEmbeddingRowIds.get(embedding.nodeId) ?? [];
+                rowIds.push(`${embedding.nodeId}:${embedding.chunkIndex}`);
+                restoredEmbeddingRowIds.set(embedding.nodeId, rowIds);
                 continue;
               }
               const liveNode = pipelineResult.graph.getNode(embedding.nodeId);
@@ -2144,6 +3099,7 @@ const runFullAnalysisImpl = async (
             }
           },
           resumeEmbeddingCheckpoint ? undefined : existingEmbeddingCount,
+          embeddingSnapshotValidationOptions,
         );
         if (skippedPendingEmbeddingRows > 0) {
           log(
@@ -2250,12 +3206,13 @@ const runFullAnalysisImpl = async (
         },
         pendingNodeIds: string[],
         embeddings: number | undefined,
+        integrity?: EmbeddingIntegrityReport,
       ): Promise<void> => {
         const fileHashes: Record<string, string> = {};
         for (const [key, value] of newFileHashes) fileHashes[key] = value;
-        await saveMeta(metaDir, {
+        await savePreAdoptionMeta(metaDir, {
           ...(existingMeta ?? {}),
-          repoPath,
+          repoPath: persistedRepoPath,
           lastCommit: currentCommit,
           indexedAt: new Date().toISOString(),
           branch: branchLabel ?? existingMeta?.branch,
@@ -2278,9 +3235,14 @@ const runFullAnalysisImpl = async (
           embeddingCheckpoint: {
             at: new Date().toISOString(),
             ...checkpoint,
+            provider: embeddingIdentity.provider,
             model: embeddingIdentity.model,
             dimensions: embeddingIdentity.dimensions,
             pendingNodeIds,
+            physicalRows: integrity?.physicalRows,
+            validRows: integrity?.validRows,
+            recoverableIdentitySha256: integrity?.recoverableIdentitySha256,
+            physicalRowsSha256: integrity?.physicalRowsSha256 || undefined,
           },
           pdg: resolvePdgConfig(options),
         });
@@ -2305,6 +3267,8 @@ const runFullAnalysisImpl = async (
         {
           forceReembedNodeIds: pendingEmbeddingNodeIds,
           existingEmbeddingRowIds: restoredEmbeddingRowIds,
+          rebuildVectorIndexBeforeMutation:
+            Boolean(stagedPaths) && resumeEmbeddingCheckpoint && pendingEmbeddingNodeIds.size > 0,
           loadExistingEmbeddingHashes: async (nodeIds) => {
             const hashes = await fetchExistingEmbeddingHashesForNodeIds(executeQuery, nodeIds);
             for (const nodeId of nodeIds) {
@@ -2318,12 +3282,12 @@ const runFullAnalysisImpl = async (
           },
           onCheckpoint: async (checkpoint) => {
             await checkpointOnce();
-            const countResult = await executeQuery(
-              `MATCH (e:${EMBEDDING_TABLE_NAME}) RETURN count(e) AS cnt`,
+            const integrity = await inspectEmbeddingIntegrity(
+              undefined,
+              checkpoint.nodesProcessed === checkpoint.totalNodes,
             );
-            const countRow = countResult?.[0];
-            const embeddings = Number(countRow?.cnt ?? countRow?.[0] ?? 0);
-            await saveEmbeddingCheckpoint(checkpoint, [], embeddings);
+            assertEmbeddingIntegrity(integrity, 'Completed embedding checkpoint');
+            await saveEmbeddingCheckpoint(checkpoint, [], integrity.validRows, integrity);
           },
         },
       );
@@ -2341,17 +3305,10 @@ const runFullAnalysisImpl = async (
     // ── Phase 5: Finalize (98–100%) ───────────────────────────────────
     progress('done', 98, 'Saving metadata...');
 
-    // Count embeddings in the index (cached + newly generated)
-    let embeddingCount = 0;
-    try {
-      const embResult = await executeQuery(
-        `MATCH (e:${EMBEDDING_TABLE_NAME}) RETURN count(e) AS cnt`,
-      );
-      const row = embResult?.[0];
-      embeddingCount = Number(row?.cnt ?? row?.[0] ?? 0);
-    } catch {
-      /* table may not exist if embeddings never ran */
-    }
+    // Finalization, metadata, and registration trust only canonical live rows.
+    const terminalIntegrity = await inspectEmbeddingIntegrity(undefined, true);
+    assertEmbeddingIntegrity(terminalIntegrity, 'Terminal embedding finalization');
+    const embeddingCount = terminalIntegrity.validRows;
 
     if (!embeddingSkipped && stats.nodes > 0 && embeddingCount === 0) {
       throw new Error(
@@ -2392,8 +3349,8 @@ const runFullAnalysisImpl = async (
     // RepoMeta's status unions (tri-review 4669518496 P1/U3) — an unannotated
     // literal widens the vectorSearch.status ternary to `string` and the
     // honesty contract silently decays to "whatever interpolates".
-    const meta: RepoMeta = {
-      repoPath,
+    const meta: RepoMeta = preservePreAdoptionBranch({
+      repoPath: persistedRepoPath,
       lastCommit: currentCommit,
       indexedAt: new Date().toISOString(),
       // Branch identity this index represents (#2106). Recorded for the flat
@@ -2458,14 +3415,15 @@ const runFullAnalysisImpl = async (
       // stamp after an on→off flip; the next pdgModeMismatch then compares
       // off==off and incremental eligibility is restored.
       pdg: resolvePdgConfig(options),
-    };
+    });
     if (isIncremental && hashDiff) {
       callbacks.onRecoveryBoundary?.('before-finalize', {
         phase: escalatedFullWrite ? 'escalated-load-graph' : 'load-graph',
         targetCommit: currentCommit,
       });
     }
-    await saveMeta(metaDir, meta);
+    const metadataToCommit = stagedPaths ? meta : markPendingImplicitFlatAdoption(meta);
+    await saveMeta(metaDir, metadataToCommit);
 
     // Persist the incremental parse cache for the next run. Wraps in
     // try/catch so a cache-write failure never breaks an otherwise
@@ -2522,7 +3480,17 @@ const runFullAnalysisImpl = async (
     // reclaim (#2264). Long-lived callers close for real.
     await (options.skipNativeCloseOnExit && !stagedPaths ? closeLbugBeforeExit() : closeLbug());
 
-    if (embeddingSnapshotAvailable) {
+    let embeddingTableRebuildMarkerRemoved = true;
+    if (embeddingTableRebuildStarted) {
+      await removeEmbeddingTableRebuildMarker(embeddingTableRebuildMarkerPath).catch((error) => {
+        embeddingTableRebuildMarkerRemoved = false;
+        log(
+          `Warning: could not remove completed embedding table rebuild marker ` +
+            `(${(error as Error).message}); the validated snapshot remains authoritative.`,
+        );
+      });
+    }
+    if (embeddingSnapshotAvailable && embeddingTableRebuildMarkerRemoved) {
       await removeEmbeddingSnapshot(embeddingSnapshotPath).catch((error) => {
         log(
           `Warning: could not remove completed embedding preservation snapshot ` +
@@ -2547,17 +3515,18 @@ const runFullAnalysisImpl = async (
     } else {
       // Forward the --name alias and registry-collision bypass only after the
       // canonical DB is finalized. In staged mode this same commit is journaled.
-      projectName = await registerRepo(repoPath, meta, {
+      projectName = await registerRepo(persistedRepoPath, metadataToCommit, {
         name: options.registryName,
         allowDuplicateName: options.allowDuplicateName,
         branch: placement.branch,
+        ...frozenRegistryIdentity,
       });
     }
 
     // ── #2354: the flat workspace slot has adopted this run's branch ──────
-    if (!placement.branch && branchLabel) {
+    if (implicitFlatBranch) {
       try {
-        await adoptFlatBranchLabel(repoPath, branchLabel);
+        await adoptAndRestampImplicitFlatBranch(metadataToCommit);
       } catch (e) {
         log(
           `Warning: could not sync the workspace branch label (${(e as Error).message}); continuing.`,
@@ -2567,7 +3536,7 @@ const runFullAnalysisImpl = async (
 
     // Side effects that describe the canonical generation happen only after a
     // staged promotion has committed.
-    await ensureGitNexusIgnored(repoPath);
+    await ensureGitNexusIgnored(repoPath, storagePath);
 
     let aggregatedClusterCount = 0;
     if (pipelineResult.communityResult?.communities) {
@@ -2642,11 +3611,65 @@ const runFullAnalysisImpl = async (
   }
 };
 
+type AnalyzeInternalContext = {
+  /** The server parent owns the frozen storage/root lease through finalization. */
+  parentAnalyzeOwnershipHeld?: boolean;
+};
+
 export async function runFullAnalysis(
   repoPath: string,
   options: AnalyzeOptions,
   callbacks: AnalyzeCallbacks,
+  internal: AnalyzeInternalContext = {},
 ): Promise<AnalyzeResult> {
+  if (
+    !internal.parentAnalyzeOwnershipHeld &&
+    (options.analyzeStoragePath !== undefined || options.registryPath !== undefined)
+  ) {
+    throw new Error(
+      'Frozen analyzeStoragePath and registryPath overrides require parent-held analyze ownership.',
+    );
+  }
+  if (
+    internal.parentAnalyzeOwnershipHeld &&
+    (!options.analyzeStoragePath || !options.registryPath)
+  ) {
+    throw new Error(
+      'Parent-held analyze ownership requires frozen analyzeStoragePath and registryPath.',
+    );
+  }
+  if (
+    options.registryPath !== undefined &&
+    !registryPathEquals(canonicalizePath(options.registryPath), canonicalizePath(repoPath))
+  ) {
+    throw new Error('GitNexus: analyze display path changed before worker start');
+  }
+  if (options.analyzeStoragePath !== undefined && !path.isAbsolute(options.analyzeStoragePath)) {
+    throw new Error('GitNexus: analyze storage target must be absolute');
+  }
+  if (options.incrementalOnly && options.dropEmbeddings) {
+    throw new Error(
+      'Cannot combine `--incremental-only` with `--drop-embeddings`. ' +
+        'The preservation contract refuses every option that can require a clean rebuild.',
+    );
+  }
+  if (options.repairVector) {
+    const conflicts = [
+      options.force && '--force',
+      options.staged && '--staged',
+      options.incrementalOnly && '--incremental-only',
+      options.repairFts && '--repair-fts',
+      options.embeddings && '--embeddings',
+      options.embeddingsNodeLimit !== undefined && '--embeddings',
+      options.dropEmbeddings && '--drop-embeddings',
+      options.pdg && '--pdg',
+      options.branch && '--branch',
+    ].filter((value): value is string => typeof value === 'string');
+    if (conflicts.length > 0) {
+      throw new Error(`Cannot combine \`--repair-vector\` with ${conflicts.join(', ')}.`);
+    }
+  }
+
   // Repository identity is the first gate. It must run before the analyzer
   // ownership lock creates its storage directory, as well as before metadata,
   // sidecar, or database mutation. registerRepo repeats the check at commit
@@ -2654,12 +3677,25 @@ export async function runFullAnalysis(
   const repoHasGit = hasGitDir(repoPath);
   const repositoryRemoteUrl = repoHasGit ? getRemoteUrl(repoPath) : undefined;
   await assertCanonicalRepositoryIdentity(repoPath, repositoryRemoteUrl);
+  if (options.repairVector) await assertVectorRepairPreflight(repoPath);
 
-  const { storagePath } = getStoragePaths(repoPath);
-  return withAnalyzeOwnershipLock(storagePath, () =>
-    runFullAnalysisImpl(repoPath, options, callbacks, {
+  const storagePath = options.analyzeStoragePath ?? getStoragePaths(repoPath).storagePath;
+  const runWithOwnedStorage = async (): Promise<AnalyzeResult> => {
+    // The first preflight avoids creating an ownership lock for a known-dirty
+    // index. Repeat it after lock acquisition because a writer may have run
+    // while this command was waiting and left new recovery or dirty state.
+    if (options.repairVector) {
+      await assertVectorRepairPreflight(repoPath, { allowAnalyzeOwnershipLock: true });
+    }
+    return runFullAnalysisImpl(repoPath, options, callbacks, {
       repoHasGit,
       remoteUrl: repositoryRemoteUrl,
-    }),
-  );
+    });
+  };
+
+  if (internal.parentAnalyzeOwnershipHeld) {
+    return runWithOwnedStorage();
+  }
+
+  return withAnalyzeOwnershipLock(storagePath, runWithOwnedStorage, { repoRoot: repoPath });
 }

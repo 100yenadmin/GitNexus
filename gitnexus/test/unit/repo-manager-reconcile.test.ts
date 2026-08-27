@@ -72,6 +72,18 @@ describe('reconcileMetadataFiles', () => {
     await expect(readJson(storagePath, 'meta.json')).resolves.toEqual(primary);
   });
 
+  it('reconciles only the frozen storage target when the lexical slot differs', async () => {
+    const frozenStorage = path.join(tmpRepo.dbPath, 'frozen-storage');
+    await fs.mkdir(frozenStorage);
+    const legacy = metaAt('2026-06-01T00:00:00.000Z', 'frozen-commit');
+    await fs.writeFile(path.join(frozenStorage, 'meta.json'), JSON.stringify(legacy));
+
+    await expect(reconcileMetadataFiles(tmpRepo.dbPath, frozenStorage)).resolves.toBe(true);
+
+    await expect(readJson(frozenStorage, 'gitnexus.json')).resolves.toEqual(legacy);
+    await expect(fs.access(path.join(storagePath, 'gitnexus.json'))).rejects.toThrow();
+  });
+
   it('preserves the incrementalInProgress crash-recovery flag through a bootstrap', async () => {
     // The dirty flag travels through this file; a reconciliation that
     // reconstructed a trimmed object instead of carrying fields verbatim
@@ -255,6 +267,23 @@ describe('runFullAnalysis metadata reconciliation (mocked pipeline)', () => {
       queryImporters: vi.fn(async () => []),
       queryImportersBatch: vi.fn(async () => []),
       loadFTSExtension: vi.fn(async () => false),
+      inspectEmbeddingIntegrity: vi.fn(async () => ({
+        tablePresent: false,
+        physicalRows: 0,
+        validRows: 0,
+        recoverableRows: 0,
+        emptyIdRows: 0,
+        emptyNodeIdRows: 0,
+        invalidChunkRows: 0,
+        noncanonicalIdRows: 0,
+        duplicateIdRows: 0,
+        duplicateSemanticRows: 0,
+        orphanRows: 0,
+        wrongDimensionRows: 0,
+        recoverableIdentitySha256: '0'.repeat(64),
+        physicalRowsSha256: '0'.repeat(64),
+      })),
+      embeddingIntegrityFailures: vi.fn(() => 0),
     }));
     vi.doMock('../../src/core/search/fts-indexes.js', () => ({
       initialiseSearchFTSStemmer: vi.fn(() => 'porter'),

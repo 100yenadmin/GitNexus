@@ -13,6 +13,28 @@ import { STALE_HASH_SENTINEL } from '../../src/core/lbug/schema.js';
 const CLASS_CHUNK_SIZE = 90;
 const CLASS_OVERLAP = 10;
 
+const cleanEmbeddingIntegrityReport = {
+  tablePresent: true,
+  physicalRows: 0,
+  validRows: 0,
+  recoverableRows: 0,
+  emptyIdRows: 0,
+  emptyNodeIdRows: 0,
+  invalidChunkRows: 0,
+  noncanonicalIdRows: 0,
+  duplicateIdRows: 0,
+  duplicateSemanticRows: 0,
+  orphanRows: 0,
+  wrongDimensionRows: 0,
+  recoverableIdentitySha256: '0'.repeat(64),
+  physicalRowsSha256: '0'.repeat(64),
+};
+
+const mockEmbeddingIntegrityAdapter = () => ({
+  inspectEmbeddingIntegrity: vi.fn().mockResolvedValue(cleanEmbeddingIntegrityReport),
+  embeddingIntegrityFailures: vi.fn().mockReturnValue(0),
+});
+
 // ────────────────────────────────────────────────────────────────────────────
 // resolveEmbeddingInstallPolicy (offline-first, #1153)
 // ────────────────────────────────────────────────────────────────────────────
@@ -164,6 +186,53 @@ describe('runEmbeddingPipeline incremental mode', () => {
     const mod = await import('../../src/core/embeddings/embedding-pipeline.js');
     expect(typeof mod.runEmbeddingPipeline).toBe('function');
   });
+
+  it('stops waiting for first-time model initialization when the job is aborted', async () => {
+    vi.resetModules();
+    let initializationStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      initializationStarted = resolve;
+    });
+    const neverFinishes = new Promise<void>(() => {});
+    vi.doMock('../../src/core/embeddings/embedder.js', () => ({
+      initEmbedder: vi.fn(() => {
+        initializationStarted();
+        return neverFinishes;
+      }),
+      embedBatch: vi.fn(),
+      embedText: vi.fn(),
+      embeddingToArray: vi.fn(),
+      isEmbedderReady: vi.fn().mockReturnValue(false),
+    }));
+    vi.doMock('../../src/core/lbug/lbug-adapter.js', () => ({
+      ...mockEmbeddingIntegrityAdapter(),
+      loadVectorExtension: vi.fn().mockResolvedValue(true),
+      createVectorIndex: vi.fn(),
+      dropVectorIndex: vi.fn(),
+    }));
+
+    const executeQuery = vi.fn();
+    const controller = new AbortController();
+    const { runEmbeddingPipeline } =
+      await import('../../src/core/embeddings/embedding-pipeline.js');
+    const pipeline = runEmbeddingPipeline(
+      executeQuery,
+      vi.fn(),
+      vi.fn(),
+      {},
+      undefined,
+      undefined,
+      {
+        signal: controller.signal,
+      },
+    );
+
+    await started;
+    controller.abort();
+
+    await expect(pipeline).rejects.toMatchObject({ name: 'AbortError' });
+    expect(executeQuery).not.toHaveBeenCalled();
+  });
 });
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -205,6 +274,7 @@ describe('runEmbeddingPipeline incremental filter', () => {
   // it was invoked instead of asserting CREATE_VECTOR_INDEX flowed through the
   // injected (prepared) executeQuery, which it must NOT.
   let vectorIndexMock: ReturnType<typeof vi.fn>;
+  let vectorIndexDropMock: ReturnType<typeof vi.fn>;
 
   // Helper node
   const makeNode = (overrides: Partial<EmbeddableNode> = {}): EmbeddableNode => ({
@@ -239,11 +309,14 @@ describe('runEmbeddingPipeline incremental filter', () => {
     }));
 
     // Mock the adapter (avoids needing the native lbug module). The pipeline
-    // imports both loadVectorExtension and createVectorIndex from here.
+    // imports vector-index lifecycle functions from here.
     vectorIndexMock = vi.fn().mockResolvedValue(true);
+    vectorIndexDropMock = vi.fn().mockResolvedValue(true);
     vi.doMock('../../src/core/lbug/lbug-adapter.js', () => ({
+      ...mockEmbeddingIntegrityAdapter(),
       loadVectorExtension: vi.fn().mockResolvedValue(true),
       createVectorIndex: vectorIndexMock,
+      dropVectorIndex: vectorIndexDropMock,
     }));
   };
 
@@ -361,10 +434,10 @@ describe('runEmbeddingPipeline incremental filter', () => {
     expect(result.nodesProcessed).toBe(1);
   });
 
-  it('propagates unexpected symbol-query failures instead of building a partial index', async () => {
+  it('propagates connection does-not-exist failures instead of building a partial index', async () => {
     mockEmbedderSetup();
 
-    const executeQuery = vi.fn().mockRejectedValue(new Error('connection reset by peer'));
+    const executeQuery = vi.fn().mockRejectedValue(new Error('connection does not exist'));
     const executeWithReusedStatement = mockExecuteWithReusedStatement();
 
     const { runEmbeddingPipeline } =
@@ -372,7 +445,7 @@ describe('runEmbeddingPipeline incremental filter', () => {
 
     await expect(
       runEmbeddingPipeline(executeQuery, executeWithReusedStatement, onProgress),
-    ).rejects.toThrow('connection reset by peer');
+    ).rejects.toThrow('connection does not exist');
     expect(vectorIndexMock).not.toHaveBeenCalled();
   });
 
@@ -503,6 +576,7 @@ describe('runEmbeddingPipeline incremental filter', () => {
       isEmbedderReady: vi.fn().mockReturnValue(true),
     }));
     vi.doMock('../../src/core/lbug/lbug-adapter.js', () => ({
+      ...mockEmbeddingIntegrityAdapter(),
       loadVectorExtension: vi.fn().mockResolvedValue(true),
       createVectorIndex: vi.fn().mockResolvedValue(true),
     }));
@@ -637,6 +711,50 @@ describe('runEmbeddingPipeline incremental filter', () => {
 
     const createCalls = stmtCalls.filter((call) => call.cypher.includes('CREATE'));
     expect(createCalls.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('drops staged HNSW before deleting and regenerating a persisted pending-window row (#162)', async () => {
+    mockEmbedderSetup();
+
+    const node = makeNode({
+      id: 'Function:pending:src/pending.ts',
+      name: 'pending',
+      filePath: 'src/pending.ts',
+    });
+    const existingEmbeddingRowIds = new Map<string, readonly string[]>([
+      [node.id, [`${node.id}:0`]],
+    ]);
+    const executeQuery = mockExecuteQuery([node]);
+    const executeWithReusedStatement = mockExecuteWithReusedStatement();
+
+    const { runEmbeddingPipeline } =
+      await import('../../src/core/embeddings/embedding-pipeline.js');
+
+    await runEmbeddingPipeline(
+      executeQuery,
+      executeWithReusedStatement,
+      onProgress,
+      {},
+      undefined,
+      undefined,
+      {
+        forceReembedNodeIds: new Set([node.id]),
+        existingEmbeddingRowIds,
+        rebuildVectorIndexBeforeMutation: true,
+      },
+    );
+
+    const mutationCalls = stmtCalls.filter(
+      (call) => call.cypher.includes('DELETE') || call.cypher.includes('CREATE'),
+    );
+    expect(vectorIndexDropMock).toHaveBeenCalledOnce();
+    expect(vectorIndexDropMock).toHaveBeenCalledWith({ policy: 'auto' });
+    expect(mutationCalls[0].cypher).toContain('MATCH (e:CodeEmbedding {id: $id}) DELETE e');
+    expect(mutationCalls[0].params).toEqual([{ id: `${node.id}:0` }]);
+    expect(mutationCalls.some((call) => call.cypher.includes('CREATE'))).toBe(true);
+    expect(vectorIndexDropMock.mock.invocationCallOrder[0]).toBeLessThan(
+      vectorIndexMock.mock.invocationCallOrder[0],
+    );
   });
 
   it('treats STALE_HASH_SENTINEL as stale — triggers re-embed', async () => {
@@ -873,7 +991,7 @@ describe('runEmbeddingPipeline incremental filter', () => {
     expect(checkpoints).toEqual([2, 3]);
   });
 
-  it('pages 5,001 nodes by 512, checkpoints exactly 5,000, and caps embed calls at 8', async () => {
+  it('pages 5,001 nodes by 512, checkpoints 5,000, and writes one identity per statement', async () => {
     mockEmbedderSetup();
     const nodes = Array.from({ length: 5_001 }, (_, index) =>
       makeNode({
@@ -932,7 +1050,7 @@ describe('runEmbeddingPipeline incremental filter', () => {
     ).toBe(true);
     expect(Math.max(...vi.mocked(embedBatch).mock.calls.map(([texts]) => texts.length))).toBe(8);
     const createCalls = stmtCalls.filter((call) => call.cypher.includes('CREATE'));
-    expect(Math.max(...createCalls.map((call) => call.params.length))).toBe(8);
+    expect(Math.max(...createCalls.map((call) => call.params.length))).toBe(1);
   });
 
   it('deletes pending-window rows whose node is no longer embeddable', async () => {
@@ -1041,6 +1159,7 @@ describe('runEmbeddingPipeline incremental filter', () => {
       isEmbedderReady: vi.fn().mockReturnValue(true),
     }));
     vi.doMock('../../src/core/lbug/lbug-adapter.js', () => ({
+      ...mockEmbeddingIntegrityAdapter(),
       loadVectorExtension: vi.fn().mockResolvedValue(false),
       createVectorIndex: vi.fn().mockResolvedValue(false),
     }));
@@ -1075,6 +1194,7 @@ describe('runEmbeddingPipeline incremental filter', () => {
     // during HNSW build). The pipeline wrapper must swallow it, log, and fall
     // back to exact-scan rather than failing the whole analyze run (#2114).
     vi.doMock('../../src/core/lbug/lbug-adapter.js', () => ({
+      ...mockEmbeddingIntegrityAdapter(),
       loadVectorExtension: vi.fn().mockResolvedValue(true),
       createVectorIndex: vi.fn().mockRejectedValue(new Error('HNSW build failed')),
     }));
@@ -1108,6 +1228,7 @@ describe('runEmbeddingPipeline incremental filter', () => {
       isEmbedderReady: vi.fn().mockReturnValue(true),
     }));
     vi.doMock('../../src/core/lbug/lbug-adapter.js', () => ({
+      ...mockEmbeddingIntegrityAdapter(),
       loadVectorExtension: vi.fn().mockResolvedValue(true),
       createVectorIndex: vi.fn().mockResolvedValue(true),
     }));
@@ -1162,6 +1283,7 @@ describe('runEmbeddingPipeline incremental filter', () => {
       isEmbedderReady: vi.fn().mockReturnValue(true),
     }));
     vi.doMock('../../src/core/lbug/lbug-adapter.js', () => ({
+      ...mockEmbeddingIntegrityAdapter(),
       loadVectorExtension: vi.fn().mockResolvedValue(true),
       createVectorIndex: vi.fn().mockResolvedValue(true),
     }));

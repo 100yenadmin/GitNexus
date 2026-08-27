@@ -6,6 +6,7 @@
  * waiter queue timeout, idle eviction guards, stdout silencing race
  */
 import { describe, it, expect, afterEach } from 'vitest';
+import { promises as fs } from 'node:fs';
 import {
   initLbug,
   executeQuery,
@@ -91,6 +92,21 @@ withTestLbugDB(
         await closeLbug();
         expect(isLbugReady('repo1')).toBe(false);
         expect(isLbugReady('repo2')).toBe(false);
+      });
+
+      it('retires every idle alias before reopening a replaced database path', async () => {
+        await initLbug('repo1', handle.dbPath);
+        await initLbug('repo2', handle.dbPath);
+        const before = await fs.stat(handle.dbPath);
+        const changed = new Date(before.mtimeMs + 2_000);
+        await fs.utimes(handle.dbPath, changed, changed);
+
+        await expect(initLbug('repo1', handle.dbPath)).resolves.toBe(true);
+        expect(isLbugReady('repo1')).toBe(true);
+        expect(isLbugReady('repo2')).toBe(false);
+        await expect(
+          executeQuery('repo1', 'MATCH (n:Function) RETURN n.name AS name'),
+        ).resolves.toEqual(expect.arrayContaining([expect.objectContaining({ name: 'main' })]));
       });
     });
 

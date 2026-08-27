@@ -166,6 +166,7 @@ export const zhCN = {
   'help.option.analyze.force': '即使已是最新也强制完整重建索引',
   'help.option.analyze.incrementalOnly': '拒绝任何需要完整重建的恢复、迁移或规模升级路径',
   'help.option.analyze.repairFts': '修复/重建搜索 FTS 索引，不执行完整重新分析',
+  'help.option.analyze.repairVector': '修复/重建 HNSW，不重新生成嵌入行',
   'help.option.analyze.embeddings':
     '启用语义搜索的嵌入生成（默认关闭）。可选 [limit] 覆盖 50,000 节点安全上限；传 0 可完全禁用上限。',
   'help.option.analyze.dropEmbeddings':

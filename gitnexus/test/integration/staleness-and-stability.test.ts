@@ -211,6 +211,7 @@ withTestLbugDB(
           vi.useRealTimers();
         }
         expect(vi.mocked(initLbug).mock.calls.length).toBeGreaterThan(initCallsBefore);
+        expect(vi.mocked(initLbug).mock.calls.at(-1)?.[2]).toEqual({ forceReopen: true });
         expect(vi.mocked(closeLbug)).toHaveBeenCalled();
       });
 

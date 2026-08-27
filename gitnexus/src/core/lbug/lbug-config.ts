@@ -299,6 +299,62 @@ const resolveCheckpointThreshold = (): number => {
   return DEFAULT_WAL_CHECKPOINT_THRESHOLD;
 };
 
+const DEFAULT_BUFFER_POOL_CAP = 2 * 1024 * 1024 * 1024;
+const BUFFER_POOL_FLOOR = 64 * 1024 * 1024;
+// Real staged resumes build graph/FTS state before restoring vectors. A 128 MiB
+// hint can exhaust LadybugDB even for a ~21k-element repository, so keep the
+// analyze floor at the smallest value proven by the copied ClawSweeper corpus.
+const ANALYZE_BUFFER_POOL_FLOOR = 512 * 1024 * 1024;
+
+const parseBufferPoolSize = (raw: string | undefined): number | undefined => {
+  if (raw === undefined) return undefined;
+  const normalized = raw.trim();
+  if (normalized.length === 0) return undefined;
+  const parsed = Number(normalized);
+  if (!Number.isFinite(parsed) || parsed < 0) return undefined;
+  return Math.floor(parsed);
+};
+
+const defaultBufferPoolSize = (): number =>
+  Math.min(DEFAULT_BUFFER_POOL_CAP, Math.max(BUFFER_POOL_FLOOR, Math.floor(os.totalmem() * 0.8)));
+
+const clampBufferPool = (bytes: number): number =>
+  Math.min(defaultBufferPoolSize(), Math.max(ANALYZE_BUFFER_POOL_FLOOR, Math.floor(bytes)));
+
+const POOL_BYTES_PER_ELEMENT = 4 * 1024;
+
+export const estimateBufferPool = (graphElementCount: number): number =>
+  clampBufferPool(graphElementCount * POOL_BYTES_PER_ELEMENT);
+
+let bufferPoolSizeHint: number | undefined;
+
+export const setBufferPoolSizeHint = (bytes: number | undefined): void => {
+  bufferPoolSizeHint = bytes;
+};
+
+/**
+ * Bound LadybugDB's page cache on every open. The native zero value allows
+ * growth toward 80% of host RAM; zero remains an explicit operator escape
+ * hatch, while analyze may supply a smaller graph-derived hint.
+ */
+const resolveBufferManagerSize = (): number => {
+  const raw = process.env.GITNEXUS_LBUG_BUFFER_POOL_SIZE;
+  if (raw === undefined) {
+    return bufferPoolSizeHint !== undefined
+      ? clampBufferPool(bufferPoolSizeHint)
+      : defaultBufferPoolSize();
+  }
+  const parsed = parseBufferPoolSize(raw);
+  if (parsed !== undefined) return parsed;
+  if (raw.trim().length > 0) {
+    logger.warn(
+      { rawValue: raw, fallback: defaultBufferPoolSize() },
+      `Ignoring invalid GITNEXUS_LBUG_BUFFER_POOL_SIZE=${raw}; expected integer >= 0 (bytes; 0 restores the native 80%-of-RAM default); falling back to min(2 GiB, 80% of RAM).`,
+    );
+  }
+  return defaultBufferPoolSize();
+};
+
 /** Matches WAL corruption errors from the LadybugDB engine. */
 const WAL_CORRUPTION_RE = /corrupt(ed)?\s+wal|invalid\s+wal\s+record|wal.*corrupt|checksum.*wal/i;
 
@@ -540,7 +596,7 @@ export function createLbugDatabase(
   // .d.ts declares fewer args than the native constructor accepts.
   return new (lbugModule.Database as any)(
     databasePath,
-    0, // bufferManagerSize
+    resolveBufferManagerSize(),
     false, // enableCompression (pinned for v0.16.0)
     options.readOnly ?? false,
     LBUG_MAX_DB_SIZE,

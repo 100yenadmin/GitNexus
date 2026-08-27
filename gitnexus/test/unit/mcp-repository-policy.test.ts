@@ -1,6 +1,10 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import fsSync from 'node:fs';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import type { LocalBackend, RepoListing } from '../../src/mcp/local/local-backend.js';
 import {
   createMcpRepositoryPolicy,
@@ -170,27 +174,22 @@ describe('MCP repository policy', () => {
     expect(message).not.toContain('Beta');
   });
 
-  it('keeps MCP discovery agent-visible while a failed policy remains fail-closed', async () => {
+  it('keeps valid repositories available while rejected entries remain agent-visible', async () => {
     const backend = createBackend();
-    let configurationError: McpRepositoryPolicyConfigurationError | undefined;
-    try {
-      await createMcpRepositoryPolicy(backend, {
-        GITNEXUS_MCP_ALLOWED_REPOS: 'Alpha,Duplicate',
-      });
-    } catch (error) {
-      if (error instanceof McpRepositoryPolicyConfigurationError) configurationError = error;
-    }
-
-    expect(configurationError).toMatchObject({
-      key: 'GITNEXUS_MCP_ALLOWED_REPOS',
-      reason: 'ambiguous',
-      entryPosition: 2,
+    const policy = await createMcpRepositoryPolicy(backend, {
+      GITNEXUS_MCP_ALLOWED_REPOS: 'Alpha,Duplicate',
     });
+    expect(policy.rejectedEntries).toEqual([
+      {
+        environmentKey: 'GITNEXUS_MCP_ALLOWED_REPOS',
+        failureClass: 'ambiguous',
+        entryPosition: 2,
+      },
+    ]);
     vi.clearAllMocks();
 
-    const policy = McpRepositoryPolicy.blocked(configurationError!);
     const server = createMCPServer(backend, { repositoryPolicy: policy });
-    const client = new Client({ name: 'blocked-policy-client', version: '0.0.0' });
+    const client = new Client({ name: 'degraded-policy-client', version: '0.0.0' });
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
 
     try {
@@ -200,31 +199,118 @@ describe('MCP repository policy', () => {
       expect(tools.tools.length).toBeGreaterThan(0);
       for (const tool of tools.tools) {
         expect(tool.description).toMatch(
-          /BLOCKED.*ambiguous.*GITNEXUS_MCP_ALLOWED_REPOS entry 2/is,
+          /DEGRADED.*rejected 1 configured allowlist entry.*valid entries remain available/is,
         );
         expect(tool.description).not.toContain('/repos/');
         expect(tool.description).not.toContain('Duplicate');
       }
 
       const call = await client.callTool({ name: 'list_repos', arguments: {} });
-      expect(call.isError).toBe(true);
+      expect(call.isError).not.toBe(true);
       const callText = (call.content[0] as { text: string }).text;
-      expect(callText).toMatch(/ambiguous.*GITNEXUS_MCP_ALLOWED_REPOS entry 2/is);
-      expect(callText).not.toContain('/repos/');
+      expect(callText).toContain('Alpha');
+      expect(callText).toMatch(/repositoryPolicy.*degraded/is);
+      expect(callText).toMatch(/GITNEXUS_MCP_ALLOWED_REPOS.*entryPosition.*2.*ambiguous/is);
       expect(callText).not.toContain('Duplicate');
 
-      const resource = await client.readResource({ uri: 'gitnexus://repos' });
-      const resourceText = (resource.contents[0] as { text: string }).text;
-      expect(resourceText).toMatch(/ambiguous.*GITNEXUS_MCP_ALLOWED_REPOS entry 2/is);
-      expect(resourceText).not.toContain('/repos/');
-      expect(resourceText).not.toContain('Duplicate');
+      const query = await client.callTool({
+        name: 'query',
+        arguments: { search_query: 'auth', repo: 'Alpha' },
+      });
+      expect(query.isError).not.toBe(true);
 
-      expect(backend.listRepos).not.toHaveBeenCalled();
-      expect(backend.callTool).not.toHaveBeenCalled();
+      const rejected = await client.callTool({
+        name: 'query',
+        arguments: { search_query: 'auth', repo: 'Duplicate' },
+      });
+      expect(rejected.isError).toBe(true);
+      expect((rejected.content[0] as { text: string }).text).toMatch(/not available/i);
+
+      expect(backend.listRepos).toHaveBeenCalled();
+      expect(backend.callTool).toHaveBeenCalled();
       expect(backend.resolveRepo).not.toHaveBeenCalled();
     } finally {
       await client.close();
       await server.close();
+    }
+  });
+
+  it('keeps stdio blocked when a configured allowlist resolves no repositories', async () => {
+    const backend = createBackend();
+    let configurationError: McpRepositoryPolicyConfigurationError | undefined;
+    try {
+      await createMcpRepositoryPolicy(backend, {
+        GITNEXUS_MCP_ALLOWED_REPOS: 'Missing,Duplicate',
+      });
+    } catch (error) {
+      if (error instanceof McpRepositoryPolicyConfigurationError) configurationError = error;
+    }
+
+    expect(configurationError).toMatchObject({
+      key: 'GITNEXUS_MCP_ALLOWED_REPOS',
+      reason: 'invalid',
+      entryPosition: 1,
+    });
+    vi.clearAllMocks();
+    if (!configurationError) throw new Error('Expected blocked policy configuration error');
+
+    const policy = McpRepositoryPolicy.blocked(configurationError);
+    const server = createMCPServer(backend, { repositoryPolicy: policy });
+    const client = new Client({ name: 'blocked-policy-client', version: '0.0.0' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+
+    try {
+      await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+      const call = await client.callTool({ name: 'list_repos', arguments: {} });
+      expect(call.isError).toBe(true);
+      expect((call.content[0] as { text: string }).text).toMatch(
+        /invalid.*GITNEXUS_MCP_ALLOWED_REPOS entry 1/is,
+      );
+      expect(backend.listRepos).not.toHaveBeenCalled();
+      expect(backend.callTool).not.toHaveBeenCalled();
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
+  it('accepts an absolute-path alias only when it resolves to the registered filesystem object', async () => {
+    const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-policy-identity-'));
+    const canonical = path.join(tempRoot, 'evaos-hive');
+    const alternateCase = path.join(tempRoot, 'evaOS-Hive');
+    await fs.mkdir(canonical);
+    try {
+      await fs.stat(alternateCase);
+    } catch {
+      await fs.symlink(canonical, alternateCase, 'dir');
+    }
+
+    try {
+      const backend = createBackend([
+        {
+          name: 'evaOS-Hive',
+          path: canonical,
+          indexedAt: '2026-07-30',
+          lastCommit: 'e'.repeat(40),
+        },
+      ]);
+      const policy = await createMcpRepositoryPolicy(backend, {
+        GITNEXUS_MCP_ALLOWED_REPOS: alternateCase,
+      });
+      expect(policy.rejectedEntries).toEqual([]);
+      const syncRealpath = vi.spyOn(fsSync, 'realpathSync');
+      const syncStat = vi.spyOn(fsSync, 'statSync');
+      await policy
+        .scopeBackend(backend)
+        .callTool('query', { search_query: 'agents', repo: alternateCase });
+      expect(backend.callTool).toHaveBeenCalledWith('query', {
+        search_query: 'agents',
+        repo: canonical,
+      });
+      expect(syncRealpath).not.toHaveBeenCalled();
+      expect(syncStat).not.toHaveBeenCalled();
+    } finally {
+      await fs.rm(tempRoot, { recursive: true, force: true });
     }
   });
 
@@ -298,18 +384,14 @@ describe('MCP repository policy', () => {
   });
 
   it.each([
-    ['Alpha,,Beta', 2],
-    ['Alpha,,Missing', 2],
-    ['Alpha,Beta,Missing', 3],
-  ])('preserves raw allowlist coordinates for %s', async (configured, entryPosition) => {
-    await expect(
-      createMcpRepositoryPolicy(createBackend(), {
-        GITNEXUS_MCP_ALLOWED_REPOS: configured,
-      }),
-    ).rejects.toMatchObject({
-      key: 'GITNEXUS_MCP_ALLOWED_REPOS',
-      entryPosition,
+    ['Alpha,,Beta', [2]],
+    ['Alpha,,Missing', [2, 3]],
+    ['Alpha,Beta,Missing', [3]],
+  ])('preserves rejected allowlist coordinates for %s', async (configured, entryPositions) => {
+    const policy = await createMcpRepositoryPolicy(createBackend(), {
+      GITNEXUS_MCP_ALLOWED_REPOS: configured,
     });
+    expect(policy.rejectedEntries.map((entry) => entry.entryPosition)).toEqual(entryPositions);
   });
 
   it('is transparent when no repository policy is configured', async () => {

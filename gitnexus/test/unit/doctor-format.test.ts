@@ -167,6 +167,13 @@ describe('doctor page-size lines (#1231, #2424 review)', () => {
 });
 
 describe('doctor current-repository VECTOR status', () => {
+  it('reports zero embeddings as not-indexed rather than broken VECTOR', () => {
+    expect(repoVectorDoctorStatus({ stats: { embeddings: 0 } } as RepoMeta)).toEqual({
+      status: 'not-indexed',
+      detail: null,
+    });
+  });
+
   it('distinguishes a persisted HNSW index from platform support', () => {
     expect(
       repoVectorDoctorStatus({

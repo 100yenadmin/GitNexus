@@ -175,6 +175,7 @@ export const en = {
   'help.option.analyze.incrementalOnly':
     'Refuse recovery, migration, or scale escalation that would require a full rebuild',
   'help.option.analyze.repairFts': 'Repair/rebuild search FTS indexes without full re-analysis',
+  'help.option.analyze.repairVector': 'Repair/rebuild HNSW without regenerating embedding rows',
   'help.option.analyze.embeddings':
     'Enable embedding generation for semantic search (off by default). Local models default to a 50,000-node safety cap; remote HTTP providers default uncapped. Optional [limit] sets an explicit cap; pass 0 to disable it.',
   'help.option.analyze.dropEmbeddings':

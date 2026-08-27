@@ -33,24 +33,30 @@ describe('doctor --mcp-config preflight (#127)', () => {
   });
 
   it.each([
-    [
-      { GITNEXUS_MCP_ALLOWED_REPOS: 'Alpha,MissingConfiguredSecret' },
-      'GITNEXUS_MCP_ALLOWED_REPOS',
-      2,
-      'invalid',
-    ],
-    [
-      { GITNEXUS_MCP_ALLOWED_REPOS: 'Alpha,,MissingConfiguredSecret' },
-      'GITNEXUS_MCP_ALLOWED_REPOS',
-      2,
-      'invalid',
-    ],
-    [
-      { GITNEXUS_MCP_ALLOWED_REPOS: 'Alpha,Alpha,MissingConfiguredSecret' },
-      'GITNEXUS_MCP_ALLOWED_REPOS',
-      3,
-      'invalid',
-    ],
+    [{ GITNEXUS_MCP_ALLOWED_REPOS: 'Alpha,MissingConfiguredSecret' }, [2]],
+    [{ GITNEXUS_MCP_ALLOWED_REPOS: 'Alpha,,MissingConfiguredSecret' }, [2, 3]],
+    [{ GITNEXUS_MCP_ALLOWED_REPOS: 'Alpha,Alpha,MissingConfiguredSecret' }, [3]],
+  ])('reports sanitized degraded coordinates for %#', async (env, entryPositions) => {
+    const report = await buildMcpConfigDoctorReport(env, REGISTRY);
+    expect(report).toEqual({
+      mode: 'mcp-config',
+      readOnly: true,
+      valid: true,
+      degraded: true,
+      rejectedEntries: entryPositions.map((entryPosition) => ({
+        environmentKey: 'GITNEXUS_MCP_ALLOWED_REPOS',
+        entryPosition,
+        failureClass: 'invalid',
+      })),
+    });
+    const serialized = JSON.stringify(report);
+    expect(serialized).not.toContain('/secret/registry/');
+    expect(serialized).not.toContain('MissingConfiguredSecret');
+    expect(serialized).not.toContain('Alpha');
+    expect(serialized).not.toContain('Duplicate');
+  });
+
+  it.each([
     [{ GITNEXUS_MCP_ALLOWED_REPOS: 'Duplicate' }, 'GITNEXUS_MCP_ALLOWED_REPOS', 1, 'ambiguous'],
     [
       { GITNEXUS_MCP_DEFAULT_REPO: 'MissingConfiguredSecret' },
@@ -74,7 +80,7 @@ describe('doctor --mcp-config preflight (#127)', () => {
       'invalid',
     ],
   ])(
-    'returns only sanitized operator coordinates for %#',
+    'returns only sanitized blocking coordinates for %#',
     async (env, environmentKey, entryPosition, failureClass) => {
       const report = await buildMcpConfigDoctorReport(env, REGISTRY);
       expect(report).toEqual({

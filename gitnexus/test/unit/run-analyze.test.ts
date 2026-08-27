@@ -17,8 +17,16 @@ import {
   type RepoMeta,
 } from '../../src/storage/repo-manager.js';
 import { taintModelVersion } from '../../src/core/ingestion/taint/typescript-model.js';
+import { httpEmbeddingProvider } from '../../src/core/embeddings/embedding-identity.js';
 import { createTempDir } from '../helpers/test-db.js';
-import { readEmbeddingNodeIds } from '../helpers/embedding-seed.js';
+import { readEmbeddingNodeIds, seedEmbeddingsForFiles } from '../helpers/embedding-seed.js';
+
+async function createReadableEmptyIndex(repoPath: string, branch?: string): Promise<void> {
+  const { lbugPath } = getStoragePaths(repoPath, branch);
+  const { initLbug, closeLbug } = await import('../../src/core/lbug/lbug-adapter.js');
+  await initLbug(lbugPath);
+  await closeLbug();
+}
 
 describe('run-analyze module', () => {
   it('exports runFullAnalysis as a function', async () => {
@@ -26,10 +34,291 @@ describe('run-analyze module', () => {
     expect(typeof mod.runFullAnalysis).toBe('function');
   });
 
+  it('rejects parent-held ownership without both frozen worker paths', async () => {
+    const { runFullAnalysis } = await import('../../src/core/run-analyze.js');
+    await expect(
+      runFullAnalysis('/repo', {}, {}, { parentAnalyzeOwnershipHeld: true }),
+    ).rejects.toThrow(
+      'Parent-held analyze ownership requires frozen analyzeStoragePath and registryPath.',
+    );
+  });
+
+  it.each([{ analyzeStoragePath: '/tmp/frozen-storage' }, { registryPath: '/repo' }])(
+    'rejects internal path overrides without parent-held ownership',
+    async (options) => {
+      const { runFullAnalysis } = await import('../../src/core/run-analyze.js');
+      await expect(runFullAnalysis('/repo', options, {})).rejects.toThrow(
+        'Frozen analyzeStoragePath and registryPath overrides require parent-held analyze ownership.',
+      );
+    },
+  );
+
   it('exports PHASE_LABELS', async () => {
     const mod = await import('../../src/core/run-analyze.js');
     expect(mod.PHASE_LABELS).toBeDefined();
     expect(mod.PHASE_LABELS.parsing).toBe('Parsing code');
+  });
+
+  it('recreates an authorized staged embedding table even when its snapshot has zero rows', async () => {
+    const mod = await import('../../src/core/run-analyze.js');
+    expect(
+      mod.shouldRecreateStagedEmbeddingTableForResume(true, {
+        count: 0,
+        dimensions: 0,
+        identitySha256: '0'.repeat(64),
+      }),
+    ).toBe(true);
+  });
+
+  it('inspects a completed staged checkpoint through the selected database path', async () => {
+    const source = await fs.readFile(
+      path.join(__dirname, '..', '..', 'src', 'core', 'run-analyze.ts'),
+      'utf-8',
+    );
+    expect(source).toMatch(
+      /const completedIntegrity = await withLbugDb\(\s*lbugPath,\s*\(\) =>\s*inspectEmbeddingIntegrity\(\s*undefined,\s*checkpointToVerify\.physicalRowsSha256 !== undefined/,
+    );
+  });
+
+  it('uses the non-recovering opener for provider-less legacy checkpoint proof', async () => {
+    const source = await fs.readFile(
+      path.join(__dirname, '..', '..', 'src', 'core', 'run-analyze.ts'),
+      'utf-8',
+    );
+    expect(source).toMatch(
+      /const integrity = await withLbugReadOnlyNonRecovering\(\s*lbugPath,\s*inspectEmbeddingIntegrity/,
+    );
+  });
+
+  it('stamps the provider on new checkpoints and rejects unknown legacy resumes', async () => {
+    const source = await fs.readFile(
+      path.join(__dirname, '..', '..', 'src', 'core', 'run-analyze.ts'),
+      'utf-8',
+    );
+    expect(source).toMatch(/checkpoint\.provider === undefined/);
+    expect(source).toMatch(/provider: embeddingIdentity\.provider/);
+    expect(source).toMatch(/unknown-provider/);
+    expect(source).not.toMatch(/--drop-embeddings --embeddings(?! 0)/);
+    expect(source).not.toMatch(
+      /Restore the matching embedding configuration[^\n]*--drop-embeddings(?! --embeddings 0)/,
+    );
+    expect(source).not.toMatch(/[Rr]e-run (?:analyze |with )--embeddings(?! 0)/);
+    expect(source.match(/--drop-embeddings --embeddings 0/g)).toHaveLength(5);
+    expect(source.match(/re-run analyze --embeddings 0/g)).toHaveLength(2);
+    expect(source.match(/Re-run with --embeddings 0/g)).toHaveLength(1);
+  });
+
+  it.each([' http://test:8080/v1', 'http://test:8080/v1 ', '\thttp://test:8080/v1\n'])(
+    'rejects endpoint surrounding whitespace before hashing (%j)',
+    (endpoint) => {
+      expect(() => httpEmbeddingProvider(endpoint)).toThrow(
+        'HTTP embedding endpoint must not have surrounding whitespace.',
+      );
+    },
+  );
+
+  it('gives provider-less durable-proof mismatches actionable recovery guidance', async () => {
+    const tmpRepo = await createTempDir('gitnexus-run-analyze-checkpoint-guidance-');
+    try {
+      execSync('git init', { cwd: tmpRepo.dbPath, stdio: 'pipe' });
+      execSync('git -c user.name=test -c user.email=test@test commit --allow-empty -m init', {
+        cwd: tmpRepo.dbPath,
+        stdio: 'pipe',
+      });
+      await createReadableEmptyIndex(tmpRepo.dbPath);
+      const { storagePath } = getStoragePaths(tmpRepo.dbPath);
+      const checkpoint = {
+        at: new Date().toISOString(),
+        nodesProcessed: 0,
+        totalNodes: 0,
+        chunksProcessed: 0,
+        model: 'legacy-model',
+        dimensions: 384,
+        physicalRows: 3,
+        validRows: 3,
+        recoverableIdentitySha256: 'a'.repeat(64),
+        physicalRowsSha256: 'a'.repeat(64),
+      };
+      await saveMeta(storagePath, {
+        repoPath: tmpRepo.dbPath,
+        lastCommit: execSync('git rev-parse HEAD', {
+          cwd: tmpRepo.dbPath,
+          encoding: 'utf8',
+        }).trim(),
+        indexedAt: checkpoint.at,
+        schemaVersion: INCREMENTAL_SCHEMA_VERSION,
+        stats: { embeddings: 3 },
+        embeddingCheckpoint: checkpoint,
+      });
+
+      const { runFullAnalysis } = await import('../../src/core/run-analyze.js');
+      await expect(runFullAnalysis(tmpRepo.dbPath, {}, { onProgress: () => {} })).rejects.toThrow(
+        /gitnexus analyze --force --drop-embeddings --embeddings 0/,
+      );
+      expect((await loadMeta(storagePath))?.embeddingCheckpoint).toMatchObject(checkpoint);
+    } finally {
+      await tmpRepo.cleanup();
+    }
+  });
+
+  it('refuses a provider-less zero-node checkpoint that records completed chunks', async () => {
+    const tmpRepo = await createTempDir('gitnexus-run-analyze-checkpoint-chunks-');
+    try {
+      execSync('git init', { cwd: tmpRepo.dbPath, stdio: 'pipe' });
+      execSync('git -c user.name=test -c user.email=test@test commit --allow-empty -m init', {
+        cwd: tmpRepo.dbPath,
+        stdio: 'pipe',
+      });
+      await createReadableEmptyIndex(tmpRepo.dbPath);
+      const { storagePath } = getStoragePaths(tmpRepo.dbPath);
+      const checkpoint = {
+        at: new Date().toISOString(),
+        nodesProcessed: 0,
+        totalNodes: 0,
+        chunksProcessed: 1,
+        model: 'legacy-model',
+        dimensions: 384,
+      };
+      await saveMeta(storagePath, {
+        repoPath: tmpRepo.dbPath,
+        lastCommit: execSync('git rev-parse HEAD', {
+          cwd: tmpRepo.dbPath,
+          encoding: 'utf8',
+        }).trim(),
+        indexedAt: checkpoint.at,
+        schemaVersion: INCREMENTAL_SCHEMA_VERSION,
+        stats: { embeddings: 0 },
+        embeddingCheckpoint: checkpoint,
+      });
+
+      const { runFullAnalysis } = await import('../../src/core/run-analyze.js');
+      await expect(runFullAnalysis(tmpRepo.dbPath, {}, { onProgress: () => {} })).rejects.toThrow(
+        /unknown-provider/i,
+      );
+      expect((await loadMeta(storagePath))?.embeddingCheckpoint).toMatchObject({
+        chunksProcessed: 1,
+      });
+    } finally {
+      await tmpRepo.cleanup();
+    }
+  });
+
+  it('keeps a provider-less empty checkpoint byte-identical in incremental-only mode', async () => {
+    const tmpRepo = await createTempDir('gitnexus-run-analyze-checkpoint-incremental-only-');
+    try {
+      execSync('git init', { cwd: tmpRepo.dbPath, stdio: 'pipe' });
+      await fs.writeFile(path.join(tmpRepo.dbPath, 'tracked.ts'), 'export const tracked = true;\n');
+      execSync('git add tracked.ts', { cwd: tmpRepo.dbPath, stdio: 'pipe' });
+      execSync('git -c user.name=test -c user.email=test@test commit --allow-empty -m init', {
+        cwd: tmpRepo.dbPath,
+        stdio: 'pipe',
+      });
+
+      const { runFullAnalysis } = await import('../../src/core/run-analyze.js');
+      await runFullAnalysis(
+        tmpRepo.dbPath,
+        { skipAgentsMd: true, skipSkills: true },
+        { onProgress: () => {} },
+      );
+
+      const { storagePath } = getStoragePaths(tmpRepo.dbPath);
+      const completed = await loadMeta(storagePath);
+      if (!completed) throw new Error('expected completed metadata');
+      await saveMeta(storagePath, {
+        ...completed,
+        stats: { ...completed.stats, embeddings: 0 },
+        embeddingCheckpoint: {
+          at: new Date().toISOString(),
+          nodesProcessed: 0,
+          totalNodes: 0,
+          chunksProcessed: 0,
+          model: 'legacy-model',
+          dimensions: 384,
+        },
+      });
+      const metaPath = path.join(storagePath, 'gitnexus.json');
+      const before = await fs.readFile(metaPath);
+
+      await expect(
+        runFullAnalysis(tmpRepo.dbPath, { incrementalOnly: true }, { onProgress: () => {} }),
+      ).rejects.toThrow(/provider-less empty checkpoint requires a metadata restamp/i);
+      expect(await fs.readFile(metaPath)).toEqual(before);
+    } finally {
+      await tmpRepo.cleanup();
+    }
+  });
+
+  it('refuses completed VECTOR repair checkpoints with mismatched or unknown providers', async () => {
+    const tmpRepo = await createTempDir('gitnexus-run-analyze-vector-repair-identity-');
+    const saved = {
+      url: process.env.GITNEXUS_EMBEDDING_URL,
+      model: process.env.GITNEXUS_EMBEDDING_MODEL,
+      dims: process.env.GITNEXUS_EMBEDDING_DIMS,
+    };
+    try {
+      process.env.GITNEXUS_EMBEDDING_URL = 'http://test:8080/v1';
+      process.env.GITNEXUS_EMBEDDING_MODEL = 'test-model';
+      process.env.GITNEXUS_EMBEDDING_DIMS = '384';
+      const { storagePath, lbugPath } = getStoragePaths(tmpRepo.dbPath);
+      await fs.mkdir(storagePath, { recursive: true });
+      await fs.writeFile(lbugPath, '');
+      const otherProvider = httpEmbeddingProvider('http://other:8080/v1');
+      const checkpoint = {
+        at: new Date().toISOString(),
+        nodesProcessed: 1,
+        totalNodes: 1,
+        chunksProcessed: 1,
+        provider: otherProvider,
+        model: 'test-model',
+        dimensions: 384,
+      };
+      await saveMeta(storagePath, {
+        repoPath: tmpRepo.dbPath,
+        lastCommit: 'test-commit',
+        indexedAt: new Date().toISOString(),
+        embeddingCheckpoint: checkpoint,
+      });
+
+      const { assertVectorRepairPreflight } = await import('../../src/core/run-analyze.js');
+      await expect(assertVectorRepairPreflight(tmpRepo.dbPath)).rejects.toThrow(
+        new RegExp(
+          `completed embedding checkpoint records ${otherProvider} /[\\s\\S]*--drop-embeddings --embeddings 0`,
+        ),
+      );
+
+      await saveMeta(storagePath, {
+        repoPath: tmpRepo.dbPath,
+        lastCommit: 'test-commit',
+        indexedAt: new Date().toISOString(),
+        embeddingCheckpoint: { ...checkpoint, provider: undefined },
+      });
+      await expect(assertVectorRepairPreflight(tmpRepo.dbPath)).rejects.toThrow(
+        /unknown-provider[\s\S]*--drop-embeddings --embeddings 0/,
+      );
+      expect((await loadMeta(storagePath))?.embeddingCheckpoint?.provider).toBeUndefined();
+
+      await saveMeta(storagePath, {
+        repoPath: tmpRepo.dbPath,
+        lastCommit: 'test-commit',
+        indexedAt: new Date().toISOString(),
+        embeddingCheckpoint: {
+          ...checkpoint,
+          provider: httpEmbeddingProvider('http://test:8080/v1'),
+        },
+      });
+      await expect(assertVectorRepairPreflight(tmpRepo.dbPath)).resolves.toMatchObject({
+        embeddingCheckpoint: { provider: httpEmbeddingProvider('http://test:8080/v1') },
+      });
+    } finally {
+      const restore = (key: string, value: string | undefined) => {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      };
+      restore('GITNEXUS_EMBEDDING_URL', saved.url);
+      restore('GITNEXUS_EMBEDDING_MODEL', saved.model);
+      restore('GITNEXUS_EMBEDDING_DIMS', saved.dims);
+      await tmpRepo.cleanup();
+    }
   });
 
   it('creates .gitnexus/.gitignore on the already-up-to-date fast path (#1233)', async () => {
@@ -55,6 +344,7 @@ describe('run-analyze module', () => {
         schemaVersion: INCREMENTAL_SCHEMA_VERSION,
       };
       await saveMeta(storagePath, meta);
+      await createReadableEmptyIndex(tmpRepo.dbPath);
 
       const { runFullAnalysis } = await import('../../src/core/run-analyze.js');
       const result = await runFullAnalysis(
@@ -68,9 +358,86 @@ describe('run-analyze module', () => {
       expect(result.alreadyUpToDate).toBe(true);
       // A flat/primary index reports isPrimaryBranch true (#2106 R2).
       expect(result.isPrimaryBranch).toBe(true);
+      const { isLbugReady } = await import('../../src/core/lbug/lbug-adapter.js');
+      expect(isLbugReady()).toBe(false);
       await expect(
         fs.readFile(path.join(tmpRepo.dbPath, '.gitnexus', '.gitignore'), 'utf-8'),
       ).resolves.toBe('*\n');
+    } finally {
+      await tmpRepo.cleanup();
+    }
+  });
+
+  it('restamps a verified clean embedding count on the already-up-to-date fast path', async () => {
+    const tmpRepo = await createTempDir('gitnexus-run-analyze-fast-path-count-');
+    try {
+      await fs.writeFile(
+        path.join(tmpRepo.dbPath, 'index.ts'),
+        'export function fastPathCount() { return "verified"; }\n',
+      );
+      execSync('git init', { cwd: tmpRepo.dbPath, stdio: 'pipe' });
+      execSync('git add index.ts', { cwd: tmpRepo.dbPath, stdio: 'pipe' });
+      execSync('git -c user.name=test -c user.email=test@test commit -m init', {
+        cwd: tmpRepo.dbPath,
+        stdio: 'pipe',
+      });
+
+      const { runFullAnalysis } = await import('../../src/core/run-analyze.js');
+      await runFullAnalysis(
+        tmpRepo.dbPath,
+        { skipAgentsMd: true, skipSkills: true },
+        { onProgress: () => {} },
+      );
+      const seeded = await seedEmbeddingsForFiles(tmpRepo.dbPath, ['index.ts'], 1);
+      expect(seeded.get('index.ts')).toHaveLength(1);
+
+      const { storagePath } = getStoragePaths(tmpRepo.dbPath);
+      const completed = await loadMeta(storagePath);
+      if (!completed) throw new Error('expected completed metadata');
+      await saveMeta(storagePath, {
+        ...completed,
+        stats: { ...completed.stats, embeddings: 0 },
+      });
+
+      await expect(
+        runFullAnalysis(tmpRepo.dbPath, { incrementalOnly: true }, { onProgress: () => {} }),
+      ).rejects.toThrow(/verified embedding count requires a metadata restamp/i);
+      expect((await loadMeta(storagePath))?.stats?.embeddings).toBe(0);
+      const { isLbugReady } = await import('../../src/core/lbug/lbug-adapter.js');
+      expect(isLbugReady()).toBe(false);
+
+      const result = await runFullAnalysis(tmpRepo.dbPath, {}, { onProgress: () => {} });
+
+      expect(result.alreadyUpToDate).toBe(true);
+      expect(result.stats.embeddings).toBe(1);
+      expect((await loadMeta(storagePath))?.stats?.embeddings).toBe(1);
+
+      const restamped = await loadMeta(storagePath);
+      if (!restamped) throw new Error('expected restamped metadata');
+      await saveMeta(storagePath, {
+        ...restamped,
+        stats: { ...restamped.stats, embeddings: 2 },
+      });
+      await expect(
+        runFullAnalysis(tmpRepo.dbPath, { incrementalOnly: true }, { onProgress: () => {} }),
+      ).rejects.toThrow(/verified embedding count requires a metadata restamp/i);
+      expect((await loadMeta(storagePath))?.stats?.embeddings).toBe(2);
+
+      const stalePositive = await runFullAnalysis(tmpRepo.dbPath, {}, { onProgress: () => {} });
+      expect(stalePositive.alreadyUpToDate).toBe(true);
+      expect(stalePositive.stats.embeddings).toBe(1);
+      expect((await loadMeta(storagePath))?.stats?.embeddings).toBe(1);
+
+      const { lbugPath } = getStoragePaths(tmpRepo.dbPath);
+      const { initLbug, executeQuery, closeLbug } =
+        await import('../../src/core/lbug/lbug-adapter.js');
+      await initLbug(lbugPath);
+      await executeQuery('MATCH (e:CodeEmbedding) DELETE e');
+      await closeLbug();
+      await expect(runFullAnalysis(tmpRepo.dbPath, {}, { onProgress: () => {} })).rejects.toThrow(
+        /lost all recorded embeddings/i,
+      );
+      expect((await loadMeta(storagePath))?.stats?.embeddings).toBe(1);
     } finally {
       await tmpRepo.cleanup();
     }
@@ -126,6 +493,9 @@ describe('run-analyze module', () => {
 
       const interrupted = await loadMeta(storagePath);
       expect(interrupted?.embeddingCheckpoint).toBeDefined();
+      expect(interrupted?.embeddingCheckpoint?.provider).toBe(
+        httpEmbeddingProvider('http://test:8080/v1'),
+      );
       expect(interrupted?.schemaVersion).toBe(INCREMENTAL_SCHEMA_VERSION);
     } finally {
       vi.unstubAllGlobals();
@@ -193,6 +563,7 @@ describe('run-analyze module', () => {
       const completed = await loadMeta(storagePath);
       expect(completed).not.toBeNull();
       if (!completed) throw new Error('expected completed metadata');
+      const currentProvider = httpEmbeddingProvider('http://test:8080/v1');
       await saveMeta(storagePath, {
         ...completed,
         embeddingCheckpoint: {
@@ -205,6 +576,28 @@ describe('run-analyze module', () => {
         },
       } as RepoMeta);
       fetchMock.mockClear();
+      await expect(
+        runFullAnalysis(
+          tmpRepo.dbPath,
+          { skipAgentsMd: true, skipSkills: true },
+          { onProgress: () => {} },
+        ),
+      ).rejects.toThrow(/unknown-provider/);
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect((await loadMeta(storagePath))?.embeddingCheckpoint?.provider).toBeUndefined();
+
+      await saveMeta(storagePath, {
+        ...completed,
+        embeddingCheckpoint: {
+          at: new Date().toISOString(),
+          nodesProcessed: 1,
+          totalNodes: 1,
+          chunksProcessed: 1,
+          provider: currentProvider,
+          model: 'test-model',
+          dimensions: 384,
+        },
+      } as RepoMeta);
       const logs: string[] = [];
 
       const resumed = await runFullAnalysis(
@@ -234,6 +627,7 @@ describe('run-analyze module', () => {
           nodesProcessed: 0,
           totalNodes: 1,
           chunksProcessed: 0,
+          provider: currentProvider,
           model: 'test-model',
           dimensions: 384,
           pendingNodeIds: [pendingNodeId],
@@ -260,6 +654,7 @@ describe('run-analyze module', () => {
       const resumedPending = await loadMeta(storagePath);
       if (!resumedPending) throw new Error('expected pending-window resume metadata');
       fetchMock.mockClear();
+      const mismatchedProvider = httpEmbeddingProvider('http://other:8080/v1');
       await saveMeta(storagePath, {
         ...resumedPending,
         embeddingCheckpoint: {
@@ -267,7 +662,8 @@ describe('run-analyze module', () => {
           nodesProcessed: 1,
           totalNodes: 2,
           chunksProcessed: 1,
-          model: 'different-model',
+          provider: mismatchedProvider,
+          model: 'test-model',
           dimensions: 384,
         },
       });
@@ -277,8 +673,38 @@ describe('run-analyze module', () => {
           { skipAgentsMd: true, skipSkills: true },
           { onProgress: () => {} },
         ),
-      ).rejects.toThrow('Cannot resume embedding checkpoint');
+      ).rejects.toThrow(
+        `Cannot resume embedding checkpoint: it uses ${mismatchedProvider} / test-model at 384 dimensions`,
+      );
       expect(fetchMock).not.toHaveBeenCalled();
+
+      await saveMeta(storagePath, {
+        ...resumedPending,
+        embeddingCheckpoint: {
+          at: new Date().toISOString(),
+          nodesProcessed: 1,
+          totalNodes: 2,
+          chunksProcessed: 1,
+          provider: currentProvider,
+          model: 'test-model',
+          dimensions: 384,
+          pendingNodeIds: [],
+          physicalRows: 1,
+          validRows: 1,
+          recoverableIdentitySha256: '0'.repeat(64),
+          physicalRowsSha256: '0'.repeat(64),
+        },
+      });
+      await expect(
+        runFullAnalysis(
+          tmpRepo.dbPath,
+          { skipAgentsMd: true, skipSkills: true },
+          { onProgress: () => {} },
+        ),
+      ).rejects.toThrow(/no longer matches the live embedding identities/i);
+      expect(fetchMock).not.toHaveBeenCalled();
+      const { isLbugReady } = await import('../../src/core/lbug/lbug-adapter.js');
+      expect(isLbugReady()).toBe(false);
     } finally {
       vi.unstubAllGlobals();
       const restore = (key: string, value: string | undefined) => {
@@ -326,6 +752,7 @@ describe('run-analyze module', () => {
         schemaVersion: INCREMENTAL_SCHEMA_VERSION,
       };
       await saveMeta(flat.storagePath, flatMetaSeed);
+      await createReadableEmptyIndex(tmpRepo.dbPath);
       const branch = getStoragePaths(tmpRepo.dbPath, 'feature/x');
       await saveMeta(path.dirname(branch.metaPath), {
         repoPath: tmpRepo.dbPath,
@@ -388,6 +815,7 @@ describe('run-analyze module', () => {
         branch: 'main',
         schemaVersion: INCREMENTAL_SCHEMA_VERSION,
       });
+      await createReadableEmptyIndex(tmpRepo.dbPath);
       const branch = getStoragePaths(tmpRepo.dbPath, 'feature/x');
       await saveMeta(path.dirname(branch.metaPath), {
         repoPath: tmpRepo.dbPath,
@@ -404,8 +832,8 @@ describe('run-analyze module', () => {
       const result = await runFullAnalysis(tmpRepo.dbPath, {}, { onProgress: () => {} });
       expect(result.alreadyUpToDate).toBe(true);
       const flatMeta = await loadMeta(flat.storagePath);
-      // The informational flat label still restamps…
-      expect(flatMeta?.branch).toBe('feature/x');
+      // Missing registry ownership returns NOT_ADOPTED, so the prior label survives.
+      expect(flatMeta?.branch).toBe('main');
       // …but the pinned sub-index survives untouched.
       await expect(fs.access(path.dirname(branch.metaPath))).resolves.toBeUndefined();
     } finally {
@@ -442,6 +870,7 @@ describe('run-analyze module', () => {
         branch: 'main',
         schemaVersion: INCREMENTAL_SCHEMA_VERSION,
       });
+      await createReadableEmptyIndex(tmpRepo.dbPath);
 
       // Detached HEAD → branchLabel is null → the restamp block must not
       // fire: the existing stamp survives, mirroring the end-of-run write.
@@ -491,6 +920,7 @@ describe('run-analyze module', () => {
         branch: 'feature/x',
         schemaVersion: INCREMENTAL_SCHEMA_VERSION,
       });
+      await createReadableEmptyIndex(tmpRepo.dbPath, 'feature/x');
 
       const { runFullAnalysis } = await import('../../src/core/run-analyze.js');
       const result = await runFullAnalysis(

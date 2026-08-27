@@ -43,7 +43,7 @@ describe('bounded embedding preservation snapshot', () => {
       await emit(rows.slice(512));
     });
 
-    await expect(validateEmbeddingSnapshot(snapshotPath, source, 600)).resolves.toEqual({
+    await expect(validateEmbeddingSnapshot(snapshotPath, source, 600)).resolves.toMatchObject({
       count: 600,
       dimensions: 4,
     });
@@ -69,9 +69,9 @@ describe('bounded embedding preservation snapshot', () => {
         await emit(rows.slice(0, 256));
         await emit([rows[100], ...rows.slice(256)]);
       }),
-    ).resolves.toEqual({ count: 300, dimensions: 4, duplicateRows: 1 });
+    ).resolves.toMatchObject({ count: 300, dimensions: 4, duplicateRows: 1 });
 
-    await expect(validateEmbeddingSnapshot(snapshotPath, source, 300)).resolves.toEqual({
+    await expect(validateEmbeddingSnapshot(snapshotPath, source, 300)).resolves.toMatchObject({
       count: 300,
       dimensions: 4,
     });
@@ -97,7 +97,7 @@ describe('bounded embedding preservation snapshot', () => {
       .digest('hex');
     await fs.writeFile(snapshotPath, `${physicalRows.join('\n')}\n${JSON.stringify(footer)}\n`);
 
-    await expect(validateEmbeddingSnapshot(snapshotPath, source, 3)).resolves.toEqual({
+    await expect(validateEmbeddingSnapshot(snapshotPath, source, 3)).resolves.toMatchObject({
       count: 3,
       dimensions: 4,
       duplicateRows: 1,
@@ -105,7 +105,7 @@ describe('bounded embedding preservation snapshot', () => {
     const restored: CachedEmbedding[] = [];
     await expect(
       readEmbeddingSnapshot(snapshotPath, source, async (batch) => restored.push(...batch), 3),
-    ).resolves.toEqual({ count: 3, dimensions: 4, duplicateRows: 1 });
+    ).resolves.toMatchObject({ count: 3, dimensions: 4, duplicateRows: 1 });
     expect(restored).toHaveLength(3);
     expect(restored.find((row) => row.nodeId === 'node-0')?.contentHash).toBe('hash-0');
   });
@@ -201,6 +201,34 @@ describe('bounded embedding preservation snapshot', () => {
     await expect(
       validateEmbeddingSnapshot(snapshotPath, { ...source, lastCommit: 'different' }),
     ).resolves.toBeUndefined();
+  });
+
+  it('keeps checkpoint-resume snapshots valid across metadata timestamp rewrites', async () => {
+    const snapshotPath = await makePath();
+    const source = { lastCommit: 'abc', indexedAt: '2026-07-22T00:00:00.000Z' };
+    await createEmbeddingSnapshot(snapshotPath, source, async (emit) => emit(makeRows(1)));
+
+    const checkpointMetadata = { lastCommit: 'abc', indexedAt: '2026-07-22T01:23:45.000Z' };
+    const resumeSource = {
+      lastCommit: checkpointMetadata.lastCommit,
+      indexedAt: undefined,
+    };
+    await expect(validateEmbeddingSnapshot(snapshotPath, resumeSource)).resolves.toBeUndefined();
+    await expect(
+      validateEmbeddingSnapshot(snapshotPath, resumeSource, undefined, {
+        allowSourceIndexedAtDriftForCheckpointResume: true,
+      }),
+    ).resolves.toMatchObject({ count: 1, dimensions: 4 });
+
+    const restored: CachedEmbedding[] = [];
+    await readEmbeddingSnapshot(
+      snapshotPath,
+      resumeSource,
+      async (batch) => restored.push(...batch),
+      undefined,
+      { allowSourceIndexedAtDriftForCheckpointResume: true },
+    );
+    expect(restored).toHaveLength(1);
   });
 
   it('rejects a producer batch above the 256-vector cap and removes its temp file', async () => {

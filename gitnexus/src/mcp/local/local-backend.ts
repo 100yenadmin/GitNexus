@@ -16,6 +16,8 @@ import {
   closeLbug,
   isLbugReady,
   getPoolCapabilities,
+  statDbIdentity,
+  dbIdentityChanged,
 } from '../../core/lbug/pool-adapter.js';
 import { isValidQueryParams } from '../../core/lbug/query-params.js';
 import { toDisplayLine } from './line-display.js';
@@ -756,6 +758,8 @@ export class LocalBackend {
   // not persist across calls and the staleness check would reinit forever
   // (#2106).
   private lastObservedIndexedAt: Map<string, string> = new Map();
+  private lastObservedDbIdentity: Map<string, Awaited<ReturnType<typeof statDbIdentity>>> =
+    new Map();
   private groupToolSvc: GroupService | null = null;
   /**
    * One-shot stderr warnings for sibling-clone drift, keyed by
@@ -1102,6 +1106,7 @@ export class LocalBackend {
       this.initializedRepos.delete(key);
       this.lastStalenessCheck.delete(key);
       this.lastObservedIndexedAt.delete(key);
+      this.lastObservedDbIdentity.delete(key);
       this.reinitPromises.delete(key);
       closeLbug(key).catch(() => {});
     }
@@ -1288,7 +1293,11 @@ export class LocalBackend {
     // old label until the end-of-run atomic stamp (run-analyze dirty stamps
     // spread the existing meta), so this read never runs ahead of the DB.
     const flatMeta = await loadMeta(path.dirname(handle.lbugPath));
-    if (flatMeta?.branch && flatMeta.branch === branch) {
+    // A branch-adoption projection deliberately retains the prior label while
+    // the canonical DB may already hold the requested branch's generation.
+    // Never route that incomplete label. An ordinary embedding checkpoint does
+    // not change the graph generation or branch identity and remains readable.
+    if (flatMeta?.branch && !flatMeta.incrementalInProgress && flatMeta.branch === branch) {
       // The disk meta decides routing, so it also supplies the metadata —
       // the cached handle's label/commit/stats can predate the restamp.
       return {
@@ -1505,22 +1514,34 @@ export class LocalBackend {
         // Reading the flat meta for a branch handle would compare the branch
         // index's indexedAt against the primary's and thrash the pool (#2106).
         const meta = await loadMeta(path.dirname(repo.lbugPath));
-        if (!meta) return;
+        // Analyze writes the dirty marker before touching the live database.
+        // Continue serving the complete old read pool until final metadata
+        // clears it; never reopen onto a partial in-place generation.
+        if (!meta || meta.incrementalInProgress) return;
         // Compare against the last indexedAt OBSERVED for this pool (keyed by
         // lbugPath), not the handle's — branch handles are fresh spreads so a
         // handle mutation would not persist and would reinit on every check.
         const observed = this.lastObservedIndexedAt.get(poolKey) ?? repo.indexedAt;
-        if (meta.indexedAt && meta.indexedAt !== observed) {
-          // Index was rebuilt — close stale connection and re-init.
+        const stampChanged = !!meta.indexedAt && meta.indexedAt !== observed;
+        const currentIdentity = await statDbIdentity(repo.lbugPath);
+        const identityChanged = dbIdentityChanged(
+          this.lastObservedDbIdentity.get(poolKey) ?? null,
+          currentIdentity,
+        );
+        if (stampChanged || identityChanged) {
+          // Delegate rollover to the pool so an in-flight native query keeps
+          // its complete old generation until its connection is returned.
           // Wrap in reinitPromises to prevent TOCTOU race where concurrent
           // callers both detect staleness and double-close the pool.
           const reinit = (async () => {
             try {
-              await closeLbug(poolKey);
-              this.initializedRepos.delete(poolKey);
-              this.lastObservedIndexedAt.set(poolKey, meta.indexedAt);
-              await initLbug(poolKey, repo.lbugPath);
-              this.initializedRepos.add(poolKey);
+              const reopened = await initLbug(poolKey, repo.lbugPath, {
+                forceReopen: stampChanged,
+              });
+              if (reopened) {
+                if (meta.indexedAt) this.lastObservedIndexedAt.set(poolKey, meta.indexedAt);
+                this.lastObservedDbIdentity.set(poolKey, await statDbIdentity(repo.lbugPath));
+              }
             } finally {
               this.reinitPromises.delete(poolKey);
             }
@@ -1539,6 +1560,7 @@ export class LocalBackend {
       await initLbug(poolKey, repo.lbugPath);
       this.initializedRepos.add(poolKey);
       this.lastObservedIndexedAt.set(poolKey, repo.indexedAt);
+      this.lastObservedDbIdentity.set(poolKey, await statDbIdentity(repo.lbugPath));
     } catch (err: any) {
       // If lock error, mark as not initialized so next call retries
       this.initializedRepos.delete(poolKey);

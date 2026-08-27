@@ -1,3 +1,4 @@
+import fs from 'node:fs';
 import path from 'node:path';
 import type { LocalBackend, RepoListing } from './local/local-backend.js';
 import { parseListReposPagination } from './local/local-backend.js';
@@ -22,6 +23,13 @@ interface ResolvedRepository {
   name: string;
   path: string;
   pathKey: string;
+  filesystemIdentity?: string;
+}
+
+export interface McpRepositoryPolicyRejection {
+  environmentKey: string;
+  entryPosition: number;
+  failureClass: 'invalid' | 'ambiguous';
 }
 
 /** Minimal read-only surface needed by the production policy resolver. */
@@ -77,14 +85,9 @@ function parseRepositoryPolicy(env: NodeJS.ProcessEnv): RawRepositoryPolicy {
 
   let allowed: RawRepositoryPolicy['allowed'];
   if (allowedRaw) {
-    allowed = allowedRaw.value.split(',').map((entry, index) => {
-      const value = entry.trim();
-      const entryPosition = index + 1;
-      if (!value) {
-        throw new McpRepositoryPolicyConfigurationError(allowedRaw.key, 'blank', entryPosition);
-      }
-      return { value, entryPosition };
-    });
+    allowed = allowedRaw.value
+      .split(',')
+      .map((entry, index) => ({ value: entry.trim(), entryPosition: index + 1 }));
   }
 
   let defaultRepo: string | undefined;
@@ -108,6 +111,17 @@ function normalizedPath(value: string): string {
   return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
 }
 
+function existingFilesystemIdentity(value: string): string | undefined {
+  try {
+    const resolved = fs.realpathSync.native(path.resolve(value));
+    const stats = fs.statSync(resolved, { bigint: true });
+    if (stats.ino !== 0n) return `${stats.dev}:${stats.ino}`;
+    return `path:${normalizedPath(resolved)}`;
+  } catch {
+    return undefined;
+  }
+}
+
 function isAbsolutePath(value: string): boolean {
   return path.isAbsolute(value) || path.win32.isAbsolute(value);
 }
@@ -117,9 +131,18 @@ function resolveSpecifier(
   registry: readonly ResolvedRepository[],
 ): { repo?: ResolvedRepository; reason?: 'invalid' | 'ambiguous' } {
   const trimmed = specifier.trim();
-  const matches = isAbsolutePath(trimmed)
-    ? registry.filter((repo) => repo.pathKey === normalizedPath(trimmed))
-    : registry.filter((repo) => repo.name.toLowerCase() === trimmed.toLowerCase());
+  let matches: readonly ResolvedRepository[];
+  if (isAbsolutePath(trimmed)) {
+    matches = registry.filter((repo) => repo.pathKey === normalizedPath(trimmed));
+    if (matches.length === 0) {
+      const identity = existingFilesystemIdentity(trimmed);
+      if (identity) {
+        matches = registry.filter((repo) => repo.filesystemIdentity === identity);
+      }
+    }
+  } else {
+    matches = registry.filter((repo) => repo.name.toLowerCase() === trimmed.toLowerCase());
+  }
 
   if (matches.length === 0) return { reason: 'invalid' };
   if (matches.length > 1) return { reason: 'ambiguous' };
@@ -134,34 +157,43 @@ export class McpRepositoryPolicy {
   readonly restricted: boolean;
   readonly configured: boolean;
   readonly configurationError?: McpRepositoryPolicyConfigurationError;
+  readonly rejectedEntries: readonly McpRepositoryPolicyRejection[];
 
   private readonly registry: readonly ResolvedRepository[];
   private readonly allowed: readonly ResolvedRepository[];
   private readonly allowedPathKeys: ReadonlySet<string>;
+  private readonly runtimePathAliases: ReadonlyMap<string, ResolvedRepository>;
   private readonly defaultRepo?: ResolvedRepository;
   private readonly uniqueAllowedContextNames: ReadonlySet<string>;
 
   static unrestricted(): McpRepositoryPolicy {
-    return new McpRepositoryPolicy([], undefined, undefined);
+    return new McpRepositoryPolicy([], undefined, undefined, undefined);
   }
 
   static blocked(error: McpRepositoryPolicyConfigurationError): McpRepositoryPolicy {
-    return new McpRepositoryPolicy([], [], undefined, error);
+    return new McpRepositoryPolicy([], [], undefined, undefined, error);
   }
 
   constructor(
     registry: readonly ResolvedRepository[],
     allowed: readonly ResolvedRepository[] | undefined,
     defaultRepo: ResolvedRepository | undefined,
+    runtimePathAliases: ReadonlyMap<string, ResolvedRepository> | undefined,
     configurationError?: McpRepositoryPolicyConfigurationError,
+    rejectedEntries: readonly McpRepositoryPolicyRejection[] = [],
   ) {
     this.registry = registry;
     this.restricted = allowed !== undefined;
     this.configured = this.restricted || defaultRepo !== undefined;
     this.allowed = allowed ?? registry;
     this.allowedPathKeys = new Set(this.allowed.map((repo) => repo.pathKey));
+    this.runtimePathAliases = new Map([
+      ...registry.map((repo) => [repo.pathKey, repo] as const),
+      ...(runtimePathAliases ?? new Map<string, ResolvedRepository>()),
+    ]);
     this.defaultRepo = defaultRepo;
     this.configurationError = configurationError;
+    this.rejectedEntries = rejectedEntries;
 
     const registryNameCounts = new Map<string, number>();
     for (const repo of registry) {
@@ -176,11 +208,17 @@ export class McpRepositoryPolicy {
   }
 
   private resolveRuntimeRepo(specifier: string): ResolvedRepository {
-    const result = resolveSpecifier(specifier, this.registry);
-    if (!result.repo || (this.restricted && !this.allowedPathKeys.has(result.repo.pathKey))) {
+    const trimmed = specifier.trim();
+    const matches = isAbsolutePath(trimmed)
+      ? [this.runtimePathAliases.get(normalizedPath(trimmed))].filter(
+          (repo): repo is ResolvedRepository => repo !== undefined,
+        )
+      : this.registry.filter((repo) => repo.name.toLowerCase() === trimmed.toLowerCase());
+    const repo = matches.length === 1 ? matches[0] : undefined;
+    if (!repo || (this.restricted && !this.allowedPathKeys.has(repo.pathKey))) {
       throw unavailableRepositoryError();
     }
-    return result.repo;
+    return repo;
   }
 
   private repoForArgs(args: Record<string, unknown> | undefined): ResolvedRepository | undefined {
@@ -261,6 +299,12 @@ export class McpRepositoryPolicy {
         hasMore,
         ...(hasMore && { nextOffset: offset + returned }),
       },
+      ...(this.rejectedEntries.length > 0 && {
+        repositoryPolicy: {
+          status: 'degraded',
+          rejectedEntries: this.rejectedEntries,
+        },
+      }),
     };
   }
 
@@ -333,11 +377,15 @@ export class McpRepositoryPolicy {
       .replace(/\nGROUP MODE:[\s\S]*?(?=\n\n[A-Z][A-Z ()-]*:|$)/gu, '')
       .replace(/\nCROSS-REPO \(experimental\):[\s\S]*?(?=\n\n[A-Z][A-Z ()-]*:|$)/gu, '')
       .replace(/\nDESTINATION TRACE \(cross-repo\):[\s\S]*?(?=\n\n[A-Z][A-Z ()-]*:|$)/gu, '');
+    const degradedNotice =
+      this.rejectedEntries.length > 0
+        ? `DEGRADED: MCP repository policy rejected ${this.rejectedEntries.length} configured allowlist ${this.rejectedEntries.length === 1 ? 'entry' : 'entries'}; valid entries remain available and rejected entries grant no access. Run \`gitnexus doctor --mcp-config --json\` for sanitized coordinates.\n\n`
+        : '';
     return {
       ...tool,
       description: this.configurationError
         ? `BLOCKED: ${this.configurationError.message}\n\n${description}`
-        : description,
+        : `${degradedNotice}${description}`,
       inputSchema: { ...tool.inputSchema, properties },
     };
   }
@@ -400,23 +448,41 @@ export async function createMcpRepositoryPolicy(
     name: repo.name,
     path: repo.path,
     pathKey: normalizedPath(repo.path),
+    filesystemIdentity: existingFilesystemIdentity(repo.path),
   }));
 
   let allowed: ResolvedRepository[] | undefined;
+  const runtimePathAliases = new Map<string, ResolvedRepository>();
+  const rejectedEntries: McpRepositoryPolicyRejection[] = [];
   if (raw.allowed) {
     const byPath = new Map<string, ResolvedRepository>();
     for (const specifier of raw.allowed) {
       const result = resolveSpecifier(specifier.value, registry);
       if (!result.repo) {
-        throw new McpRepositoryPolicyConfigurationError(
-          raw.allowedKey ?? CANONICAL_ALLOWED,
-          result.reason ?? 'invalid',
-          specifier.entryPosition,
-        );
+        rejectedEntries.push({
+          environmentKey: raw.allowedKey ?? CANONICAL_ALLOWED,
+          entryPosition: specifier.entryPosition,
+          failureClass: result.reason === 'ambiguous' ? 'ambiguous' : 'invalid',
+        });
+        continue;
       }
       byPath.set(result.repo.pathKey, result.repo);
+      if (isAbsolutePath(specifier.value)) {
+        runtimePathAliases.set(normalizedPath(specifier.value), result.repo);
+      }
     }
     allowed = [...byPath.values()];
+    if (allowed.length === 0) {
+      const first = rejectedEntries[0];
+      const firstConfiguredEntry = raw.allowed.find(
+        (entry) => entry.entryPosition === first?.entryPosition,
+      );
+      throw new McpRepositoryPolicyConfigurationError(
+        first?.environmentKey ?? raw.allowedKey ?? CANONICAL_ALLOWED,
+        firstConfiguredEntry?.value ? (first?.failureClass ?? 'invalid') : 'blank',
+        first?.entryPosition ?? 1,
+      );
+    }
   }
 
   let defaultRepo: ResolvedRepository | undefined;
@@ -430,6 +496,9 @@ export async function createMcpRepositoryPolicy(
       );
     }
     defaultRepo = result.repo;
+    if (isAbsolutePath(raw.defaultRepo)) {
+      runtimePathAliases.set(normalizedPath(raw.defaultRepo), result.repo);
+    }
   }
 
   const defaultPathKey = defaultRepo?.pathKey;
@@ -441,7 +510,14 @@ export async function createMcpRepositoryPolicy(
     );
   }
 
-  return new McpRepositoryPolicy(registry, allowed, defaultRepo);
+  return new McpRepositoryPolicy(
+    registry,
+    allowed,
+    defaultRepo,
+    runtimePathAliases,
+    undefined,
+    rejectedEntries,
+  );
 }
 
 export type McpRepositoryPolicyPreflightFailureClass =
@@ -450,7 +526,15 @@ export type McpRepositoryPolicyPreflightFailureClass =
   | 'default-outside-allowlist';
 
 export type McpRepositoryPolicyPreflightResult =
-  | { valid: true }
+  | {
+      valid: true;
+      degraded?: false;
+    }
+  | {
+      valid: true;
+      degraded: true;
+      rejectedEntries: readonly McpRepositoryPolicyRejection[];
+    }
   | {
       valid: false;
       environmentKey: string;
@@ -469,7 +553,14 @@ export async function preflightMcpRepositoryPolicy(
   env: NodeJS.ProcessEnv = process.env,
 ): Promise<McpRepositoryPolicyPreflightResult> {
   try {
-    await createMcpRepositoryPolicy(backend, env);
+    const policy = await createMcpRepositoryPolicy(backend, env);
+    if (policy.rejectedEntries.length > 0) {
+      return {
+        valid: true,
+        degraded: true,
+        rejectedEntries: policy.rejectedEntries,
+      };
+    }
     return { valid: true };
   } catch (error) {
     if (!(error instanceof McpRepositoryPolicyConfigurationError)) throw error;

@@ -3,6 +3,7 @@ import { createReadStream } from 'fs';
 import fs from 'fs/promises';
 import { createInterface } from 'readline';
 import type { CachedEmbedding } from './types.js';
+import { embeddingIdentitySetDigest, embeddingSemanticIdentity } from './identity-digest.js';
 
 export const EMBEDDING_PRESERVATION_BATCH_SIZE = 256;
 export const EMBEDDING_SNAPSHOT_FILE = 'embedding-preservation.jsonl';
@@ -37,9 +38,25 @@ export interface EmbeddingSnapshotSource {
 export interface EmbeddingSnapshotInfo {
   count: number;
   dimensions: number;
+  identitySha256: string;
   /** Repeated physical rows coalesced by (nodeId, chunkIndex). */
   duplicateRows?: number;
 }
+
+export interface EmbeddingSnapshotValidationOptions {
+  /**
+   * A staged checkpoint restamps metadata after the preservation snapshot is
+   * written. Only that resume path may ignore the old indexedAt value; the
+   * source commit, payload checksum, row count, dimensions, and identity
+   * digest remain mandatory.
+   */
+  allowSourceIndexedAtDriftForCheckpointResume?: boolean;
+}
+
+export const embeddingSnapshotMatchesIdentityDigest = (
+  info: EmbeddingSnapshotInfo,
+  identitySha256: string,
+): boolean => info.identitySha256 === identitySha256;
 
 const hasValidEmbeddingIdentity = (
   row: unknown,
@@ -55,14 +72,19 @@ const hasValidEmbeddingIdentity = (
 };
 
 const embeddingIdentity = (row: Pick<SnapshotRow, 'nodeId' | 'chunkIndex'>): string =>
-  `${row.nodeId}\0${row.chunkIndex}`;
+  embeddingSemanticIdentity(row.nodeId, row.chunkIndex);
 
 const snapshotInfo = (
   count: number,
   dimensions: number,
   duplicateRows: number,
-): EmbeddingSnapshotInfo =>
-  duplicateRows > 0 ? { count, dimensions, duplicateRows } : { count, dimensions };
+  identities: ReadonlySet<string>,
+): EmbeddingSnapshotInfo => {
+  const identitySha256 = embeddingIdentitySetDigest(identities);
+  return duplicateRows > 0
+    ? { count, dimensions, identitySha256, duplicateRows }
+    : { count, dimensions, identitySha256 };
+};
 
 const encodeEmbedding = (embedding: number[]): string => {
   const vector = Float32Array.from(embedding);
@@ -171,7 +193,7 @@ export const createEmbeddingSnapshot = async (
     await handle.sync();
     await handle.close();
     await fs.rename(tempPath, snapshotPath);
-    return snapshotInfo(count, dimensions, duplicateRows);
+    return snapshotInfo(count, dimensions, duplicateRows, seenIdentities);
   } catch (error) {
     await handle.close().catch(() => {});
     await fs.rm(tempPath, { force: true }).catch(() => {});
@@ -184,6 +206,7 @@ export const validateEmbeddingSnapshot = async (
   snapshotPath: string,
   source: EmbeddingSnapshotSource,
   expectedCount?: number,
+  options: EmbeddingSnapshotValidationOptions = {},
 ): Promise<EmbeddingSnapshotInfo | undefined> => {
   let input: ReturnType<typeof createReadStream>;
   try {
@@ -245,12 +268,13 @@ export const validateEmbeddingSnapshot = async (
     footer.dimensions !== dimensions ||
     footer.sha256 !== digest.digest('hex') ||
     footer.sourceLastCommit !== source.lastCommit ||
-    footer.sourceIndexedAt !== source.indexedAt ||
+    (!options.allowSourceIndexedAtDriftForCheckpointResume &&
+      footer.sourceIndexedAt !== source.indexedAt) ||
     (expectedCount !== undefined && uniqueCount !== expectedCount)
   ) {
     return undefined;
   }
-  return snapshotInfo(uniqueCount, dimensions, duplicateRows);
+  return snapshotInfo(uniqueCount, dimensions, duplicateRows, seenIdentities);
 };
 
 /**
@@ -262,8 +286,9 @@ export const readEmbeddingSnapshot = async (
   source: EmbeddingSnapshotSource,
   onBatch: (batch: readonly CachedEmbedding[]) => Promise<void>,
   expectedCount?: number,
+  options: EmbeddingSnapshotValidationOptions = {},
 ): Promise<EmbeddingSnapshotInfo> => {
-  const info = await validateEmbeddingSnapshot(snapshotPath, source, expectedCount);
+  const info = await validateEmbeddingSnapshot(snapshotPath, source, expectedCount, options);
   if (!info) throw new Error('Embedding preservation snapshot failed validation');
 
   const input = createReadStream(snapshotPath, { encoding: 'utf8' });

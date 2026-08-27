@@ -433,9 +433,12 @@ describe('Cursor hook concurrency guard', () => {
 
   it('uses atomic fixed-name slot files (hard cap, not soft TOCTOU cap)', () => {
     expect(lockSource).toMatch(/slot-\$\{slot\}\.lock|`slot-/);
+    const slotFunctionName = lockSource.includes('function acquireSlotInDir')
+      ? 'function acquireSlotInDir'
+      : 'function acquireHookSlot';
     const slotFn = lockSource.slice(
-      lockSource.indexOf('function acquireHookSlot'),
-      lockSource.indexOf('function', lockSource.indexOf('function acquireHookSlot') + 1),
+      lockSource.indexOf(slotFunctionName),
+      lockSource.indexOf('function', lockSource.indexOf(slotFunctionName) + 1),
     );
     expect(slotFn).not.toContain('readdirSync');
   });
@@ -444,9 +447,12 @@ describe('Cursor hook concurrency guard', () => {
     // Regression: see hooks.test.ts. The mkdirSync catch must return null
     // (skip augment) rather than `() => {}` (proceed unguarded), so that
     // a read-only or cross-user `.gitnexus/` cannot reintroduce #1486.
+    const slotFunctionName = lockSource.includes('function acquireSlotInDir')
+      ? 'function acquireSlotInDir'
+      : 'function acquireHookSlot';
     const slotFn = lockSource.slice(
-      lockSource.indexOf('function acquireHookSlot'),
-      lockSource.indexOf('function', lockSource.indexOf('function acquireHookSlot') + 1),
+      lockSource.indexOf(slotFunctionName),
+      lockSource.indexOf('function', lockSource.indexOf(slotFunctionName) + 1),
     );
     const mkdirCatch = slotFn.slice(
       slotFn.indexOf('fs.mkdirSync(lockDir'),

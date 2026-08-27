@@ -39,8 +39,19 @@ import {
   resolveEmbeddingConfig,
 } from './config.js';
 import { rankExactEmbeddingRows, type ExactEmbeddingRow } from './exact-search.js';
-import { EMBEDDING_TABLE_NAME, EMBEDDING_INDEX_NAME, STALE_HASH_SENTINEL } from '../lbug/schema.js';
-import { loadVectorExtension, createVectorIndex } from '../lbug/lbug-adapter.js';
+import {
+  EMBEDDING_TABLE_NAME,
+  EMBEDDING_INDEX_NAME,
+  EMBEDDING_DIMS,
+  STALE_HASH_SENTINEL,
+} from '../lbug/schema.js';
+import {
+  loadVectorExtension,
+  createVectorIndex,
+  dropVectorIndex,
+  inspectEmbeddingIntegrity,
+  embeddingIntegrityFailures,
+} from '../lbug/lbug-adapter.js';
 import { escapeCypherString } from '../lbug/cypher-escape.js';
 import { isMissingColumnOrTableError } from '../lbug/schema-errors.js';
 import type { ExtensionInstallPolicy } from '../lbug/extension-loader.js';
@@ -75,6 +86,34 @@ export const resolveEmbeddingInstallPolicy = (): ExtensionInstallPolicy => {
 
 const ensureVectorExtensionAvailable = async (): Promise<boolean> => {
   return loadVectorExtension(undefined, { policy: resolveEmbeddingInstallPolicy() });
+};
+
+const waitForOperationOrAbort = <T>(operation: Promise<T>, signal?: AbortSignal): Promise<T> => {
+  if (!signal) return operation;
+  signal.throwIfAborted();
+
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const cleanup = () => signal.removeEventListener('abort', onAbort);
+    const resolveOnce = (value: T) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(value);
+    };
+    const rejectOnce = (reason: unknown) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(reason);
+    };
+    const onAbort = () =>
+      rejectOnce(signal.reason ?? new DOMException('This operation was aborted', 'AbortError'));
+
+    signal.addEventListener('abort', onAbort, { once: true });
+    operation.then(resolveOnce, rejectOnce);
+    if (signal.aborted) onAbort();
+  });
 };
 /**
  * Bump this when the embedding text template changes in a way that should
@@ -286,6 +325,23 @@ export const batchInsertEmbeddings = async (
     contentHash?: string;
   }>,
 ): Promise<void> => {
+  const identities = new Set<string>();
+  for (const update of updates) {
+    const nodeId = update.nodeId;
+    const identity = `${nodeId}:${update.chunkIndex}`;
+    if (
+      typeof nodeId !== 'string' ||
+      nodeId.trim().length === 0 ||
+      !Number.isSafeInteger(update.chunkIndex) ||
+      update.chunkIndex < 0 ||
+      update.embedding.length !== EMBEDDING_DIMS ||
+      update.embedding.some((value) => !Number.isFinite(value)) ||
+      identities.has(identity)
+    ) {
+      throw new Error('Embedding batch contains an invalid or duplicate identity/vector.');
+    }
+    identities.add(identity);
+  }
   const cypher = `CREATE (e:${EMBEDDING_TABLE_NAME} {id: $id, nodeId: $nodeId, chunkIndex: $chunkIndex, startLine: $startLine, endLine: $endLine, embedding: $embedding, contentHash: $contentHash})`;
   const paramsList = updates.map((u) => ({
     id: `${u.nodeId}:${u.chunkIndex}`,
@@ -296,7 +352,13 @@ export const batchInsertEmbeddings = async (
     embedding: u.embedding,
     contentHash: u.contentHash ?? STALE_HASH_SENTINEL,
   }));
-  await executeWithReusedStatement(cypher, paramsList);
+  // Preserved malformed artifacts passed through the repeated prepared-CREATE
+  // path, although a focused native reproduction did not prove it causal.
+  // Prepare, execute, and drain once per identity as a bounded precaution; the
+  // terminal integrity scan remains the authoritative safety gate.
+  for (const params of paramsList) {
+    await executeWithReusedStatement(cypher, [params]);
+  }
 };
 
 /**
@@ -319,6 +381,14 @@ export const batchInsertEmbeddings = async (
  * dynamic import only (lazy-embeddings convention, #2370).
  */
 export const buildVectorIndex = async (): Promise<boolean> => {
+  const integrity = await inspectEmbeddingIntegrity(undefined, true);
+  if (embeddingIntegrityFailures(integrity) > 0 || integrity.physicalRows !== integrity.validRows) {
+    throw new Error(
+      `Vector index creation refused malformed embedding rows ` +
+        `(physical=${integrity.physicalRows}, valid=${integrity.validRows}, ` +
+        `recoverable=${integrity.recoverableRows}).`,
+    );
+  }
   // This pre-check applies the embedding-specific install policy
   // (resolveEmbeddingInstallPolicy, default `auto` for analyze) before reaching
   // the adapter. The adapter's createVectorIndex() calls loadVectorExtension()
@@ -362,8 +432,10 @@ export interface EmbeddingPipelineOptions {
   signal?: AbortSignal;
   checkpointEveryNodes?: number;
   forceReembedNodeIds?: ReadonlySet<string>;
-  /** Exact restored row identities, keyed by owner node, for PK-safe stale deletion. */
+  /** Exact known row identities, keyed by owner node, for PK-safe stale deletion. */
   existingEmbeddingRowIds?: ReadonlyMap<string, readonly string[]>;
+  /** Drop staged HNSW before a checkpoint-window rewrite; rebuilt after inserts. */
+  rebuildVectorIndexBeforeMutation?: boolean;
   /** Load cached node identities for one page; callers must return at most the requested IDs. */
   loadExistingEmbeddingHashes?: (
     nodeIds: readonly string[],
@@ -463,6 +535,17 @@ export const runEmbeddingPipeline = async (
     if (!vectorAvailable) {
       logger.warn(vectorUnavailableMessage);
     }
+    if (pipelineOptions.rebuildVectorIndexBeforeMutation) {
+      if (
+        !vectorAvailable ||
+        !(await dropVectorIndex({ policy: resolveEmbeddingInstallPolicy() }))
+      ) {
+        throw new Error(
+          'Cannot safely resume the staged embedding checkpoint because its VECTOR index could not be dropped.',
+        );
+      }
+      throwIfCancelled();
+    }
 
     // Phase 1: Load embedding model
     onProgress({
@@ -472,14 +555,17 @@ export const runEmbeddingPipeline = async (
     });
 
     if (!isEmbedderReady()) {
-      await initEmbedder((modelProgress: ModelProgress) => {
-        const downloadPercent = modelProgress.progress ?? 0;
-        onProgress({
-          phase: 'loading-model',
-          percent: Math.round(downloadPercent * 0.2),
-          modelDownloadPercent: downloadPercent,
-        });
-      }, finalConfig);
+      await waitForOperationOrAbort(
+        initEmbedder((modelProgress: ModelProgress) => {
+          const downloadPercent = modelProgress.progress ?? 0;
+          onProgress({
+            phase: 'loading-model',
+            percent: Math.round(downloadPercent * 0.2),
+            modelDownloadPercent: downloadPercent,
+          });
+        }, finalConfig),
+        pipelineOptions.signal,
+      );
       throwIfCancelled();
     }
 
@@ -669,7 +755,10 @@ export const runEmbeddingPipeline = async (
         }
 
         const batchStaleIds = batch
-          .filter((node) => pageHashes.has(node.id))
+          .filter(
+            (node) =>
+              pageHashes.has(node.id) || pipelineOptions.existingEmbeddingRowIds?.has(node.id),
+          )
           .map((node) => node.id);
         await deleteStaleEmbeddingRows(
           executeWithReusedStatement,

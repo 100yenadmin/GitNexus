@@ -53,6 +53,7 @@ const OPTION_DESCRIPTION_KEYS = {
   'analyze|-f, --force': 'help.option.analyze.force',
   'analyze|--incremental-only': 'help.option.analyze.incrementalOnly',
   'analyze|--repair-fts': 'help.option.analyze.repairFts',
+  'analyze|--repair-vector': 'help.option.analyze.repairVector',
   'analyze|--embeddings [limit]': 'help.option.analyze.embeddings',
   'analyze|--drop-embeddings': 'help.option.analyze.dropEmbeddings',
   'analyze|--skills': 'help.option.analyze.skills',

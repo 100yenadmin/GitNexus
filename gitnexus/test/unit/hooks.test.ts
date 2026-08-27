@@ -652,9 +652,12 @@ describe('PreToolUse concurrency guard', () => {
       const source = fs.readFileSync(lockPath, 'utf-8');
       expect(source).toMatch(/slot-\$\{slot\}\.lock|`slot-/);
       // And no longer reads the lock dir to count active hooks.
+      const slotFunctionName = source.includes('function acquireSlotInDir')
+        ? 'function acquireSlotInDir'
+        : 'function acquireHookSlot';
       const slotFn = source.slice(
-        source.indexOf('function acquireHookSlot'),
-        source.indexOf('function', source.indexOf('function acquireHookSlot') + 1),
+        source.indexOf(slotFunctionName),
+        source.indexOf('function', source.indexOf(slotFunctionName) + 1),
       );
       expect(slotFn).not.toContain('readdirSync');
     });
@@ -665,9 +668,12 @@ describe('PreToolUse concurrency guard', () => {
       // proceed unguarded and reintroduce the #1486 fan-out on read-only or
       // cross-user `.gitnexus/` setups. The guard must fail closed (null).
       const source = fs.readFileSync(lockPath, 'utf-8');
+      const slotFunctionName = source.includes('function acquireSlotInDir')
+        ? 'function acquireSlotInDir'
+        : 'function acquireHookSlot';
       const slotFn = source.slice(
-        source.indexOf('function acquireHookSlot'),
-        source.indexOf('function', source.indexOf('function acquireHookSlot') + 1),
+        source.indexOf(slotFunctionName),
+        source.indexOf('function', source.indexOf(slotFunctionName) + 1),
       );
       const mkdirCatch = slotFn.slice(
         slotFn.indexOf('fs.mkdirSync(lockDir'),

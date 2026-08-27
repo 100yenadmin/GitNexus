@@ -117,6 +117,27 @@ describe('analyzeCommand .gitnexusrc wiring (#243)', () => {
     expect(opts.skipSkills).toBeFalsy();
   });
 
+  it('reports journal recovery as recovery-only instead of already up to date', async () => {
+    runFullAnalysisMock.mockResolvedValueOnce({
+      repoName: 'repo',
+      repoPath: dir,
+      stats: {},
+      recoveredPromotionOnly: true,
+    });
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    try {
+      const { analyzeCommand } = await import('../../src/cli/analyze.js');
+      await analyzeCommand(dir, {});
+      const output = logSpy.mock.calls.flat().join('\n');
+      expect(output).toContain('Recovered the previous staged promotion.');
+      expect(output).toContain('The current checkout was not analyzed');
+      expect(output).toContain('gitnexus analyze --staged --drop-embeddings');
+      expect(output).not.toContain('Already up to date');
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
   it('indexOnly from config remains stronger than context/skills options', async () => {
     await writeRc({ indexOnly: true });
     const { analyzeCommand } = await import('../../src/cli/analyze.js');

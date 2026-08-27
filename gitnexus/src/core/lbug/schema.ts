@@ -502,6 +502,11 @@ export const CREATE_VECTOR_INDEX_QUERY = `
 CALL CREATE_VECTOR_INDEX('${EMBEDDING_TABLE_NAME}', '${EMBEDDING_INDEX_NAME}', 'embedding', metric := 'cosine')
 `;
 
+/** Drop the persisted HNSW index before a staged checkpoint-window rewrite. */
+export const DROP_VECTOR_INDEX_QUERY = `
+CALL DROP_VECTOR_INDEX('${EMBEDDING_TABLE_NAME}', '${EMBEDDING_INDEX_NAME}')
+`;
+
 // ============================================================================
 // ALL SCHEMA QUERIES IN ORDER
 // Node tables must be created before relationship tables that reference them

@@ -169,7 +169,7 @@ export function repoVectorDoctorStatus(
   const rawEmbeddingCount = Number(meta.stats?.embeddings ?? 0);
   const embeddingCount =
     Number.isFinite(rawEmbeddingCount) && rawEmbeddingCount > 0 ? Math.floor(rawEmbeddingCount) : 0;
-  if (embeddingCount <= 0) return { status: 'no embeddings', detail: null };
+  if (embeddingCount <= 0) return { status: 'not-indexed', detail: null };
 
   if (liveProbe) {
     if (liveProbe.vectorIndex) {
@@ -224,21 +224,48 @@ export const doctorCommand = async (
     recoveryPlan?: boolean;
     mcpConfig?: boolean;
     registry?: boolean;
+    integrations?: boolean;
     json?: boolean;
     showPaths?: boolean;
   } = {},
 ) => {
-  const selectedModes = [options.recoveryPlan, options.mcpConfig, options.registry].filter(
-    Boolean,
-  ).length;
+  const selectedModes = [
+    options.recoveryPlan,
+    options.mcpConfig,
+    options.registry,
+    options.integrations,
+  ].filter(Boolean).length;
   if (selectedModes > 1) {
-    throw new Error('--recovery-plan, --mcp-config, and --registry are mutually exclusive');
+    throw new Error(
+      '--recovery-plan, --mcp-config, --registry, and --integrations are mutually exclusive',
+    );
   }
   if (options.showPaths && !options.registry) {
     throw new Error('--show-paths may only be used with --registry');
   }
-  if (options.json && !options.mcpConfig && !options.registry) {
-    throw new Error('--json may only be used with --mcp-config or --registry');
+  if (options.json && !options.mcpConfig && !options.registry && !options.integrations) {
+    throw new Error('--json may only be used with --mcp-config, --registry, or --integrations');
+  }
+
+  if (options.integrations) {
+    const { buildIntegrationDoctorReport } = await import('./integration-doctor.js');
+    const report = await buildIntegrationDoctorReport();
+    if (options.json) {
+      console.log(JSON.stringify(report, null, 2));
+    } else {
+      console.log('GitNexus integration doctor (read-only)');
+      console.log(`  selected CLI:         ${report.selectedCli.version}`);
+      console.log(`  Codex/Claude MCP:     ${report.mcp.status}`);
+      console.log(`  Claude MCP entries:   ${report.mcp.claudeConfiguredEntries}`);
+      console.log(`  Claude hooks:         ${report.hooks.claude}`);
+      console.log(
+        `  legacy SessionStart:  ${report.hooks.obsoleteSessionStart ? 'present' : 'absent'}`,
+      );
+    }
+    if (report.mcp.status !== 'consistent' || report.hooks.claude !== 'current') {
+      process.exitCode = 1;
+    }
+    return;
   }
 
   if (options.recoveryPlan) {
@@ -254,6 +281,13 @@ export const doctorCommand = async (
     const report = await buildMcpConfigDoctorReport();
     if (options.json) {
       console.log(JSON.stringify(report, null, 2));
+    } else if (report.valid && report.degraded) {
+      console.log('MCP repository policy: degraded (read-only preflight)');
+      for (const rejected of report.rejectedEntries) {
+        console.log(`  environment: ${rejected.environmentKey}`);
+        console.log(`  entry:       ${rejected.entryPosition}`);
+        console.log(`  failure:     ${rejected.failureClass}`);
+      }
     } else if (report.valid) {
       console.log('MCP repository policy: valid (read-only preflight)');
     } else if ('failureClass' in report) {
@@ -262,7 +296,7 @@ export const doctorCommand = async (
       console.log(`  entry:       ${report.entryPosition}`);
       console.log(`  failure:     ${report.failureClass}`);
     }
-    if (!report.valid) process.exitCode = 1;
+    if (!report.valid || report.degraded) process.exitCode = 1;
     return;
   }
 
@@ -282,10 +316,28 @@ export const doctorCommand = async (
       console.log(`  recovery states:         ${report.summary.recoveryStateEntries}`);
       console.log(`  database locks:          ${report.summary.lockedEntries}`);
       console.log(`  unsafe storage entries:  ${report.summary.unsafeStorageEntries}`);
+      for (const state of ['healthy', 'degraded', 'quarantined'] as const) {
+        console.log(
+          `  health ${state}:`.padEnd(29) +
+            report.entries.filter((entry) => entry.health.state === state).length,
+        );
+      }
+      const reasonCounts = new Map<string, number>();
+      for (const entry of report.entries) {
+        for (const reason of entry.health.reasons) {
+          reasonCounts.set(reason, (reasonCounts.get(reason) ?? 0) + 1);
+        }
+      }
+      for (const [reason, count] of [...reasonCounts].sort(([left], [right]) =>
+        left.localeCompare(right),
+      )) {
+        console.log(`  health reason ${reason}: ${count}`);
+      }
       if (!options.showPaths) {
         console.log('  paths:                   hidden (use --show-paths to reveal)');
       }
     }
+    if (report.entries.some((entry) => entry.health.state !== 'healthy')) process.exitCode = 1;
     return;
   }
 

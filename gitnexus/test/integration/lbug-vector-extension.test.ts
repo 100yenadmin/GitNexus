@@ -336,6 +336,139 @@ withTestLbugDB('vector-index-creation', (handle) => {
       )) as Array<{ count: number | bigint }>;
       expect(Number(rows[0]?.count ?? 0)).toBe(0);
     });
+
+    it('drops persisted HNSW before deleting and reinserting the same embedding primary key (#162)', async () => {
+      const adapter = await import('../../src/core/lbug/lbug-adapter.js');
+      const { batchInsertEmbeddings } =
+        await import('../../src/core/embeddings/embedding-pipeline.js');
+      const { EMBEDDING_DIMS, EMBEDDING_INDEX_NAME } =
+        await import('../../src/core/lbug/schema.js');
+      const filePath = 'src/vector-reopen-reinsert.ts';
+      const nodeId = `Function:${filePath}:target:1`;
+      const rowId = `${nodeId}:0`;
+
+      await adapter.executeQuery(
+        `CREATE (:Function {id: '${nodeId}', name: 'target', filePath: '${filePath}', startLine: 1, endLine: 3, isExported: true, content: '', description: ''})`,
+      );
+      await batchInsertEmbeddings(adapter.executeWithReusedStatement, [
+        {
+          nodeId,
+          chunkIndex: 0,
+          startLine: 1,
+          endLine: 3,
+          embedding: new Array(EMBEDDING_DIMS).fill(0),
+        },
+      ]);
+      await adapter.createVectorIndex();
+      await adapter.closeLbug();
+      await adapter.initLbug(handle.dbPath);
+
+      await expect(adapter.dropVectorIndex()).resolves.toBe(true);
+      await adapter.executeWithReusedStatement('MATCH (e:CodeEmbedding {id: $id}) DELETE e', [
+        { id: rowId },
+      ]);
+      await batchInsertEmbeddings(adapter.executeWithReusedStatement, [
+        {
+          nodeId,
+          chunkIndex: 0,
+          startLine: 1,
+          endLine: 3,
+          embedding: new Array(EMBEDDING_DIMS).fill(1),
+        },
+      ]);
+      await expect(adapter.createVectorIndex()).resolves.toBe(true);
+
+      const rows = (await adapter.executeQuery(
+        `MATCH (e:CodeEmbedding {id: '${rowId}'}) RETURN count(e) AS count`,
+      )) as Array<{ count: number | bigint }>;
+      expect(Number(rows[0]?.count ?? 0)).toBe(1);
+      const indexes = await adapter.executeQuery('CALL SHOW_INDEXES() RETURN *');
+      expect(indexes.filter((row: any) => row.index_name === EMBEDDING_INDEX_NAME)).toHaveLength(1);
+    });
+
+    it('recreates a staged embedding table and restores non-pending rows before regeneration (#162)', async () => {
+      const adapter = await import('../../src/core/lbug/lbug-adapter.js');
+      const { batchInsertEmbeddings } =
+        await import('../../src/core/embeddings/embedding-pipeline.js');
+      const { EMBEDDING_DIMS, EMBEDDING_INDEX_NAME } =
+        await import('../../src/core/lbug/schema.js');
+      const keptNodeId = 'Function:src/resume.ts:kept:1';
+      const pendingNodeId = 'Function:src/resume.ts:pending:2';
+
+      for (const [nodeId, name] of [
+        [keptNodeId, 'kept'],
+        [pendingNodeId, 'pending'],
+      ]) {
+        await adapter.executeQuery(
+          `CREATE (:Function {id: '${nodeId}', name: '${name}', filePath: 'src/resume.ts', startLine: 1, endLine: 3, isExported: true, content: '', description: ''})`,
+        );
+      }
+      await batchInsertEmbeddings(adapter.executeWithReusedStatement, [
+        {
+          nodeId: keptNodeId,
+          chunkIndex: 0,
+          startLine: 1,
+          endLine: 3,
+          embedding: new Array(EMBEDDING_DIMS).fill(0.25),
+          contentHash: 'kept-hash',
+        },
+        {
+          nodeId: pendingNodeId,
+          chunkIndex: 0,
+          startLine: 1,
+          endLine: 3,
+          embedding: new Array(EMBEDDING_DIMS).fill(0.5),
+          contentHash: 'pending-old-hash',
+        },
+      ]);
+      await adapter.createVectorIndex();
+      await adapter.closeLbug();
+      await adapter.initLbug(handle.dbPath);
+
+      const snapshotRows: import('../../src/core/embeddings/types.js').CachedEmbedding[] = [];
+      await adapter.loadCachedEmbeddings({
+        batchSize: 256,
+        onBatch: async (batch) => {
+          snapshotRows.push(...batch);
+        },
+      });
+      const resumeRows = snapshotRows.filter(
+        (row) => row.nodeId === keptNodeId || row.nodeId === pendingNodeId,
+      );
+      expect(resumeRows).toHaveLength(2);
+
+      await adapter.recreateCodeEmbeddingTable();
+      const emptyRows = (await adapter.executeQuery(
+        'MATCH (e:CodeEmbedding) RETURN count(e) AS count',
+      )) as Array<{ count: number | bigint }>;
+      expect(Number(emptyRows[0]?.count ?? 0)).toBe(0);
+
+      await batchInsertEmbeddings(
+        adapter.executeWithReusedStatement,
+        resumeRows.filter((row) => row.nodeId !== pendingNodeId),
+      );
+      await batchInsertEmbeddings(adapter.executeWithReusedStatement, [
+        {
+          nodeId: pendingNodeId,
+          chunkIndex: 0,
+          startLine: 1,
+          endLine: 3,
+          embedding: new Array(EMBEDDING_DIMS).fill(0.75),
+          contentHash: 'pending-new-hash',
+        },
+      ]);
+      await expect(adapter.createVectorIndex()).resolves.toBe(true);
+
+      const restoredRows = (await adapter.executeQuery(
+        'MATCH (e:CodeEmbedding) RETURN e.nodeId AS nodeId, e.contentHash AS contentHash ORDER BY e.nodeId',
+      )) as Array<{ nodeId: string; contentHash: string }>;
+      expect(restoredRows).toEqual([
+        { nodeId: keptNodeId, contentHash: 'kept-hash' },
+        { nodeId: pendingNodeId, contentHash: 'pending-new-hash' },
+      ]);
+      const indexes = await adapter.executeQuery('CALL SHOW_INDEXES() RETURN *');
+      expect(indexes.filter((row: any) => row.index_name === EMBEDDING_INDEX_NAME)).toHaveLength(1);
+    });
   });
 });
 

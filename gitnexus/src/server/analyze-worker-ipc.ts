@@ -51,7 +51,13 @@ import type { AnalyzeResult } from '../core/run-analyze.js';
  */
 export type AnalyzeResultIpc = Pick<
   AnalyzeResult,
-  'repoName' | 'repoPath' | 'stats' | 'alreadyUpToDate' | 'ftsRepairedOnly' | 'ftsSkipped'
+  | 'repoName'
+  | 'repoPath'
+  | 'stats'
+  | 'alreadyUpToDate'
+  | 'recoveredPromotionOnly'
+  | 'ftsRepairedOnly'
+  | 'ftsSkipped'
 >;
 
 /**
@@ -66,6 +72,7 @@ export function projectAnalyzeResultForIpc(result: AnalyzeResult): AnalyzeResult
     repoPath: result.repoPath,
     stats: result.stats,
     alreadyUpToDate: result.alreadyUpToDate,
+    recoveredPromotionOnly: result.recoveredPromotionOnly,
     ftsRepairedOnly: result.ftsRepairedOnly,
     ftsSkipped: result.ftsSkipped,
   };

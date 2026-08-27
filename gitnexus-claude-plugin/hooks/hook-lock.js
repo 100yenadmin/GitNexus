@@ -1,12 +1,14 @@
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 
 const HOOK_LOCK_SUBDIR = '.hook-locks';
 const HOOK_LOCK_MAX_INFLIGHT = 3;
+const HOOK_GLOBAL_LOCK_SUBDIR = '.hook-locks-global';
+const HOOK_GLOBAL_MAX_INFLIGHT = 8;
 const HOOK_LOCK_STALE_MS = 30000;
 
-function acquireHookSlot(gitNexusDir) {
-  const lockDir = path.join(gitNexusDir, HOOK_LOCK_SUBDIR);
+function acquireSlotInDir(lockDir, maxInflight) {
   try {
     fs.mkdirSync(lockDir, { recursive: true });
   } catch {
@@ -19,7 +21,7 @@ function acquireHookSlot(gitNexusDir) {
 
   const myPidStr = String(process.pid);
 
-  for (let slot = 0; slot < HOOK_LOCK_MAX_INFLIGHT; slot++) {
+  for (let slot = 0; slot < maxInflight; slot++) {
     const slotPath = path.join(lockDir, `slot-${slot}.lock`);
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
@@ -111,9 +113,42 @@ function acquireHookSlot(gitNexusDir) {
   return null;
 }
 
+function globalHookLockDir() {
+  const override = process.env.GITNEXUS_HOOK_GLOBAL_LOCK_DIR;
+  if (override && path.isAbsolute(override)) return override;
+  return path.join(os.homedir(), '.gitnexus', HOOK_GLOBAL_LOCK_SUBDIR);
+}
+
+function acquireHookSlot(gitNexusDir) {
+  const releaseGlobal = acquireSlotInDir(globalHookLockDir(), HOOK_GLOBAL_MAX_INFLIGHT);
+  if (!releaseGlobal) return null;
+
+  const releaseRepository = acquireSlotInDir(
+    path.join(gitNexusDir, HOOK_LOCK_SUBDIR),
+    HOOK_LOCK_MAX_INFLIGHT,
+  );
+  if (!releaseRepository) {
+    releaseGlobal();
+    return null;
+  }
+
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    releaseRepository();
+    releaseGlobal();
+  };
+  process.on('exit', release);
+  return release;
+}
+
 module.exports = {
   HOOK_LOCK_SUBDIR,
   HOOK_LOCK_MAX_INFLIGHT,
+  HOOK_GLOBAL_LOCK_SUBDIR,
+  HOOK_GLOBAL_MAX_INFLIGHT,
   HOOK_LOCK_STALE_MS,
+  globalHookLockDir,
   acquireHookSlot,
 };

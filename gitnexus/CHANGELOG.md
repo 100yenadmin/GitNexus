@@ -4,6 +4,94 @@ All notable changes to GitNexus will be documented in this file.
 
 ## [Unreleased]
 
+## [1.6.10-electric.10] - 2026-08-20
+
+### Fixed
+
+- `--repair-vector` now admits a COMPLETED embedding checkpoint (fully persisted window) instead
+  of forcing a full `--drop-embeddings` re-embed for an index whose vectors are already whole
+  (#192, field evidence on #132). Incomplete checkpoints and in-progress incremental writes
+  remain fail-closed.
+- A completed checkpoint must match the run's resolved embedding identity (model AND
+  dimensions), mirroring the resume-path guard; a same-dimension model swap can no longer
+  rebuild HNSW over incompatible rows while erasing the persisted model marker (#192).
+- Total embedding-table loss after a completed checkpoint is refused instead of returning a
+  successful `not-indexed`; a completed zero-node checkpoint is cleared on the not-indexed path
+  so empty repositories cannot stay marked as interrupted (#192).
+- A successful VECTOR repair clears `embeddingCheckpoint` and `incrementalInProgress` in the
+  committed metadata, so the stale marker cannot re-enter recovery on the next run (#192).
+
+## [1.6.10-electric.9] - 2026-07-30
+
+### Fixed
+
+- **One invalid or ambiguous MCP allowlist entry no longer denies access to every valid repository**: valid entries remain available, rejected entries grant no access, and agents receive sanitized degraded-policy coordinates (#182, #183)
+- **Absolute repository paths accept equivalent filesystem capitalization and aliases during startup resolution** while runtime requests use a precomputed in-memory map instead of synchronous filesystem calls (#182, #183)
+- **MCP policy doctor exits nonzero for degraded configurations** so automation can detect rejected entries without changing the runtime's fail-closed, partial-service behavior (#182, #183)
+
+### Changed
+
+- An allowlist still blocks all repository access when none of its entries resolve. Invalid, ambiguous, or outside-allowlist defaults remain fully blocking, and GitNexus never falls back to unrestricted access.
+- Distribution remains GitHub-only as one tarball plus `SHA256SUMS`; npm and container registries are unchanged.
+- Existing `1.6.10-electric.8` remains installed as the immediate rollback runtime.
+
+## [1.6.10-electric.8] - 2026-07-23
+
+### Fixed
+
+- **Staged embedding recovery is reduced to a fail-closed containment boundary**: unjournaled staged generations are preserved but never resumed or promoted automatically, and replacing one requires an explicit clean isolated rebuild with `--staged --drop-embeddings` (#162, #180)
+- **Journal recovery is terminal and truthful**: CLI callers receive a distinct recovery-only result stating that the current checkout was not analyzed, while server callers fail closed with the exact forced-clean retry requirements (#180)
+- **Recovery completes canonical bookkeeping without starting a second analysis**, and conflicting `--incremental-only --drop-embeddings` requests are rejected before storage or ownership-lock mutation (#180)
+
+### Changed
+
+- Generic dirty-stage resume and unjournaled completed-stage promotion are no longer supported production paths. Preserved artifacts remain available for forensics; recovery proceeds through a new clean isolated generation.
+- Fleet writers and onboarding remain disabled for this containment release. Existing healthy canonical indexes continue to serve read-only MCP, query, and doctor traffic.
+- Distribution remains GitHub-only as one tarball plus `SHA256SUMS`; npm and container registries are unchanged.
+- Existing `1.6.10-electric.7` remains installed as the immediate rollback runtime.
+
+## [1.6.10-electric.7] - 2026-07-22
+
+### Added
+
+- **Safe HNSW-only repair** preserves every stored embedding while rebuilding the vector index under fail-closed storage, lock, recovery, and live eight-connection pool checks (#170, #172)
+- **Claude hook-only maintenance and integration doctor** refresh the copied Claude adapter without replacing MCP configuration, remove only obsolete GitNexus hook wiring, cap hook subprocesses globally, and report sanitized runtime consistency (#171, #174)
+
+### Fixed
+
+- **Interrupted staged embedding resumes enforce persisted identity integrity before bounded restore and regeneration**: malformed, duplicate, orphaned, non-canonical, or wrong-dimension rows fail closed; a preservation snapshot can authorize isolated reconstruction only when its exact semantic-identity digest matches; node COPY failures cannot fall through to permissive row dropping (#162, #173)
+- **LadybugDB memory and MCP pool rollover are bounded and freshness-aware**, preventing stale pooled reads after index replacement while retaining explicit operator override behavior (#175, #176)
+- **Readable zero-embedding repositories report `not-indexed`** instead of claiming a broken vector index (#170, #172)
+
+### Changed
+
+- Remote Voyage fleet work remains detached and may use at most two different-remote slots; it has no host memory, swap, RSS, free-memory, or pressure gate.
+- Distribution remains GitHub-only as one tarball plus `SHA256SUMS`; npm and container registries are unchanged.
+- Existing `1.6.10-electric.2` through `.6` installations remain available for rollback.
+
+## [1.6.10-electric.6] - 2026-07-21
+
+### Fixed
+
+- **Interrupted staged embedding resumes rebuild the staged HNSW index around pending-window regeneration**, preventing LadybugDB's live vector index from retaining a deleted primary key long enough to reject its same-key replacement (#162, #168)
+
+### Changed
+
+- Distribution remains GitHub-only as one tarball plus `SHA256SUMS`; npm and container registries are unchanged.
+- Existing `1.6.10-electric.2` through `.5` installations remain available for rollback.
+
+## [1.6.10-electric.5] - 2026-07-21
+
+### Fixed
+
+- **Interrupted staged resumes delete exact pending-window rows before regeneration**, preventing a preserved LadybugDB primary key from colliding with the replacement `CodeEmbedding` row while keeping the delete/reinsert exposure bounded to the current batch (#162, #163)
+- **Registry doctor derives the HNSW query dimension from each database's stored vector column**, so a raw doctor invocation reports healthy 2,048-dimensional Voyage indexes truthfully without requiring provider-specific process environment (#164, #165)
+
+### Changed
+
+- Distribution remains GitHub-only as one tarball plus `SHA256SUMS`; npm and container registries are unchanged.
+- Existing `1.6.10-electric.2`, `.3`, and `.4` installations remain available for rollback.
+
 ## [1.6.10-electric.4] - 2026-07-21
 
 ### Fixed
