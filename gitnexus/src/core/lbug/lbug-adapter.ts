@@ -806,6 +806,8 @@ export const withLbugReadOnlyNonRecovering = async <T>(
 ): Promise<T> => runLbugReadOnlyNonRecovering(dbPath, operation);
 
 export interface LbugOwnershipLease {
+  /** Acquire the exact re-frozen physical storage boundary while retaining the companion lease. */
+  acquireStorage(storagePath: string): Promise<void>;
   release(): Promise<void>;
   /** Attach a forked analyzer generation before it receives its start IPC. */
   attachWorker(workerPid: number): Promise<void>;
@@ -825,7 +827,8 @@ export const acquireLbugOwnership = async (
     markEntered = resolve;
     markFailed = reject;
   });
-  const { withAnalyzeOwnershipLock } = await import('../staged-promotion.js');
+  const { analyzeStorageOwnershipIsHeld, withAnalyzeOwnershipLock } =
+    await import('../staged-promotion.js');
   const { attachAnalyzeOwnershipWorker } = await import('../staged-promotion.js');
   const ownership = withAnalyzeOwnershipLock(
     storagePath,
@@ -838,17 +841,66 @@ export const acquireLbugOwnership = async (
   void ownership.catch(markFailed);
   await entered;
   let released = false;
+  let frozenStoragePath: string | undefined;
+  let storageOwnership: Promise<void> | undefined;
+  let releaseStorageGate: (() => void) | undefined;
   return {
+    acquireStorage: async (nextStoragePath: string) => {
+      if (released) throw new Error('Analyze ownership was released before storage acquisition');
+      const resolvedStoragePath = path.resolve(nextStoragePath);
+      if (analyzeStorageOwnershipIsHeld(resolvedStoragePath)) {
+        frozenStoragePath = resolvedStoragePath;
+        return;
+      }
+      if (storageOwnership) {
+        if (frozenStoragePath === resolvedStoragePath) return;
+        throw new Error('Analyze storage ownership is already frozen to a different target');
+      }
+      frozenStoragePath = resolvedStoragePath;
+      let markStorageEntered!: () => void;
+      let markStorageFailed!: (reason?: unknown) => void;
+      const storageEntered = new Promise<void>((resolve, reject) => {
+        markStorageEntered = resolve;
+        markStorageFailed = reject;
+      });
+      const storageGate = new Promise<void>((resolve) => {
+        releaseStorageGate = resolve;
+      });
+      storageOwnership = withAnalyzeOwnershipLock(resolvedStoragePath, async () => {
+        markStorageEntered();
+        await storageGate;
+      });
+      void storageOwnership.catch(markStorageFailed);
+      try {
+        await storageEntered;
+      } catch (error) {
+        await storageOwnership.catch(() => undefined);
+        storageOwnership = undefined;
+        releaseStorageGate = undefined;
+        frozenStoragePath = undefined;
+        throw error;
+      }
+    },
     attachWorker: async (workerPid: number) => {
       if (released) throw new Error('Analyze ownership was released before worker attachment');
-      await attachAnalyzeOwnershipWorker(storagePath, repoRoot, workerPid);
+      const attachedStoragePath = frozenStoragePath ?? path.resolve(storagePath);
+      if (!analyzeStorageOwnershipIsHeld(attachedStoragePath)) {
+        throw new Error('Analyze storage ownership must be acquired before worker attachment');
+      }
+      await attachAnalyzeOwnershipWorker(attachedStoragePath, repoRoot, workerPid);
     },
     release: async () => {
       if (!released) {
         released = true;
+        releaseStorageGate?.();
         releaseGate();
       }
-      await ownership;
+      const failures: unknown[] = [];
+      if (storageOwnership) await storageOwnership.catch((error) => failures.push(error));
+      await ownership.catch((error) => failures.push(error));
+      if (failures.length === 1) throw failures[0];
+      if (failures.length > 1)
+        throw new AggregateError(failures, 'Analyze ownership release failed');
     },
   };
 };

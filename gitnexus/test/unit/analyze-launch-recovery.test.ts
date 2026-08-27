@@ -18,11 +18,11 @@ import {
 import { canonicalRepoRootLockKey } from '../../src/storage/repo-manager.js';
 import type { AnalyzeResultIpc } from '../../src/server/analyze-worker-ipc.js';
 
-const result = (recoveredPromotionOnly?: boolean): AnalyzeResultIpc => ({
+const result = (recoveredPromotionOnly?: boolean, alreadyUpToDate?: boolean): AnalyzeResultIpc => ({
   repoName: 'demo',
   repoPath: '/repos/demo',
   stats: { nodes: 10, edges: 12 },
-  alreadyUpToDate: undefined,
+  alreadyUpToDate,
   recoveredPromotionOnly,
   ftsRepairedOnly: undefined,
   ftsSkipped: undefined,
@@ -76,14 +76,20 @@ const launchDeps = (
   releaseRepoLock: ReturnType<typeof vi.fn>,
 ) => {
   const ownershipRelease = vi.fn(async () => undefined);
+  const acquireStorage = vi.fn(async (_storagePath: string) => undefined);
   const attachWorker = vi.fn(async (_workerPid: number) => undefined);
   return {
     jobManager,
     backend: { init: vi.fn(async () => undefined) },
     acquireRepoLock: vi.fn(() => null),
     releaseRepoLock,
-    acquireAnalyzeOwnership: vi.fn(async () => ({ release: ownershipRelease, attachWorker })),
+    acquireAnalyzeOwnership: vi.fn(async () => ({
+      acquireStorage,
+      release: ownershipRelease,
+      attachWorker,
+    })),
     ownershipRelease,
+    acquireStorage,
     attachWorker,
     closeDbHandle: vi.fn(async () => undefined),
   };
@@ -125,6 +131,10 @@ describe('analyze worker shared lock ownership', () => {
     await waitForWorkerStart();
     await vi.waitFor(() => expect(child.child.send).toHaveBeenCalled());
 
+    expect(deps.acquireStorage).toHaveBeenCalledWith(virtualStoragePath);
+    expect(deps.acquireStorage.mock.invocationCallOrder[0]).toBeLessThan(
+      deps.attachWorker.mock.invocationCallOrder[0],
+    );
     expect(deps.attachWorker).toHaveBeenCalledWith(child.child.pid);
     expect(deps.attachWorker.mock.invocationCallOrder[0]).toBeLessThan(
       child.child.send.mock.invocationCallOrder[0],
@@ -132,6 +142,24 @@ describe('analyze worker shared lock ownership', () => {
     child.emit('message', { type: 'error', message: 'test cleanup' });
     child.emit('close', 0);
     await vi.waitFor(() => expect(releaseRepoLock).toHaveBeenCalledOnce());
+  });
+
+  it('does not wait for rewritten files when analysis is already up to date', async () => {
+    const { job, manager } = fakeJobManager();
+    const child = fakeChild();
+    launcherState.fork.mockReset().mockReturnValue(child.child);
+    const releaseRepoLock = vi.fn();
+    const deps = launchDeps(manager, releaseRepoLock);
+
+    createLaunchAnalysisWorker(deps)(job, '/virtual/demo', {});
+    await waitForWorkerStart();
+    child.emit('message', { type: 'complete', result: result(undefined, true) });
+    child.emit('close', 0);
+
+    await vi.waitFor(() => expect(job.status).toBe('complete'));
+    expect(deps.closeDbHandle).toHaveBeenCalledOnce();
+    expect(deps.ownershipRelease).toHaveBeenCalledOnce();
+    expect(releaseRepoLock).toHaveBeenCalledOnce();
   });
 
   it('releases the captured key exactly once after terminal success and late events', async () => {
@@ -325,7 +353,12 @@ describe('analyze worker shared lock ownership', () => {
     deps.acquireAnalyzeOwnership.mockImplementationOnce(
       () =>
         new Promise((resolve) => {
-          admitOwnership = () => resolve({ release: deps.ownershipRelease });
+          admitOwnership = () =>
+            resolve({
+              acquireStorage: deps.acquireStorage,
+              release: deps.ownershipRelease,
+              attachWorker: deps.attachWorker,
+            });
         }),
     );
 
@@ -419,7 +452,11 @@ describe('analyze worker shared lock ownership', () => {
       deps.acquireAnalyzeOwnership.mockImplementationOnce(async (storagePath, ownerRoot) => {
         await expect(fs.lstat(storagePath)).rejects.toMatchObject({ code: 'ENOENT' });
         expect(ownerRoot).toBe(await fs.realpath(repoRoot));
-        return { release: deps.ownershipRelease };
+        return {
+          acquireStorage: deps.acquireStorage,
+          release: deps.ownershipRelease,
+          attachWorker: deps.attachWorker,
+        };
       });
 
       createLaunchAnalysisWorker(deps)(job, repoRoot, {});
@@ -432,6 +469,7 @@ describe('analyze worker shared lock ownership', () => {
       expect(deps.acquireRepoLock).toHaveBeenNthCalledWith(1, canonicalRepoRootLockKey(repoRoot));
       expect(deps.acquireRepoLock).toHaveBeenNthCalledWith(2, canonicalStorage);
       expect(deps.acquireAnalyzeOwnership).toHaveBeenCalledWith(canonicalStorage, canonicalRoot);
+      expect(deps.acquireStorage).toHaveBeenCalledWith(canonicalStorage);
       expect(child.child.send).toHaveBeenCalledWith(
         expect.objectContaining({
           parentAnalyzeOwnershipHeld: true,
@@ -467,13 +505,18 @@ describe('analyze worker shared lock ownership', () => {
         expect(storagePath).toBe(path.join(canonicalRoot, '.gitnexus'));
         expect(ownerRoot).toBe(canonicalRoot);
         await fs.symlink(physicalStorage, lexicalStorage, 'dir');
-        return { release: deps.ownershipRelease };
+        return {
+          acquireStorage: deps.acquireStorage,
+          release: deps.ownershipRelease,
+          attachWorker: deps.attachWorker,
+        };
       });
 
       createLaunchAnalysisWorker(deps)(job, repoRoot, {});
       await waitForWorkerStart();
 
       const canonicalStorage = await fs.realpath(physicalStorage);
+      expect(deps.acquireStorage).toHaveBeenCalledWith(canonicalStorage);
       expect(deps.acquireRepoLock).toHaveBeenNthCalledWith(2, canonicalStorage);
       expect(child.child.send).toHaveBeenCalledWith(
         expect.objectContaining({

@@ -63,6 +63,15 @@ const currentProcessStartToken = (): string => {
       .trim()
       .split(/\s+/);
     identity = `linux:${fields[19]}`;
+  } else if (process.platform === 'win32') {
+    const powershell = 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe';
+    const script =
+      `$p = Get-Process -Id ${process.pid} -ErrorAction Stop; ` +
+      '[Console]::Out.Write($p.StartTime.ToUniversalTime().Ticks)';
+    const start = execFileSync(powershell, ['-NoProfile', '-NonInteractive', '-Command', script], {
+      encoding: 'utf8',
+    }).trim();
+    identity = `win32:${start}`;
   } else {
     const start = execFileSync('/bin/ps', ['-o', 'lstart=', '-p', String(process.pid)], {
       encoding: 'utf8',
@@ -585,6 +594,19 @@ describe('common analyze ownership lock', () => {
     } finally {
       readSpy.mockRestore();
     }
+  });
+
+  it('treats an owned lock removed with its storage as already released', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-stage-lock-removed-'));
+    tempDirs.push(root);
+    const lockPath = path.join(root, 'analyze-staged.lock');
+
+    await expect(
+      withAnalyzeOwnershipLock(root, async () => {
+        await fs.rm(lockPath);
+        return 'deleted';
+      }),
+    ).resolves.toBe('deleted');
   });
 
   it('refuses a concurrent ordinary or staged writer', async () => {

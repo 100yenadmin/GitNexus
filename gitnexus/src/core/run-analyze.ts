@@ -3603,6 +3603,14 @@ export async function runFullAnalysis(
   internal: AnalyzeInternalContext = {},
 ): Promise<AnalyzeResult> {
   if (
+    !internal.parentAnalyzeOwnershipHeld &&
+    (options.analyzeStoragePath !== undefined || options.registryPath !== undefined)
+  ) {
+    throw new Error(
+      'Frozen analyzeStoragePath and registryPath overrides require parent-held analyze ownership.',
+    );
+  }
+  if (
     internal.parentAnalyzeOwnershipHeld &&
     (!options.analyzeStoragePath || !options.registryPath)
   ) {

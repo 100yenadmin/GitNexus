@@ -1118,6 +1118,10 @@ const releaseOwnedOwnershipLock = async (
       return;
     } catch (error) {
       const code = filesystemErrorCode(error);
+      // The protected operation may remove the storage tree that contained
+      // its lock. Missing is therefore an already-complete release, not a
+      // cleanup failure that can turn a successful delete into an error.
+      if (code === 'ENOENT') return;
       if (!code || !transientCodes.has(code) || attempt === 2) throw error;
       await new Promise((resolve) => setTimeout(resolve, 25 * 2 ** attempt));
     }
@@ -1250,6 +1254,9 @@ const analyzeOwnershipCompanionPath = (repoRoot: string): string => {
   // prevent differently configured homes from mutating one repository.
   return path.join(path.resolve(getGlobalDir()), 'locks', `analyze-${digest}.lock`);
 };
+
+export const analyzeStorageOwnershipIsHeld = (storagePath: string): boolean =>
+  activeOwnershipRecords.has(path.join(path.resolve(storagePath), 'analyze-staged.lock'));
 
 type AttachedWorkerGeneration = NonNullable<StageLockRecord['attachedWorker']>;
 
@@ -1550,7 +1557,10 @@ export const prepareStagedWorkspace = async (
   if (canonicalDb && canonicalMeta) {
     const tempDb = `${paths.stagedLbugPath}.copy-${randomBytes(8).toString('hex')}`;
     await fs.copyFile(paths.canonicalLbugPath, tempDb);
-    const handle = await fs.open(tempDb, 'r');
+    // Windows requires a writable handle for FlushFileBuffers even though the
+    // bytes are not modified here. The copied stage file is private and will
+    // be atomically moved only after this durability barrier succeeds.
+    const handle = await fs.open(tempDb, 'r+');
     try {
       await handle.sync();
     } finally {

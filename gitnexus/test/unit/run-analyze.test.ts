@@ -43,6 +43,16 @@ describe('run-analyze module', () => {
     );
   });
 
+  it.each([{ analyzeStoragePath: '/tmp/frozen-storage' }, { registryPath: '/repo' }])(
+    'rejects internal path overrides without parent-held ownership',
+    async (options) => {
+      const { runFullAnalysis } = await import('../../src/core/run-analyze.js');
+      await expect(runFullAnalysis('/repo', options, {})).rejects.toThrow(
+        'Frozen analyzeStoragePath and registryPath overrides require parent-held analyze ownership.',
+      );
+    },
+  );
+
   it('exports PHASE_LABELS', async () => {
     const mod = await import('../../src/core/run-analyze.js');
     expect(mod.PHASE_LABELS).toBeDefined();
