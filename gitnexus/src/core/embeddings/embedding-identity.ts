@@ -11,6 +11,9 @@ const normalizeHttpEndpoint = (endpoint: string): string => {
   if (endpoint !== endpoint.trim()) {
     throw new Error('HTTP embedding endpoint must not have surrounding whitespace.');
   }
+  if (endpoint.includes('\\')) {
+    throw new Error('HTTP embedding endpoint backslashes are unverifiable.');
+  }
 
   let url: URL;
   try {

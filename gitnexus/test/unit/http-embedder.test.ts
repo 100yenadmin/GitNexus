@@ -94,6 +94,12 @@ describe('HTTP embedding backend', () => {
       }
     });
 
+    it('refuses backslashes before provider hashing can normalize the effective route', () => {
+      for (const endpoint of ['https://example.com/v1\\', 'https:\\example.com\\v1']) {
+        expect(() => httpEmbeddingProvider(endpoint)).toThrow(/backslashes are unverifiable/i);
+      }
+    });
+
     it('refuses query-bearing and malformed endpoints before provider use', () => {
       expect(() => httpEmbeddingProvider('https://example.com/v1?deployment=secret')).toThrow(
         /query routing is unverifiable/i,

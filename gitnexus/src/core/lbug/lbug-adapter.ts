@@ -922,7 +922,7 @@ export const acquireLbugOwnership = async (
         frozenStorageOwnership = undefined;
         throw error;
       } finally {
-        if (storageReady === acquisition) storageReady = undefined;
+        storageReady = undefined;
       }
     },
     attachWorker: async (workerPid: number) => {
