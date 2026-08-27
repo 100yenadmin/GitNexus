@@ -130,6 +130,24 @@ describe('JobManager', () => {
     expect(controller.signal.aborted).toBe(true);
   });
 
+  it('defers a parent-owned cancellation until cleanup publishes the terminal state', () => {
+    const job = manager.createJob({ repoPath: '/tmp/repo' });
+    manager.updateJob(job.id, { status: 'analyzing' });
+    manager.deferCancellationFinalization(job.id);
+
+    expect(manager.cancelJob(job.id, 'Cancelled by user')).toBe(true);
+    expect(manager.getJob(job.id)).toMatchObject({
+      status: 'analyzing',
+      cancellationReason: 'Cancelled by user',
+    });
+
+    manager.updateJob(job.id, { status: 'failed', error: 'Cancelled by user' });
+    expect(manager.getJob(job.id)).toMatchObject({
+      status: 'failed',
+      error: 'Cancelled by user',
+    });
+  });
+
   it('cancelJob returns false for terminal jobs', () => {
     const job = manager.createJob({ repoUrl: 'https://github.com/user/repo' });
     manager.updateJob(job.id, { status: 'complete' });
