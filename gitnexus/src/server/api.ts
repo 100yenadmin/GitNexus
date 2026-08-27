@@ -2355,7 +2355,10 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                   throw new Error(API_METADATA_DRIFT_CONTEXT);
                 }
                 const priorCheckpoint = embeddingMeta.embeddingCheckpoint;
-                const integrity = await inspectEmbeddingIntegrity();
+                const integrity = await inspectEmbeddingIntegrity(
+                  undefined,
+                  priorCheckpoint.physicalRowsSha256 !== undefined,
+                );
                 if (integrity.physicalRows > 0) {
                   throw new Error(
                     'Cannot resume embedding checkpoint: it uses unknown-provider while the table contains ' +
@@ -2392,7 +2395,10 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                   embeddingMeta.stats?.edges !== frozenOwner.stats?.edges);
               let priorCheckpoint = embeddingMeta.embeddingCheckpoint;
               if (isEmptyLegacyCheckpoint(priorCheckpoint)) {
-                const integrity = await inspectEmbeddingIntegrity();
+                const integrity = await inspectEmbeddingIntegrity(
+                  undefined,
+                  priorCheckpoint.physicalRowsSha256 !== undefined,
+                );
                 const graphHasNodes =
                   integrity.physicalRows === 0 &&
                   (await hasEmbeddableNodes(executeQuery, embedController.signal));
