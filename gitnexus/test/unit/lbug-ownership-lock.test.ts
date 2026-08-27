@@ -58,6 +58,22 @@ describe('Ladybug writable ownership admission', () => {
     ).resolves.toBe('released');
   });
 
+  it('keeps the initial-lock fast path frozen to one storage target', async () => {
+    const { repoRoot, storagePath } = await makePaths();
+    const otherStoragePath = path.join(repoRoot, '.gitnexus-other');
+    await fs.mkdir(storagePath);
+    await fs.mkdir(otherStoragePath);
+    const lease = await acquireLbugOwnership(storagePath, repoRoot);
+
+    await lease.acquireStorage(storagePath);
+    await lease.acquireStorage(storagePath);
+    await expect(lease.acquireStorage(otherStoragePath)).rejects.toThrow(
+      /already frozen to a different target/i,
+    );
+
+    await lease.release();
+  });
+
   it('does not borrow another lease when distinct companions target one new storage path', async () => {
     const { storagePath } = await makePaths();
     const firstRepoRoot = path.join(path.dirname(storagePath), 'first-repo');

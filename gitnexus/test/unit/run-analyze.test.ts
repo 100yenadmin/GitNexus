@@ -207,6 +207,8 @@ describe('run-analyze module', () => {
     const tmpRepo = await createTempDir('gitnexus-run-analyze-checkpoint-incremental-only-');
     try {
       execSync('git init', { cwd: tmpRepo.dbPath, stdio: 'pipe' });
+      await fs.writeFile(path.join(tmpRepo.dbPath, 'tracked.ts'), 'export const tracked = true;\n');
+      execSync('git add tracked.ts', { cwd: tmpRepo.dbPath, stdio: 'pipe' });
       execSync('git -c user.name=test -c user.email=test@test commit --allow-empty -m init', {
         cwd: tmpRepo.dbPath,
         stdio: 'pipe',

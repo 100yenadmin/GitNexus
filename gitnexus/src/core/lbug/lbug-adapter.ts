@@ -868,7 +868,7 @@ export const acquireLbugOwnership = async (
         frozenStorageOwnership = initialStorageOwnership;
         return;
       }
-      if (storageOwnership) {
+      if (frozenStoragePath !== undefined) {
         if (frozenStoragePath === resolvedStoragePath) return;
         throw new Error('Analyze storage ownership is already frozen to a different target');
       }
