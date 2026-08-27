@@ -2402,7 +2402,12 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                   if (graphStats.nodes === 0 && graphStats.edges === 0) {
                     const clearedMeta = {
                       ...embeddingMeta,
-                      stats: { ...embeddingMeta.stats, ...graphStats, embeddings: 0 },
+                      stats: {
+                        ...embeddingMeta.stats,
+                        ...graphStats,
+                        communities: 0,
+                        embeddings: 0,
+                      },
                       embeddingCheckpoint: undefined,
                     };
                     await commitEmbedMetadata(barrier, 'COMMITTING_TERMINAL', async () => {
