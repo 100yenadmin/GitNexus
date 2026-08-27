@@ -610,6 +610,39 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     );
   });
 
+  it('stops a cancelled embedding job after ownership admission without starting work', async () => {
+    let admitOwnership!: (lease: { release: () => Promise<void> }) => void;
+    state.acquireLbugOwnership.mockImplementationOnce(
+      async () =>
+        new Promise<{ release: () => Promise<void> }>((resolve) => {
+          admitOwnership = resolve;
+        }),
+    );
+
+    const response = await fetch(`${baseUrl}/api/embed`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ repo: REPO.name }),
+    });
+    expect(response.status).toBe(202);
+    const { jobId } = (await response.json()) as { jobId: string };
+    await vi.waitFor(() => expect(state.acquireLbugOwnership).toHaveBeenCalledOnce());
+
+    const cancelled = await fetch(`${baseUrl}/api/embed/${jobId}`, { method: 'DELETE' });
+    expect(cancelled.status).toBe(200);
+    admitOwnership({ release: state.releaseOwnershipLease });
+
+    await expect(waitForTerminalJob(baseUrl, jobId)).resolves.toMatchObject({
+      status: 'failed',
+      error: 'Cancelled by user',
+    });
+    expect(state.loadMeta).not.toHaveBeenCalled();
+    expect(state.runEmbeddingPipeline).not.toHaveBeenCalled();
+    expect(state.saveMeta).not.toHaveBeenCalled();
+    expect(state.registerRepo).not.toHaveBeenCalled();
+    expect(state.releaseOwnershipLease).toHaveBeenCalledOnce();
+  });
+
   it('reports ownership cleanup failure together with the embedding failure', async () => {
     state.loadMeta.mockRejectedValueOnce(new Error('preflight failed'));
     state.releaseOwnershipLease.mockRejectedValue(new Error('release retries exhausted'));

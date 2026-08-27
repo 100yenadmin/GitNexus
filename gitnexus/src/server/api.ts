@@ -2316,6 +2316,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
               frozenOwner.canonicalStoragePath,
               frozenOwner.canonicalPath,
             );
+            embedController.signal.throwIfAborted();
             const lbugPath = path.join(frozenOwner.canonicalStoragePath, 'lbug');
             const { inspectEmbeddingIntegrity } = await import('../core/lbug/lbug-adapter.js');
             const tentativeMeta = await loadMeta(frozenOwner.canonicalStoragePath);

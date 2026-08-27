@@ -74,6 +74,19 @@ describe('Ladybug writable ownership admission', () => {
     await lease.release();
   });
 
+  it('waits for an in-flight same-target storage acquisition before returning', async () => {
+    const { repoRoot, storagePath } = await makePaths();
+    const lease = await acquireLbugOwnership(storagePath, repoRoot);
+    await fs.mkdir(storagePath);
+
+    const firstAcquisition = lease.acquireStorage(storagePath);
+    await lease.acquireStorage(storagePath);
+    await lease.attachWorker(process.pid);
+    await firstAcquisition;
+
+    await lease.release();
+  });
+
   it('does not borrow another lease when distinct companions target one new storage path', async () => {
     const { storagePath } = await makePaths();
     const firstRepoRoot = path.join(path.dirname(storagePath), 'first-repo');
