@@ -1021,7 +1021,10 @@ describe('POST /api/embed completed-checkpoint identity', () => {
         }),
       },
     );
-    expect(state.saveMeta).toHaveBeenCalledWith(REPO.storagePath, expect.anything());
+    expect(state.saveMeta).toHaveBeenCalledWith(
+      canonicalizePath(REPO.storagePath),
+      expect.anything(),
+    );
     expect(state.currentMeta.stats).toEqual({ nodes: 0, edges: 0, embeddings: 0 });
     expect(state.currentMeta.remoteUrl).toBeUndefined();
     expect(state.currentMeta.embeddingCheckpoint).toBeUndefined();
@@ -1253,7 +1256,11 @@ describe('POST /api/embed completed-checkpoint identity', () => {
       const removeResponse = fetch(`${baseUrl}/api/repo?repo=${encodeURIComponent(entry.name)}`, {
         method: 'DELETE',
       });
-      await vi.waitFor(() => expect(state.unregisterRepo).toHaveBeenCalledOnce());
+      // Windows obtains real process-generation tokens for the nested companion
+      // and storage ownership claims before entering the delete callback.
+      await vi.waitFor(() => expect(state.unregisterRepo).toHaveBeenCalledOnce(), {
+        timeout: 30_000,
+      });
       await expect(fs.lstat(entry.storagePath)).rejects.toMatchObject({ code: 'ENOENT' });
 
       await expect(
