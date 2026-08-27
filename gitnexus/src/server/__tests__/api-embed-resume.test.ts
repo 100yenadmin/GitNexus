@@ -51,6 +51,7 @@ const state = {
   identity: vi.fn(),
   releaseOwnership: vi.fn(async () => undefined),
   acquireOwnership: vi.fn(async () => ({ release: state.releaseOwnership })),
+  withLbugReadOnlyNonRecovering: vi.fn(async (_path: string, run: () => Promise<unknown>) => run()),
   withLbugDb: vi.fn(async (_path: string, run: () => Promise<unknown>) => run()),
 };
 
@@ -70,6 +71,7 @@ vi.doMock('../../core/lbug/lbug-adapter.js', () => ({
   streamQuery: vi.fn(async () => undefined),
   flushWAL: vi.fn(async () => undefined),
   closeLbug: vi.fn(async () => undefined),
+  withLbugReadOnlyNonRecovering: state.withLbugReadOnlyNonRecovering,
   withLbugDb: state.withLbugDb,
   isReadOnlyDbError: vi.fn(() => false),
   inspectEmbeddingIntegrity: state.inspect,
@@ -155,6 +157,7 @@ describe('POST /api/embed checkpoint recovery', () => {
     state.identity.mockReset();
     state.acquireOwnership.mockClear();
     state.releaseOwnership.mockClear();
+    state.withLbugReadOnlyNonRecovering.mockClear();
     state.saveMeta.mockClear();
     state.withLbugDb.mockClear();
   });
