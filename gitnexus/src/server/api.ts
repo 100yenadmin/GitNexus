@@ -295,7 +295,11 @@ const assertFrozenZeroClearRegistryOwner = (
 };
 
 export type EmbedCommitPhase =
-  'RUNNING' | 'COMMITTING_CHECKPOINT' | 'COMMITTING_TERMINAL' | 'COMPLETE' | 'FAILED';
+  | 'RUNNING'
+  | 'COMMITTING_CHECKPOINT'
+  | 'COMMITTING_TERMINAL'
+  | 'COMPLETE'
+  | 'FAILED';
 
 export interface EmbedCommitBarrier {
   phase: EmbedCommitPhase;
