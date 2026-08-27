@@ -61,7 +61,7 @@ describe('runFullAnalysis --staged', () => {
     const repo = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-staged-conflict-'));
     tempDirs.push(repo);
     await fs.writeFile(path.join(repo, 'index.ts'), 'export const value = 1;\n');
-    execFileSync('git', ['init'], { cwd: repo });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: repo });
     execFileSync('git', ['add', 'index.ts'], { cwd: repo });
     execFileSync(
       'git',
