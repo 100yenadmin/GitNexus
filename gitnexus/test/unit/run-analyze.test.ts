@@ -76,7 +76,7 @@ describe('run-analyze module', () => {
       'utf-8',
     );
     expect(source).toMatch(
-      /const completedIntegrity = await withLbugDb\(\s*lbugPath,\s*inspectEmbeddingIntegrity/,
+      /const completedIntegrity = await withLbugDb\(\s*lbugPath,\s*\(\) =>\s*inspectEmbeddingIntegrity\(\s*undefined,\s*checkpointToVerify\.physicalRowsSha256 !== undefined/,
     );
   });
 
