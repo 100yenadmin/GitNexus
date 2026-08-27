@@ -1016,8 +1016,8 @@ describe('POST /api/embed completed-checkpoint identity', () => {
         commitReceipt: expect.objectContaining({ value: expect.anything() }),
         expectedOwner: expect.objectContaining({
           ...enrichedRepo,
-          canonicalPath: enrichedRepo.path,
-          canonicalStoragePath: enrichedRepo.storagePath,
+          canonicalPath: canonicalizePath(enrichedRepo.path),
+          canonicalStoragePath: canonicalizePath(enrichedRepo.storagePath),
         }),
       },
     );
