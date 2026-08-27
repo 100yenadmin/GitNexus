@@ -2265,6 +2265,17 @@ describe('POST /api/embed completed-checkpoint identity', () => {
 
     expect((await runEmbedJob(baseUrl, REPO.name)).status).toBe('complete');
     expect(state.getStrictLbugStats).toHaveBeenCalledOnce();
+    expect(state.registerRepo).toHaveBeenCalledOnce();
+    expect(state.registerRepo).toHaveBeenCalledWith(
+      REPO.path,
+      expect.objectContaining({ stats: { nodes: 4, edges: 5, embeddings: 3 } }),
+      expect.objectContaining({
+        name: REPO.name,
+        allowDuplicateName: true,
+        expectedOwner: expect.objectContaining(REPO),
+        commitReceipt: expect.objectContaining({ value: expect.anything() }),
+      }),
+    );
     expect(state.currentMeta.stats).toEqual({ nodes: 4, edges: 5, embeddings: 3 });
     expect(state.currentMeta.embeddingCheckpoint).toBeUndefined();
   });

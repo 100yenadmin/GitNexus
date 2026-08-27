@@ -2383,6 +2383,11 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
               ) {
                 throw new Error(API_METADATA_DRIFT_CONTEXT);
               }
+              const persistedCheckpointNeedsRegistryReconciliation =
+                !authoritativeLegacy &&
+                embeddingMeta.embeddingCheckpoint !== undefined &&
+                (embeddingMeta.stats?.nodes !== frozenOwner.stats?.nodes ||
+                  embeddingMeta.stats?.edges !== frozenOwner.stats?.edges);
               let priorCheckpoint = embeddingMeta.embeddingCheckpoint;
               if (isEmptyLegacyCheckpoint(priorCheckpoint)) {
                 const integrity = await inspectEmbeddingIntegrity();
@@ -2620,7 +2625,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                 },
                 embeddingCheckpoint: undefined,
               };
-              if (reconciledGraphStats) {
+              if (reconciledGraphStats || persistedCheckpointNeedsRegistryReconciliation) {
                 await commitEmbedMetadata(barrier, 'COMMITTING_TERMINAL', async () => {
                   const owner = await assertZeroClearRegistryOwner(frozenOwner, terminalMeta);
                   const commitReceipt: import('../storage/repo-manager.js').RegistryCommitReceiptRef =
