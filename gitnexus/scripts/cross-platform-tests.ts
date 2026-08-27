@@ -170,6 +170,14 @@ const FILESYSTEM = [
   'test/integration/filesystem-walker.test.ts',
   'test/integration/markdown-processor-crlf.test.ts',
   'test/integration/ignore-and-skip-e2e.test.ts',
+  // Embed/delete lock identity is sensitive to symlink and disappearing-root
+  // behavior on the real filesystem (#279).
+  'test/integration/api-embed-checkpoint-identity.test.ts',
+  // Analyze ownership recovery uses real hard-link/unlink behavior (#284).
+  'test/unit/staged-promotion.test.ts',
+  'test/unit/repo-manager-writer-lock.test.ts',
+  'test/unit/repo-manager-adopt-rebase.test.ts',
+  'test/unit/repo-manager-transient-error.test.ts',
 ];
 
 const ALL_CROSS_PLATFORM = [

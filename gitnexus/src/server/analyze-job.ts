@@ -31,6 +31,9 @@ export interface AnalyzeJob {
   completedAt?: number;
   /** Number of times the worker has been retried after a crash. */
   retryCount: number;
+  /** Internal parent-launcher cancellation state retained until cleanup finishes. */
+  deferCancellationUntilCleanup?: boolean;
+  cancellationReason?: string;
 }
 
 const JOB_TTL_MS = 60 * 60 * 1000; // 1 hour
@@ -162,10 +165,21 @@ export class JobManager {
     this.abortControllers.set(jobId, controller);
   }
 
-  /** Cancel a running job — sends SIGTERM to child process. */
-  cancelJob(jobId: string, reason?: string): boolean {
+  /** Let the parent launcher publish cancellation only after its owned cleanup finishes. */
+  deferCancellationFinalization(jobId: string): void {
     const job = this.jobs.get(jobId);
-    if (!job || this.isTerminal(job.status)) return false;
+    if (job && !this.isTerminal(job.status)) job.deferCancellationUntilCleanup = true;
+  }
+
+  /** Cancel a running job — sends SIGTERM to child process. */
+  cancelJob(jobId: string, reason?: string): AnalyzeJob | undefined {
+    const job = this.jobs.get(jobId);
+    if (!job || this.isTerminal(job.status)) return undefined;
+
+    const cancellationReason = reason || 'Analysis cancelled';
+    if (job.deferCancellationUntilCleanup) {
+      job.cancellationReason ??= cancellationReason;
+    }
 
     const child = this.children.get(jobId);
     if (child) {
@@ -174,12 +188,14 @@ export class JobManager {
     this.abortControllers.get(jobId)?.abort();
     this.abortControllers.delete(jobId);
 
+    if (job.deferCancellationUntilCleanup) return job;
+
     this.updateJob(jobId, {
       status: 'failed',
-      error: reason || 'Analysis cancelled',
+      error: cancellationReason,
     });
 
-    return true;
+    return job;
   }
 
   /** Subscribe to progress events for a job. Returns unsubscribe function. */

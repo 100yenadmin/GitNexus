@@ -9,8 +9,8 @@ describe('API embedding checkpoint identity foundation', () => {
       'utf8',
     );
 
-    expect(source).toMatch(/priorCheckpoint\.provider === undefined/);
-    expect(source).toMatch(/priorCheckpoint\.provider !== embeddingIdentity\.provider/);
+    expect(source).toMatch(/isEmptyLegacyCheckpoint\(tentativeCheckpoint\)/);
+    expect(source).toMatch(/tentativeCheckpoint\.provider !== embeddingIdentity\.provider/);
     expect(source).toMatch(/unknown-provider/);
     expect(source).toMatch(/embeddingCheckpoint:\s*\{[\s\S]*\.\.\.embeddingIdentity/);
   });

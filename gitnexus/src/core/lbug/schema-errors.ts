@@ -8,3 +8,11 @@ export const isMissingColumnOrTableError = (message: string): boolean =>
   // Kuzu-specific: "(table|column|property) ... not found" — narrow enough to avoid
   // matching transient errors like "connection not found" or "key not found".
   /(table|column|property).*not found/i.test(message);
+
+/** Match only LadybugDB's explicit missing-table error for the expected table. */
+export const isExpectedMissingTableError = (message: string, expectedTable: string): boolean => {
+  const escapedTable = expectedTable.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`^Binder exception:\\s*Table\\s+${escapedTable}\\s+does not exist\\.?$`).test(
+    message.trim(),
+  );
+};

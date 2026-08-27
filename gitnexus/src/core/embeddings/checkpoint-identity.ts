@@ -2,9 +2,14 @@ import type { EmbeddingIntegrityReport } from '../lbug/lbug-adapter.js';
 import type { RepoMeta } from '../../storage/repo-manager.js';
 
 const embeddingIntegrityFailures = (report: EmbeddingIntegrityReport): number =>
-  report.emptyIdRows + report.emptyNodeIdRows + report.invalidChunkRows +
-  report.noncanonicalIdRows + report.duplicateIdRows + report.duplicateSemanticRows +
-  report.orphanRows + report.wrongDimensionRows;
+  report.emptyIdRows +
+  report.emptyNodeIdRows +
+  report.invalidChunkRows +
+  report.noncanonicalIdRows +
+  report.duplicateIdRows +
+  report.duplicateSemanticRows +
+  report.orphanRows +
+  report.wrongDimensionRows;
 
 export const embeddingIntegrityIsClean = (report: EmbeddingIntegrityReport): boolean =>
   embeddingIntegrityFailures(report) === 0 && report.physicalRows === report.validRows;
