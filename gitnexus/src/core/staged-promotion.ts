@@ -1092,6 +1092,13 @@ export interface AnalyzeOwnershipLockOptions {
   repoRoot?: string;
   /** DELETE sets this false so locking an absent generation does not create it. */
   createStoragePath?: boolean;
+  /** Capture the exact in-process storage record owned by this acquisition. */
+  onStorageOwnershipAcquired?: (token: AnalyzeStorageOwnershipToken) => void;
+}
+
+export interface AnalyzeStorageOwnershipToken {
+  readonly lockPath: string;
+  readonly nonce: string;
 }
 
 const releaseOwnedOwnershipLock = async (
@@ -1130,7 +1137,7 @@ const releaseOwnedOwnershipLock = async (
 
 const withOwnershipFileLock = async <T>(
   lockPath: string,
-  operation: () => Promise<T>,
+  operation: (record: StageLockRecord) => Promise<T>,
 ): Promise<T> => {
   const ownerProcessStartToken = await processStartToken(process.pid).catch(() => undefined);
   const record: StageLockRecord = {
@@ -1210,7 +1217,7 @@ const withOwnershipFileLock = async <T>(
       await clearRecoveryClaims(lockPath, record, await requireClaimantStartToken());
     }
     activeOwnershipRecords.set(lockPath, record);
-    return await operation();
+    return await operation(record);
   } catch (error) {
     operationFailed = true;
     operationFailure = error;
@@ -1255,8 +1262,13 @@ const analyzeOwnershipCompanionPath = (repoRoot: string): string => {
   return path.join(path.resolve(getGlobalDir()), 'locks', `analyze-${digest}.lock`);
 };
 
-export const analyzeStorageOwnershipIsHeld = (storagePath: string): boolean =>
-  activeOwnershipRecords.has(path.join(path.resolve(storagePath), 'analyze-staged.lock'));
+export const analyzeStorageOwnershipIsHeld = (
+  storagePath: string,
+  token: AnalyzeStorageOwnershipToken,
+): boolean => {
+  const lockPath = path.join(path.resolve(storagePath), 'analyze-staged.lock');
+  return token.lockPath === lockPath && activeOwnershipRecords.get(lockPath)?.nonce === token.nonce;
+};
 
 type AttachedWorkerGeneration = NonNullable<StageLockRecord['attachedWorker']>;
 
@@ -1322,6 +1334,7 @@ export const attachAnalyzeOwnershipWorker = async (
   storagePath: string,
   repoRoot: string,
   workerPid: number,
+  storageOwnership: AnalyzeStorageOwnershipToken,
 ): Promise<void> => {
   const workerStartToken = await readVerifiedProcessStartToken(workerPid, 'analyze worker');
   if (!workerStartToken) {
@@ -1340,6 +1353,11 @@ export const attachAnalyzeOwnershipWorker = async (
   if (!activeOwnershipRecords.has(lockPaths[0])) {
     throw new AnalyzeOwnershipConflictError(
       'Analyze companion ownership is not held by this parent; refusing to attach a worker.',
+    );
+  }
+  if (!analyzeStorageOwnershipIsHeld(storagePath, storageOwnership)) {
+    throw new AnalyzeOwnershipConflictError(
+      'Analyze storage ownership is not held by this lease; refusing to attach a worker.',
     );
   }
   const records = lockPaths.flatMap((lockPath) => {
@@ -1413,13 +1431,17 @@ export const withAnalyzeOwnershipLock = async <T>(
 
     // Keep the existing filename so an older staged writer and a newer ordinary
     // writer still contend during an in-place upgrade.
-    return withOwnershipFileLock(path.join(lockedStoragePath, 'analyze-staged.lock'), operation);
+    const lockPath = path.join(lockedStoragePath, 'analyze-staged.lock');
+    return withOwnershipFileLock(lockPath, (record) => {
+      options.onStorageOwnershipAcquired?.({ lockPath, nonce: record.nonce });
+      return operation();
+    });
   };
 
   if (!options.repoRoot) return withStorageLock();
   const companionPath = analyzeOwnershipCompanionPath(options.repoRoot);
   await fs.mkdir(path.dirname(companionPath), { recursive: true, mode: 0o700 });
-  return withOwnershipFileLock(companionPath, withStorageLock);
+  return withOwnershipFileLock(companionPath, () => withStorageLock());
 };
 
 /** @deprecated Use the common ownership lock so plain and staged writers cannot overlap. */
