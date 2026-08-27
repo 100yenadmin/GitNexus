@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'child_process';
 import { createHash } from 'crypto';
+import { readFileSync } from 'fs';
 import fs from 'fs/promises';
 import os from 'os';
 import path from 'path';
@@ -58,7 +59,7 @@ const deadRecoveryLeaseSourcePath = (lockPath: string): string =>
 const currentProcessStartToken = (): string => {
   let identity: string;
   if (process.platform === 'linux') {
-    const stat = execFileSync('/bin/cat', [`/proc/${process.pid}/stat`], { encoding: 'utf8' });
+    const stat = readFileSync(`/proc/${process.pid}/stat`, 'utf8');
     const fields = stat
       .slice(stat.lastIndexOf(')') + 2)
       .trim()

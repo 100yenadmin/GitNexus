@@ -295,11 +295,7 @@ const assertFrozenZeroClearRegistryOwner = (
 };
 
 export type EmbedCommitPhase =
-  | 'RUNNING'
-  | 'COMMITTING_CHECKPOINT'
-  | 'COMMITTING_TERMINAL'
-  | 'COMPLETE'
-  | 'FAILED';
+  'RUNNING' | 'COMMITTING_CHECKPOINT' | 'COMMITTING_TERMINAL' | 'COMPLETE' | 'FAILED';
 
 export interface EmbedCommitBarrier {
   phase: EmbedCommitPhase;
@@ -2828,9 +2824,10 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
     if (barrier) {
       const phaseAtRequest = barrier.phase;
       const cancellationAlreadyRequested = barrier.cancelRequested;
-      const outcome = requestEmbedCancellation(barrier, 'Cancelled by user', () =>
-        embedAborters.get(jobId)?.(),
-      );
+      const abortEmbedding = embedAborters.get(jobId);
+      const outcome = requestEmbedCancellation(barrier, 'Cancelled by user', () => {
+        if (abortEmbedding) abortEmbedding();
+      });
       const acceptedDeferredCancellation =
         !cancellationAlreadyRequested &&
         phaseAtRequest === 'COMMITTING_CHECKPOINT' &&
