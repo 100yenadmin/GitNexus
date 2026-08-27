@@ -57,9 +57,16 @@ withTestLbugDB(
     it('runs legacy preflight and writable revalidation through native LadybugDB', async () => {
       const adapter = await import('../../src/core/lbug/lbug-adapter.js');
       const storagePath = path.dirname(handle.dbPath);
+      const repoPath = path.join(storagePath, 'repo-root');
+      await fs.mkdir(repoPath, { recursive: true });
+      await fs.symlink(
+        storagePath,
+        path.join(repoPath, '.gitnexus'),
+        process.platform === 'win32' ? 'junction' : 'dir',
+      );
       const repo: RegistryEntry = {
         name: 'native-legacy',
-        path: '/virtual/native-legacy',
+        path: repoPath,
         storagePath,
         indexedAt: '2026-08-23T00:00:00.000Z',
         lastCommit: 'native-head',
@@ -86,9 +93,23 @@ withTestLbugDB(
       const loadMeta = vi.fn(async () => {
         loadCount++;
         if (injectWritableDrift && loadCount === 3) {
-          await adapter.executeQuery(
-            `CREATE (e:CodeEmbedding {id:'native-row', nodeId:'Function:native.ts:run', chunkIndex:0, startLine:1, endLine:1, embedding:[${zeroVector}], contentHash:'native-hash'})`,
-          );
+          // This callback runs inside withLbugDb's serialized session. Calling
+          // adapter.executeQuery here would recursively wait on that same
+          // session lock. Use a second native connection on the already-open
+          // Database so the fixture can inject the between-preflight drift
+          // without weakening production's single-session boundary.
+          const db = adapter.getDatabase();
+          if (!db) throw new Error('native drift fixture has no open Database');
+          const lbug = (await import('@ladybugdb/core')).default;
+          const driftConnection = new lbug.Connection(db);
+          try {
+            const result = await driftConnection.query(
+              `CREATE (e:CodeEmbedding {id:'native-row', nodeId:'Function:native.ts:run', chunkIndex:0, startLine:1, endLine:1, embedding:[${zeroVector}], contentHash:'native-hash'})`,
+            );
+            result.close();
+          } finally {
+            await driftConnection.close().catch(() => {});
+          }
         }
         return meta;
       });
@@ -165,7 +186,10 @@ withTestLbugDB(
             headers: { 'content-type': 'application/json' },
             body: JSON.stringify({ repo: repo.name }),
           });
-          const { jobId } = (await response.json()) as { jobId: string };
+          const payload = (await response.json()) as { jobId?: string; error?: string };
+          if (!payload.jobId)
+            throw new Error(payload.error ?? `embed submission failed (${response.status})`);
+          const jobId = payload.jobId;
           return waitForJob(baseUrl, jobId);
         };
         expect((await submit()).status).toBe('complete');
