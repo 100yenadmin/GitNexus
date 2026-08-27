@@ -1530,7 +1530,11 @@ export const registerRepo = async (
         match.owner.lastCommit !== expected.lastCommit ||
         match.owner.indexedAt !== expected.indexedAt
       ) {
-        throw new Error('GitNexus: expected registry owner changed during locked commit');
+        throw new Error(
+          'GitNexus: expected registry owner changed during locked commit. ' +
+            'Wait for the current repository operation to finish and retry. ' +
+            'If this repeats, inspect concurrent analyze/embed activity.',
+        );
       }
       freshIdx = match.index;
     } else {

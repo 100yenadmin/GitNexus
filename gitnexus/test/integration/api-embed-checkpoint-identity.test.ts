@@ -1516,7 +1516,11 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     state.liveIntegrity = makeIntegrity(LIVE_DIGEST, 0);
     state.executeQuery.mockResolvedValue([]);
     state.registerRepo.mockRejectedValueOnce(
-      new Error('GitNexus: expected registry owner changed during locked commit'),
+      new Error(
+        'GitNexus: expected registry owner changed during locked commit. ' +
+          'Wait for the current repository operation to finish and retry. ' +
+          'If this repeats, inspect concurrent analyze/embed activity.',
+      ),
     );
     const checkpointBefore = JSON.stringify(state.currentMeta.embeddingCheckpoint);
 
@@ -1530,7 +1534,10 @@ describe('POST /api/embed completed-checkpoint identity', () => {
 
     expect(job).toMatchObject({
       status: 'failed',
-      error: 'GitNexus: expected registry owner changed during locked commit',
+      error:
+        'GitNexus: expected registry owner changed during locked commit. ' +
+        'Wait for the current repository operation to finish and retry. ' +
+        'If this repeats, inspect concurrent analyze/embed activity.',
     });
     expect(state.registerRepo).toHaveBeenCalledOnce();
     expect(state.saveMeta).not.toHaveBeenCalled();

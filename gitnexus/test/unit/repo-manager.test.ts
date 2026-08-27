@@ -1052,7 +1052,10 @@ describe('registerRepo expected owner CAS (#264)', () => {
   let tmpHome: Awaited<ReturnType<typeof createTempDir>>;
   let tmpRepo: Awaited<ReturnType<typeof createTempDir>>;
   let savedGitnexusHome: string | undefined;
-  const casError = 'GitNexus: expected registry owner changed during locked commit';
+  const casError =
+    'GitNexus: expected registry owner changed during locked commit. ' +
+    'Wait for the current repository operation to finish and retry. ' +
+    'If this repeats, inspect concurrent analyze/embed activity.';
 
   const meta = (lastCommit: string): RepoMeta => ({
     repoPath: tmpRepo.dbPath,
