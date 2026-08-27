@@ -39,6 +39,7 @@ export async function runWorkerAnalysis(
   repoPath: string,
   options: AnalyzeOptions,
   deps: WorkerAnalysisDeps,
+  internal: { parentAnalyzeOwnershipHeld?: boolean } = {},
 ): Promise<void> {
   let terminal: WorkerMessage;
   try {
@@ -53,13 +54,14 @@ export async function runWorkerAnalysis(
           deps.send({ type: 'progress', phase, percent, message }),
         onLog: (message) => deps.send({ type: 'progress', phase: 'log', percent: -1, message }),
       },
+      internal,
     );
     // P2 (#2264): a half-finalized repo — meta.json written but the global
     // registry entry missing (e.g. a prior collision-aborted run, or a wiped
     // registry) — must NOT be reported as a successful analysis. Mirror the CLI's
     // assertAnalysisFinalized guard so the worker surfaces it as an error instead
     // of a false `complete` that leaves the repo invisible to list_repos.
-    await deps.assertAnalysisFinalized(repoPath);
+    await deps.assertAnalysisFinalized(repoPath, options.analyzeStoragePath);
 
     // Send a JSON-safe projection, NOT the raw result: the IPC channel is
     // default-JSON serialization and `result.pipelineResult` carries the live
