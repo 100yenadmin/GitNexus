@@ -2399,60 +2399,62 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                   embedController.signal.throwIfAborted();
                   const graphStats = await getStrictLbugStats();
                   embedController.signal.throwIfAborted();
-                  const clearedMeta = {
-                    ...embeddingMeta,
-                    stats: { ...embeddingMeta.stats, ...graphStats, embeddings: 0 },
-                    embeddingCheckpoint: undefined,
-                  };
-                  await commitEmbedMetadata(barrier, 'COMMITTING_TERMINAL', async () => {
-                    const owner = await assertZeroClearRegistryOwner(frozenOwner, clearedMeta);
-                    const commitReceipt: import('../storage/repo-manager.js').RegistryCommitReceiptRef =
-                      {};
-                    await registerRepo(owner.path, clearedMeta, {
-                      name: owner.name,
-                      allowDuplicateName: true,
-                      expectedOwner: owner,
-                      commitReceipt,
-                    });
-                    let metadataCommitted = false;
-                    try {
-                      const provenStoragePath = assertFrozenZeroClearRegistryOwner(
-                        owner,
-                        clearedMeta,
-                      );
-                      await saveMeta(provenStoragePath, clearedMeta);
-                      metadataCommitted = true;
-                      // The display path can retarget while the async metadata
-                      // save succeeds. Revalidate after persistence so success
-                      // never advertises a different physical owner.
-                      await assertZeroClearRegistryOwner(owner, clearedMeta);
-                    } catch (error) {
-                      const rollbackErrors: unknown[] = [error];
-                      if (commitReceipt.value) {
-                        try {
-                          await rollbackRegistryCommit(commitReceipt.value);
-                        } catch (rollbackError) {
-                          rollbackErrors.push(rollbackError);
-                        }
-                      }
-                      if (metadataCommitted) {
-                        try {
-                          await saveMeta(owner.canonicalStoragePath, embeddingMeta);
-                        } catch (rollbackError) {
-                          rollbackErrors.push(rollbackError);
-                        }
-                      }
-                      if (rollbackErrors.length > 1) {
-                        throw new AggregateError(
-                          rollbackErrors,
-                          'Embedding metadata commit failed and transactional rollback was incomplete',
+                  if (graphStats.nodes === 0 && graphStats.edges === 0) {
+                    const clearedMeta = {
+                      ...embeddingMeta,
+                      stats: { ...embeddingMeta.stats, ...graphStats, embeddings: 0 },
+                      embeddingCheckpoint: undefined,
+                    };
+                    await commitEmbedMetadata(barrier, 'COMMITTING_TERMINAL', async () => {
+                      const owner = await assertZeroClearRegistryOwner(frozenOwner, clearedMeta);
+                      const commitReceipt: import('../storage/repo-manager.js').RegistryCommitReceiptRef =
+                        {};
+                      await registerRepo(owner.path, clearedMeta, {
+                        name: owner.name,
+                        allowDuplicateName: true,
+                        expectedOwner: owner,
+                        commitReceipt,
+                      });
+                      let metadataCommitted = false;
+                      try {
+                        const provenStoragePath = assertFrozenZeroClearRegistryOwner(
+                          owner,
+                          clearedMeta,
                         );
+                        await saveMeta(provenStoragePath, clearedMeta);
+                        metadataCommitted = true;
+                        // The display path can retarget while the async metadata
+                        // save succeeds. Revalidate after persistence so success
+                        // never advertises a different physical owner.
+                        await assertZeroClearRegistryOwner(owner, clearedMeta);
+                      } catch (error) {
+                        const rollbackErrors: unknown[] = [error];
+                        if (commitReceipt.value) {
+                          try {
+                            await rollbackRegistryCommit(commitReceipt.value);
+                          } catch (rollbackError) {
+                            rollbackErrors.push(rollbackError);
+                          }
+                        }
+                        if (metadataCommitted) {
+                          try {
+                            await saveMeta(owner.canonicalStoragePath, embeddingMeta);
+                          } catch (rollbackError) {
+                            rollbackErrors.push(rollbackError);
+                          }
+                        }
+                        if (rollbackErrors.length > 1) {
+                          throw new AggregateError(
+                            rollbackErrors,
+                            'Embedding metadata commit failed and transactional rollback was incomplete',
+                          );
+                        }
+                        throw error;
                       }
-                      throw error;
-                    }
-                  });
-                  embeddingMeta = clearedMeta;
-                  return;
+                    });
+                    embeddingMeta = clearedMeta;
+                    return;
+                  }
                 }
                 // Keep the old checkpoint persisted until the fresh pipeline
                 // either records a new window or finalizes successfully.

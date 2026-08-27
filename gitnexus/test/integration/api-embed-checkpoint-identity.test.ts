@@ -105,7 +105,7 @@ const state = {
   runEmbeddingPipeline: vi.fn(async (..._args: unknown[]) => undefined),
   getActiveEmbeddingIdentity: vi.fn(() => identity),
   inspectEmbeddingIntegrity: vi.fn(async () => state.liveIntegrity),
-  getStrictLbugStats: vi.fn(async () => ({ nodes: 4, edges: 5 })),
+  getStrictLbugStats: vi.fn(async () => ({ nodes: 0, edges: 0 })),
   registerRepo: vi.fn(
     async (
       _repoPath?: string,
@@ -408,7 +408,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     state.inspectEmbeddingIntegrity.mockReset();
     state.inspectEmbeddingIntegrity.mockImplementation(async () => state.liveIntegrity);
     state.getStrictLbugStats.mockReset();
-    state.getStrictLbugStats.mockResolvedValue({ nodes: 4, edges: 5 });
+    state.getStrictLbugStats.mockResolvedValue({ nodes: 0, edges: 0 });
     state.runEmbeddingPipeline.mockReset();
     state.runEmbeddingPipeline.mockResolvedValue(undefined);
     state.registerRepo.mockReset();
@@ -901,6 +901,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
       recoverableIdentitySha256: undefined,
     };
     state.liveIntegrity = { ...state.liveIntegrity, physicalRows: 0, validRows: 0 };
+    state.getStrictLbugStats.mockResolvedValueOnce({ nodes: 0, edges: 0 });
     state.executeQuery.mockImplementation(async (query: string) =>
       query.includes('MATCH (n:`File`)') && !query.includes("trim(n.content) <> ''")
         ? [{ id: 'File:whitespace', content: '   ' }]
@@ -933,7 +934,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     expect(state.registerRepo).toHaveBeenCalledWith(
       REPO.path,
       expect.objectContaining({
-        stats: { nodes: 4, edges: 5, embeddings: 0 },
+        stats: { nodes: 0, edges: 0, embeddings: 0 },
         embeddingCheckpoint: undefined,
       }),
       {
@@ -948,7 +949,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
       },
     );
     expect(state.saveMeta).toHaveBeenCalledWith(REPO.storagePath, expect.anything());
-    expect(state.currentMeta.stats).toEqual({ nodes: 4, edges: 5, embeddings: 0 });
+    expect(state.currentMeta.stats).toEqual({ nodes: 0, edges: 0, embeddings: 0 });
     expect(state.currentMeta.remoteUrl).toBeUndefined();
     expect(state.currentMeta.embeddingCheckpoint).toBeUndefined();
   });
@@ -1414,7 +1415,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     state.listRegisteredRepos.mockResolvedValue([fixture.raceRepo]);
     state.getStrictLbugStats.mockImplementationOnce(async () => {
       await fixture.retarget();
-      return { nodes: 4, edges: 5 };
+      return { nodes: 0, edges: 0 };
     });
 
     await runSymlinkRace(
@@ -1583,7 +1584,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     expect((await waitForTerminalJob(baseUrl, retryJobId)).status).toBe('complete');
     expect(state.registerRepo).toHaveBeenCalledTimes(2);
     expect(state.saveMeta).toHaveBeenCalledTimes(2);
-    expect(state.currentMeta.stats).toEqual({ nodes: 4, edges: 5, embeddings: 0 });
+    expect(state.currentMeta.stats).toEqual({ nodes: 0, edges: 0, embeddings: 0 });
     expect(state.currentMeta.embeddingCheckpoint).toBeUndefined();
   });
 
@@ -1686,6 +1687,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     };
     state.liveIntegrity = makeIntegrity(LIVE_DIGEST, 0);
     state.graphNodes = [];
+    state.getStrictLbugStats.mockResolvedValueOnce({ nodes: 0, edges: 0 });
     const response = await fetch(`${baseUrl}/api/embed`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -1701,6 +1703,36 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     expect(state.getActiveEmbeddingIdentity).not.toHaveBeenCalled();
     expect(state.runEmbeddingPipeline).not.toHaveBeenCalled();
     expect(state.currentMeta.stats?.embeddings).toBe(0);
+    expect(state.currentMeta.embeddingCheckpoint).toBeUndefined();
+  });
+
+  it('runs the embedding pipeline when the strict recount becomes nonempty', async () => {
+    state.currentMeta = makeMeta(LIVE_DIGEST);
+    state.currentMeta.embeddingCheckpoint = {
+      ...state.currentMeta.embeddingCheckpoint!,
+      nodesProcessed: 0,
+      totalNodes: 0,
+      chunksProcessed: 0,
+      provider: undefined,
+      physicalRows: 0,
+      validRows: 0,
+    };
+    state.liveIntegrity = makeIntegrity(LIVE_DIGEST, 0);
+    state.graphNodes = [];
+    state.getStrictLbugStats.mockResolvedValueOnce({ nodes: 4, edges: 5 });
+
+    const response = await fetch(`${baseUrl}/api/embed`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ repo: REPO.name }),
+    });
+    const { jobId } = (await response.json()) as { jobId: string };
+
+    expect((await waitForTerminalJob(baseUrl, jobId)).status).toBe('complete');
+    expect(state.getStrictLbugStats).toHaveBeenCalledOnce();
+    expect(state.getActiveEmbeddingIdentity).toHaveBeenCalledOnce();
+    expect(state.runEmbeddingPipeline).toHaveBeenCalledOnce();
+    expect(state.registerRepo).not.toHaveBeenCalled();
     expect(state.currentMeta.embeddingCheckpoint).toBeUndefined();
   });
 
