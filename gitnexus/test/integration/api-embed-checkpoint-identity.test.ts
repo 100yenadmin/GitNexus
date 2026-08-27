@@ -860,7 +860,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     expect(job.error).toMatch(/but this run resolves/);
     expect(job.error).toMatch(/do not retry POST \/api\/embed/i);
     expect(job.error).toMatch(/gitnexus analyze --force --drop-embeddings --embeddings 0/);
-    expect(job.error).toContain(REPO.path);
+    expect(job.error).toContain(path.resolve(REPO.path));
     expect(job.error).not.toMatch(/POST \/api\/analyze/);
     expect(state.openModes).toEqual([]);
     expect(state.withLbugReadOnlyNonRecovering).not.toHaveBeenCalled();
@@ -889,7 +889,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
 
     expect(job.status).toBe('failed');
     expect(job.error).toMatch(/unknown-provider/i);
-    expect(job.error).toContain(REPO.path);
+    expect(job.error).toContain(path.resolve(REPO.path));
     expect(state.openModes).toEqual([]);
     expect(state.withLbugReadOnlyNonRecovering).not.toHaveBeenCalled();
     expect(state.withLbugDb).not.toHaveBeenCalled();
@@ -1843,7 +1843,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     );
     expect(job.error).toMatch(/do not retry POST \/api\/embed/i);
     expect(job.error).toMatch(/gitnexus analyze --force --drop-embeddings --embeddings 0/);
-    expect(job.error).toContain(REPO.path);
+    expect(job.error).toContain(path.resolve(REPO.path));
     expect(job.error).not.toMatch(/POST \/api\/analyze/);
     expect(state.withLbugDb).not.toHaveBeenCalled();
     expect(state.runEmbeddingPipeline).not.toHaveBeenCalled();
