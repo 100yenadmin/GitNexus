@@ -107,7 +107,10 @@ const state = {
   ),
   runEmbeddingPipeline: vi.fn(async (..._args: unknown[]) => undefined),
   getActiveEmbeddingIdentity: vi.fn(() => identity),
-  inspectEmbeddingIntegrity: vi.fn(async () => state.liveIntegrity),
+  inspectEmbeddingIntegrity: vi.fn(async (_expectedDimensions?: number, fullDigest = false) => ({
+    ...state.liveIntegrity,
+    physicalRowsSha256: fullDigest ? state.liveIntegrity.physicalRowsSha256 : '',
+  })),
   getStrictLbugStats: vi.fn(async () => ({ nodes: 0, edges: 0 })),
   useRealRegistry: false,
   registerRepo: vi.fn(
@@ -481,7 +484,12 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     state.withLbugDb.mockClear();
     state.getActiveEmbeddingIdentity.mockClear();
     state.inspectEmbeddingIntegrity.mockReset();
-    state.inspectEmbeddingIntegrity.mockImplementation(async () => state.liveIntegrity);
+    state.inspectEmbeddingIntegrity.mockImplementation(
+      async (_expectedDimensions?: number, fullDigest = false) => ({
+        ...state.liveIntegrity,
+        physicalRowsSha256: fullDigest ? state.liveIntegrity.physicalRowsSha256 : '',
+      }),
+    );
     state.getStrictLbugStats.mockReset();
     state.getStrictLbugStats.mockResolvedValue({ nodes: 0, edges: 0 });
     state.runEmbeddingPipeline.mockReset();
@@ -799,6 +807,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     state.currentMeta = makeMeta(LIVE_DIGEST);
     state.currentMeta.embeddingCheckpoint = {
       ...state.currentMeta.embeddingCheckpoint!,
+      nodesProcessed: state.currentMeta.embeddingCheckpoint!.totalNodes,
       physicalRowsSha256: undefined,
     };
 
