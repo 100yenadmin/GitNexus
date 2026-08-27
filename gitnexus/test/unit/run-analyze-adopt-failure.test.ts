@@ -172,6 +172,54 @@ describe('fast-path restamp failure modes (#2364 F3)', () => {
     },
   );
 
+  it('preserves the fresher reconciled branch when adoption remains pending', async () => {
+    await fs.writeFile(path.join(tmpRepo.dbPath, 'index.ts'), 'export function value() {}\n');
+    execSync('git init && git add index.ts', { cwd: tmpRepo.dbPath, stdio: 'pipe' });
+    execSync('git -c user.name=t -c user.email=t@t commit -m init', {
+      cwd: tmpRepo.dbPath,
+      stdio: 'pipe',
+    });
+    execSync('git branch -M main', { cwd: tmpRepo.dbPath, stdio: 'pipe' });
+    await runFullAnalysis(
+      tmpRepo.dbPath,
+      { skipAgentsMd: true, skipSkills: true },
+      { onProgress: () => {} },
+    );
+    await seedEmbeddingsForFiles(tmpRepo.dbPath, ['index.ts'], 1);
+
+    const { storagePath } = getStoragePaths(tmpRepo.dbPath);
+    const current = await loadMeta(storagePath);
+    if (!current) throw new Error('expected metadata');
+    const stalePrimary: RepoMeta = {
+      ...current,
+      branch: 'main',
+      indexedAt: '2026-08-25T00:00:00.000Z',
+      stats: { ...current.stats, embeddings: 0 },
+    };
+    const freshLegacy: RepoMeta = {
+      ...stalePrimary,
+      branch: 'release',
+      indexedAt: '2026-08-26T00:00:00.000Z',
+    };
+    await fs.writeFile(
+      path.join(storagePath, 'gitnexus.json'),
+      `${JSON.stringify(stalePrimary, null, 2)}\n`,
+    );
+    await fs.writeFile(
+      path.join(storagePath, 'meta.json'),
+      `${JSON.stringify(freshLegacy, null, 2)}\n`,
+    );
+    execSync('git checkout -b feature/x', { cwd: tmpRepo.dbPath, stdio: 'pipe' });
+    rmCtx.adoptMock.mockResolvedValueOnce('NOT_ADOPTED');
+
+    const result = await runFullAnalysis(tmpRepo.dbPath, {}, {});
+
+    expect(result).toMatchObject({ alreadyUpToDate: true, stats: { embeddings: 1 } });
+    const preserved = await loadMeta(storagePath);
+    expect(preserved?.branch).toBe('release');
+    expect(preserved?.incrementalInProgress?.phase).toBe('branch-adoption');
+  });
+
   it.each(['EROFS', 'EACCES', 'EPERM'] as const)(
     '"Already up to date" still succeeds when the restamp hits %s (#1549, gap 7)',
     async (code) => {

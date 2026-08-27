@@ -880,13 +880,22 @@ const runFullAnalysisImpl = async (
   const implicitFlatBranch =
     !options.branch && !placement.branch && branchLabel ? branchLabel : null;
   const canonicalMetaBeforeAdoption = implicitFlatBranch ? await loadMeta(canonicalMetaDir) : null;
-  const canonicalBranchExistedBeforeAdoption =
+  let canonicalBranchExistedBeforeAdoption =
     canonicalMetaBeforeAdoption !== null &&
     Object.prototype.hasOwnProperty.call(canonicalMetaBeforeAdoption, 'branch');
-  const canonicalBranchBeforeAdoption = canonicalMetaBeforeAdoption?.branch;
-  const implicitFlatBranchAdoptionPending =
+  let canonicalBranchBeforeAdoption = canonicalMetaBeforeAdoption?.branch;
+  let implicitFlatBranchAdoptionPending =
     implicitFlatBranch !== null &&
     (!canonicalBranchExistedBeforeAdoption || canonicalBranchBeforeAdoption !== implicitFlatBranch);
+  const refreshPreAdoptionBranch = (meta: RepoMeta | null): void => {
+    canonicalBranchExistedBeforeAdoption =
+      meta !== null && Object.prototype.hasOwnProperty.call(meta, 'branch');
+    canonicalBranchBeforeAdoption = meta?.branch;
+    implicitFlatBranchAdoptionPending =
+      implicitFlatBranch !== null &&
+      (!canonicalBranchExistedBeforeAdoption ||
+        canonicalBranchBeforeAdoption !== implicitFlatBranch);
+  };
   const preservePreAdoptionBranch = (meta: RepoMeta): RepoMeta => {
     if (!implicitFlatBranch) return meta;
     const protectedMeta = { ...meta };
@@ -1567,6 +1576,10 @@ const runFullAnalysisImpl = async (
       }
     }
     existingMeta = await loadMeta(metaDir);
+    // Reconciliation may select a fresher legacy mirror. All later adoption-
+    // protected writes must preserve that reconciled branch projection, not
+    // the stale primary file observed before reconciliation.
+    if (implicitFlatBranch) refreshPreAdoptionBranch(existingMeta);
   }
 
   // ── FTS-only repair path ────────────────────────────────────────────
