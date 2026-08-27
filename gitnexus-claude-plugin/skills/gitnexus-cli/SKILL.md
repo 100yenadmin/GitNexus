@@ -91,16 +91,23 @@ Lists all repositories registered in `~/.gitnexus/registry.json`. The MCP `list_
 
 Run this workflow after merging one PR or a deliberate batch into the indexed
 default branch, only when the current task owns the post-merge path and indexed
-source actually changed. Refresh at most once per merge or batch.
+source actually changed. At most one initial refresh plus one forced retry
+(two total attempts) per merge or batch.
 
 1. Resolve the exact registered alias and the canonical absolute checkout first
-   (`gitnexus list`); never assume the active worktree is the registered one.
-2. Run the pinned managed wrapper (never raw gitnexus for machine-registered repos):
-   `/Users/m1/Codex/bin/gitnexus-mcp-voyage-wrapper.sh analyze --name <existing-alias> --embeddings --index-only <absolute-repository-path>`
+   (`node .gitnexus/run.cjs list` — the project-local runner); never assume the
+   active worktree is the registered one.
+2. Resolve `<analyze-wrapper>` once: the machine's registered semantic-analyze
+   wrapper when one is pinned (machines managed by an operating kit document
+   the exact path in that kit's runbook — never invoke raw gitnexus for
+   machine-registered repos); on machines with no registered wrapper, the
+   project-local runner `node .gitnexus/run.cjs` fills the role. Then run:
+   `<analyze-wrapper> analyze --name <existing-alias> --embeddings --index-only <absolute-repository-path>`
 3. Verify from that repository:
-   `/Users/m1/Codex/bin/gitnexus-mcp-voyage-wrapper.sh status`
-4. If incremental analysis reports up to date but status still shows an older
-   indexed commit, rerun once with `--force --index-only`. One retry only.
+   `<analyze-wrapper> status`
+4. If incremental analysis reports an up-to-date index but status still shows
+   an older indexed commit, rerun once with `--force --embeddings
+   --index-only`. One retry only.
 5. Never refresh per commit, install a raw Git post-merge hook, or run blind
    recurring analysis; machine-wide reconciliation belongs to the reviewed
    `gitnexus-refresh-coordinator` scan/queue admission path.
