@@ -29,6 +29,12 @@ import type { AnalyzeResultIpc } from './analyze-worker-ipc.js';
 
 const _require = createRequire(import.meta.url);
 
+export interface AnalyzeOwnershipLease {
+  release(): Promise<void>;
+  /** Attach the forked worker before sending its start command. */
+  attachWorker?: (workerPid: number) => Promise<void>;
+}
+
 export interface LaunchDeps {
   jobManager: JobManager;
   backend: { init: () => Promise<unknown> };
@@ -37,7 +43,7 @@ export interface LaunchDeps {
   acquireAnalyzeOwnership: (
     storagePath: string,
     repoRoot: string,
-  ) => Promise<{ release(): Promise<void> }>;
+  ) => Promise<AnalyzeOwnershipLease>;
   /**
    * Drops the server's cached LadybugDB handle (closeLbug). The worker
    * process rewrites the repo's DB files on disk, so a connection opened
@@ -163,7 +169,7 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
     jobManager.deferCancellationFinalization(job.id);
     const lexicalStoragePath = getStoragePath(lockedRepoPath);
     let analyzeStorageLockKey = canonicalRepoLockKey(lockedRepoPath);
-    let ownershipLease: { release(): Promise<void> } | undefined;
+    let ownershipLease: AnalyzeOwnershipLease | undefined;
     let storageLockHeld = false;
     let lockReleased = false;
     const releaseLock = async (): Promise<void> => {
@@ -219,7 +225,7 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
       ? ['--import', pathToFileURL(_require.resolve('tsx/esm')).href]
       : [];
 
-    const forkWorker = () => {
+    const forkWorker = async (): Promise<void> => {
       const currentJob = jobManager.getJob(job.id);
       if (!currentJob || currentJob.status === 'complete' || currentJob.status === 'failed') {
         void releaseLock().catch((err) => {
@@ -424,11 +430,7 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
           });
           stderrChunks = '';
           setTimeout(() => {
-            try {
-              forkWorker();
-            } catch (err) {
-              failSynchronousLaunch(err);
-            }
+            void forkWorker().catch((err) => failSynchronousLaunch(err));
           }, delay);
         } else {
           // Exhausted retries — permanent failure
@@ -444,6 +446,33 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
       try {
         // Register child for cancellation + timeout tracking
         jobManager.registerChild(job.id, child);
+
+        // Record the worker generation before sending its start command. The
+        // parent lease then remains live if this process exits while the child
+        // is still able to mutate the shared storage.
+        if (ownershipLease?.attachWorker) {
+          if (!child.pid)
+            throw new Error('Worker process did not expose a PID for ownership attach');
+          await ownershipLease.attachWorker(child.pid);
+        }
+
+        // Cancellation or an early child failure can arrive while the
+        // process-generation lookup is in flight. Do not send a start command
+        // to a worker that has already been asked to stop.
+        const afterAttach = jobManager.getJob(job.id);
+        if (
+          !afterAttach ||
+          afterAttach.status === 'complete' ||
+          afterAttach.status === 'failed' ||
+          afterAttach.cancellationReason ||
+          terminalMessageReceived ||
+          childExited
+        ) {
+          try {
+            child.kill('SIGTERM');
+          } catch {}
+          return;
+        }
 
         // Send start command to child
         child.send({
@@ -505,7 +534,7 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
         if (storageLockErr) throw new Error(storageLockErr);
         storageLockHeld = true;
         jobManager.updateJob(job.id, { repoPath: targetPath, status: 'analyzing' });
-        forkWorker();
+        void forkWorker().catch((err) => failSynchronousLaunch(err));
       } catch (err) {
         await failSynchronousLaunch(err);
       }

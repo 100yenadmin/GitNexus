@@ -6,6 +6,7 @@ import os from 'os';
 import path from 'path';
 import {
   AnalyzeOwnershipConflictError,
+  attachAnalyzeOwnershipWorker,
   getStagedAnalyzePaths,
   prepareStagedWorkspace,
   promoteStagedGeneration,
@@ -52,6 +53,25 @@ const deadRecoveryClaimPath = (lockPath: string): string =>
 const deadRecoveryLeaseSourcePath = (lockPath: string): string =>
   `${lockPath}.lease-source.${deadRecoveryLeaseRecord.pid}.` +
   `${deadRecoveryLeaseRecord.processStartToken}.${deadRecoveryLeaseRecord.nonce}`;
+
+const currentProcessStartToken = (): string => {
+  let identity: string;
+  if (process.platform === 'linux') {
+    const stat = execFileSync('/bin/cat', [`/proc/${process.pid}/stat`], { encoding: 'utf8' });
+    const fields = stat
+      .slice(stat.lastIndexOf(')') + 2)
+      .trim()
+      .split(/\s+/);
+    identity = `linux:${fields[19]}`;
+  } else {
+    const start = execFileSync('/bin/ps', ['-o', 'lstart=', '-p', String(process.pid)], {
+      encoding: 'utf8',
+      env: { ...process.env, LC_ALL: 'C', LANG: 'C', TZ: 'UTC' },
+    }).trim();
+    identity = `${process.platform}:${start}`;
+  }
+  return createHash('sha256').update(identity).digest('hex').slice(0, 24);
+};
 
 const deadOwnershipPublicationSourcePath = (lockPath: string): string =>
   `${lockPath}.owner-source.${deadRecoveryLeaseRecord.pid}.${deadRecoveryLeaseRecord.nonce}`;
@@ -621,6 +641,79 @@ describe('common analyze ownership lock', () => {
     await expect(withAnalyzeOwnershipLock(root, async () => 'ok')).resolves.toBe('ok');
     await expect(fs.access(lockPath)).rejects.toMatchObject({ code: 'ENOENT' });
     expect(await recoveryEntries(lockPath)).toEqual([]);
+  });
+
+  it('keeps a dead parent lease active while its attached worker generation lives', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-stage-lock-worker-live-'));
+    tempDirs.push(root);
+    const lockPath = path.join(root, 'analyze-staged.lock');
+    await fs.writeFile(
+      lockPath,
+      `${JSON.stringify({
+        schema: 'gitnexus.staged-analyze-lock/v1',
+        pid: 2_147_483_647,
+        nonce: 'dead-parent',
+        startedAt: '2026-07-20T00:00:00.000Z',
+        attachedWorker: { pid: process.pid, processStartToken: currentProcessStartToken() },
+      })}\n`,
+    );
+
+    await expect(withAnalyzeOwnershipLock(root, async () => undefined)).rejects.toThrow(
+      'Another analyze is active',
+    );
+    await fs.writeFile(
+      lockPath,
+      `${JSON.stringify({
+        schema: 'gitnexus.staged-analyze-lock/v1',
+        pid: 2_147_483_647,
+        nonce: 'dead-parent',
+        startedAt: '2026-07-20T00:00:00.000Z',
+        attachedWorker: {
+          pid: 2_147_483_646,
+          processStartToken: 'deadbeefdeadbeefdeadbeef',
+        },
+      })}\n`,
+    );
+    await expect(withAnalyzeOwnershipLock(root, async () => 'reclaimed')).resolves.toBe(
+      'reclaimed',
+    );
+  });
+
+  it('publishes the attached worker before retaining and releasing the parent lease', async () => {
+    const parent = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-stage-lock-worker-attach-'));
+    tempDirs.push(parent);
+    const repoRoot = path.join(parent, 'repo');
+    const storagePath = path.join(repoRoot, '.gitnexus');
+    const home = path.join(parent, 'home');
+    vi.stubEnv('GITNEXUS_HOME', home);
+    await fs.mkdir(storagePath, { recursive: true });
+    let release!: () => void;
+    const held = withAnalyzeOwnershipLock(
+      storagePath,
+      () => new Promise<void>((resolve) => (release = resolve)),
+      { repoRoot },
+    );
+    await vi.waitFor(() => expect(release).toBeTypeOf('function'));
+
+    await attachAnalyzeOwnershipWorker(storagePath, repoRoot, process.pid);
+    const lockEntries = await fs.readdir(path.join(home, 'locks'));
+    const companion = path.join(home, 'locks', lockEntries[0]);
+    const record = JSON.parse(await fs.readFile(companion, 'utf8')) as {
+      attachedWorker?: { pid: number; processStartToken: string };
+    };
+    expect(record.attachedWorker).toMatchObject({
+      pid: process.pid,
+      processStartToken: expect.stringMatching(/^[0-9a-f]{24}$/),
+    });
+
+    await expect(
+      withAnalyzeOwnershipLock(storagePath, async () => undefined, { repoRoot }),
+    ).rejects.toThrow('Another analyze is active');
+    release();
+    await held;
+    await expect(
+      withAnalyzeOwnershipLock(storagePath, async () => 'released', { repoRoot }),
+    ).resolves.toBe('released');
   });
 
   it('keeps a live legacy tokenless owner fail-closed and byte-identical', async () => {

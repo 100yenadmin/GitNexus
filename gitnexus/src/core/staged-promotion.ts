@@ -116,6 +116,11 @@ interface StageLockRecord {
   nonce: string;
   startedAt: string;
   processStartToken?: string;
+  /** A forked analyzer that remains protected if the parent exits first. */
+  attachedWorker?: {
+    pid: number;
+    processStartToken: string;
+  };
 }
 
 export class AnalyzeOwnershipConflictError extends Error {
@@ -404,6 +409,9 @@ const processStartToken = async (pid: number): Promise<string | undefined> => {
   return identity ? createHash('sha256').update(identity).digest('hex').slice(0, 24) : undefined;
 };
 
+const activeOwnershipRecords = new Map<string, StageLockRecord>();
+const activeOwnershipUpdates = new Map<string, Promise<void>>();
+
 let currentProcessStartToken: Promise<string> | undefined;
 const getCurrentProcessStartToken = (): Promise<string> => {
   currentProcessStartToken ??= processStartToken(process.pid).then((token) => {
@@ -415,6 +423,7 @@ const getCurrentProcessStartToken = (): Promise<string> => {
 
 const validStageLockRecord = (value: unknown): value is StageLockRecord => {
   const candidate = value as Partial<StageLockRecord> | null;
+  const attachedWorker = candidate?.attachedWorker;
   return (
     !!candidate &&
     candidate.schema === 'gitnexus.staged-analyze-lock/v1' &&
@@ -425,7 +434,13 @@ const validStageLockRecord = (value: unknown): value is StageLockRecord => {
     typeof candidate.startedAt === 'string' &&
     (candidate.processStartToken === undefined ||
       (typeof candidate.processStartToken === 'string' &&
-        /^[0-9a-f]{24}$/.test(candidate.processStartToken)))
+        /^[0-9a-f]{24}$/.test(candidate.processStartToken))) &&
+    (attachedWorker === undefined ||
+      (!!attachedWorker &&
+        Number.isSafeInteger(attachedWorker.pid) &&
+        attachedWorker.pid > 0 &&
+        typeof attachedWorker.processStartToken === 'string' &&
+        /^[0-9a-f]{24}$/.test(attachedWorker.processStartToken)))
   );
 };
 
@@ -434,7 +449,9 @@ const sameStageLockRecord = (left: StageLockRecord, right: StageLockRecord): boo
   left.pid === right.pid &&
   left.nonce === right.nonce &&
   left.startedAt === right.startedAt &&
-  left.processStartToken === right.processStartToken;
+  left.processStartToken === right.processStartToken &&
+  left.attachedWorker?.pid === right.attachedWorker?.pid &&
+  left.attachedWorker?.processStartToken === right.attachedWorker?.processStartToken;
 
 const sameFileObject = (left: FileIdentity, right: FileIdentity): boolean =>
   left.dev === right.dev && left.ino === right.ino;
@@ -549,19 +566,39 @@ const readVerifiedProcessStartToken = async (
     );
   });
 
+const processGenerationIsActive = async (
+  pid: number,
+  startToken: string | undefined,
+  purpose: string,
+): Promise<boolean> => {
+  if (!processIsAlive(pid)) return false;
+  // Tokenless records are legacy parent leases. Preserve their fail-closed
+  // behavior, but never permit a newly attached worker without a generation
+  // token because a reused PID could otherwise reopen the stale-lock gap.
+  if (!startToken) return true;
+  const liveStartToken = await readVerifiedProcessStartToken(pid, purpose);
+  if (!liveStartToken) {
+    throw new AnalyzeOwnershipConflictError(
+      `Could not verify ${purpose} pid ${pid}; retry after verifying no writer is active.`,
+    );
+  }
+  return liveStartToken === startToken;
+};
+
 const primaryLockOwnerIsActive = async (
   owner: StageLockRecord,
   purpose: string,
 ): Promise<boolean> => {
-  if (!processIsAlive(owner.pid)) return false;
-  if (!owner.processStartToken) return true;
-  const liveStartToken = await readVerifiedProcessStartToken(owner.pid, purpose);
-  if (!liveStartToken) {
-    throw new AnalyzeOwnershipConflictError(
-      `Could not verify ${purpose} pid ${owner.pid}; retry after verifying no writer is active.`,
-    );
-  }
-  return liveStartToken === owner.processStartToken;
+  if (await processGenerationIsActive(owner.pid, owner.processStartToken, purpose)) return true;
+  const worker = owner.attachedWorker;
+  return (
+    worker !== undefined &&
+    (await processGenerationIsActive(
+      worker.pid,
+      worker.processStartToken,
+      `${purpose} attached worker`,
+    ))
+  );
 };
 
 const clearLegacyLeaseSources = async (lockPath: string): Promise<void> => {
@@ -1168,12 +1205,20 @@ const withOwnershipFileLock = async <T>(
     if (await hasRecoveryResidue(lockPath)) {
       await clearRecoveryClaims(lockPath, record, await requireClaimantStartToken());
     }
+    activeOwnershipRecords.set(lockPath, record);
     return await operation();
   } catch (error) {
     operationFailed = true;
     operationFailure = error;
     throw error;
   } finally {
+    for (;;) {
+      const pendingUpdate = activeOwnershipUpdates.get(lockPath);
+      if (!pendingUpdate) break;
+      await pendingUpdate;
+      if (activeOwnershipUpdates.get(lockPath) === pendingUpdate) break;
+    }
+    activeOwnershipRecords.delete(lockPath);
     if (legacyLease) await releaseLegacyRecoveryLease(legacyLease);
     if (publicationSourcePath) {
       await fs.rm(publicationSourcePath, { force: true }).catch(() => {});
@@ -1204,6 +1249,127 @@ const analyzeOwnershipCompanionPath = (repoRoot: string): string => {
   // GITNEXUS_HOME is the managed writer namespace. Runtime admission must
   // prevent differently configured homes from mutating one repository.
   return path.join(path.resolve(getGlobalDir()), 'locks', `analyze-${digest}.lock`);
+};
+
+type AttachedWorkerGeneration = NonNullable<StageLockRecord['attachedWorker']>;
+
+const updateAttachedWorker = async (
+  lockPath: string,
+  record: StageLockRecord,
+  attachedWorker: AttachedWorkerGeneration | undefined,
+): Promise<void> => {
+  const previousUpdate = activeOwnershipUpdates.get(lockPath);
+  let finishUpdate!: () => void;
+  const thisUpdate = new Promise<void>((resolve) => {
+    finishUpdate = resolve;
+  });
+  activeOwnershipUpdates.set(lockPath, thisUpdate);
+  try {
+    if (previousUpdate) await previousUpdate;
+    if (activeOwnershipRecords.get(lockPath) !== record) {
+      throw new AnalyzeOwnershipConflictError(
+        `Analyze ownership is no longer held at ${lockPath}; retry before starting the worker.`,
+      );
+    }
+    const current = await readJson<StageLockRecord>(lockPath).catch(() => undefined);
+    if (!current || !validStageLockRecord(current) || !sameStageLockRecord(current, record)) {
+      throw new AnalyzeOwnershipConflictError(
+        `Analyze ownership changed at ${lockPath}; retry before starting the worker.`,
+      );
+    }
+    if (
+      attachedWorker &&
+      current.attachedWorker?.pid === attachedWorker.pid &&
+      current.attachedWorker.processStartToken === attachedWorker.processStartToken
+    ) {
+      return;
+    }
+    const next: StageLockRecord = { ...record };
+    if (attachedWorker) next.attachedWorker = attachedWorker;
+    else delete next.attachedWorker;
+    try {
+      await writeDurableJson(lockPath, next);
+    } catch (error) {
+      const persisted = await readJson<StageLockRecord>(lockPath).catch(() => undefined);
+      if (persisted && validStageLockRecord(persisted) && sameStageLockRecord(persisted, next)) {
+        record.attachedWorker = attachedWorker;
+      }
+      throw error;
+    }
+    record.attachedWorker = attachedWorker;
+  } finally {
+    finishUpdate();
+    if (activeOwnershipUpdates.get(lockPath) === thisUpdate) {
+      activeOwnershipUpdates.delete(lockPath);
+    }
+  }
+};
+
+/**
+ * Attach the forked analyzer's process generation to the already-held parent
+ * lease. The attach is performed before the worker receives its start message,
+ * so stale recovery remains blocked if the parent exits while the child is
+ * still able to mutate the index.
+ */
+export const attachAnalyzeOwnershipWorker = async (
+  storagePath: string,
+  repoRoot: string,
+  workerPid: number,
+): Promise<void> => {
+  const workerStartToken = await readVerifiedProcessStartToken(workerPid, 'analyze worker');
+  if (!workerStartToken) {
+    throw new AnalyzeOwnershipConflictError(
+      `Could not establish analyze worker process identity for pid ${workerPid}; refusing to start it.`,
+    );
+  }
+  const attachedWorker: AttachedWorkerGeneration = {
+    pid: workerPid,
+    processStartToken: workerStartToken,
+  };
+  const lockPaths = [
+    analyzeOwnershipCompanionPath(repoRoot),
+    path.join(path.resolve(storagePath), 'analyze-staged.lock'),
+  ];
+  if (!activeOwnershipRecords.has(lockPaths[0])) {
+    throw new AnalyzeOwnershipConflictError(
+      'Analyze companion ownership is not held by this parent; refusing to attach a worker.',
+    );
+  }
+  const records = lockPaths.flatMap((lockPath) => {
+    const record = activeOwnershipRecords.get(lockPath);
+    return record ? [{ lockPath, record }] : [];
+  });
+  if (records.length === 0) {
+    throw new AnalyzeOwnershipConflictError(
+      'Analyze ownership is not held by this parent; refusing to attach a worker.',
+    );
+  }
+
+  const previous = records.map(({ record }) => record.attachedWorker);
+  let updated = 0;
+  try {
+    for (const { lockPath, record } of records) {
+      await updateAttachedWorker(lockPath, record, attachedWorker);
+      updated++;
+    }
+  } catch (error) {
+    const rollbackErrors: unknown[] = [];
+    for (let index = updated - 1; index >= 0; index--) {
+      const { lockPath, record } = records[index];
+      try {
+        await updateAttachedWorker(lockPath, record, previous[index]);
+      } catch (rollbackError) {
+        rollbackErrors.push(rollbackError);
+      }
+    }
+    if (rollbackErrors.length > 0) {
+      throw new AggregateError(
+        [error, ...rollbackErrors],
+        'Analyze worker ownership attach failed',
+      );
+    }
+    throw error;
+  }
 };
 
 /**

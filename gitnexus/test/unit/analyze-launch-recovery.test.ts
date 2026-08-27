@@ -35,6 +35,7 @@ type Listener = (...args: unknown[]) => void;
 const fakeChild = (send: () => void = () => {}) => {
   const listeners = new Map<string, Listener>();
   const child = {
+    pid: 4242,
     stderr: { on: vi.fn() },
     kill: vi.fn(),
     on: vi.fn((event: string, listener: Listener) => {
@@ -75,13 +76,15 @@ const launchDeps = (
   releaseRepoLock: ReturnType<typeof vi.fn>,
 ) => {
   const ownershipRelease = vi.fn(async () => undefined);
+  const attachWorker = vi.fn(async (_workerPid: number) => undefined);
   return {
     jobManager,
     backend: { init: vi.fn(async () => undefined) },
     acquireRepoLock: vi.fn(() => null),
     releaseRepoLock,
-    acquireAnalyzeOwnership: vi.fn(async () => ({ release: ownershipRelease })),
+    acquireAnalyzeOwnership: vi.fn(async () => ({ release: ownershipRelease, attachWorker })),
     ownershipRelease,
+    attachWorker,
     closeDbHandle: vi.fn(async () => undefined),
   };
 };
@@ -111,6 +114,26 @@ describe('analyze worker recovery-only parent contract', () => {
 });
 
 describe('analyze worker shared lock ownership', () => {
+  it('attaches the worker generation before sending its start command', async () => {
+    const { job, manager } = fakeJobManager();
+    const child = fakeChild();
+    launcherState.fork.mockReset().mockReturnValue(child.child);
+    const releaseRepoLock = vi.fn();
+    const deps = launchDeps(manager, releaseRepoLock);
+
+    createLaunchAnalysisWorker(deps)(job, '/virtual/demo', {});
+    await waitForWorkerStart();
+    await vi.waitFor(() => expect(child.child.send).toHaveBeenCalled());
+
+    expect(deps.attachWorker).toHaveBeenCalledWith(child.child.pid);
+    expect(deps.attachWorker.mock.invocationCallOrder[0]).toBeLessThan(
+      child.child.send.mock.invocationCallOrder[0],
+    );
+    child.emit('message', { type: 'error', message: 'test cleanup' });
+    child.emit('close', 0);
+    await vi.waitFor(() => expect(releaseRepoLock).toHaveBeenCalledOnce());
+  });
+
   it('releases the captured key exactly once after terminal success and late events', async () => {
     const { job, manager } = fakeJobManager();
     const child = fakeChild();

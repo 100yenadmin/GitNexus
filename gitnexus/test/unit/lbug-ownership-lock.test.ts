@@ -28,6 +28,8 @@ describe('Ladybug writable ownership admission', () => {
     const lease = await acquireLbugOwnership(storagePath, repoRoot);
     await expect(fs.access(storagePath)).rejects.toMatchObject({ code: 'ENOENT' });
 
+    await lease.attachWorker(process.pid);
+
     await expect(
       withAnalyzeOwnershipLock(storagePath, async () => undefined, { repoRoot }),
     ).rejects.toThrow(/another analyze is active/i);

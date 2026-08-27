@@ -60,6 +60,26 @@ function send(msg: WorkerMessage) {
 // late SIGTERM can't flip an already-reported job (#2264 P3).
 const claimTerminal = createTerminalClaim();
 
+// A detached IPC channel means the server parent is gone. Reserve the terminal
+// slot and use the same bounded checkpoint/exit path as cancellation.
+let shutdownStarted = false;
+const beginBoundedShutdown = (message?: string): void => {
+  if (shutdownStarted) return;
+  shutdownStarted = true;
+  const claimed = claimTerminal();
+  if (message && claimed) send({ type: 'error', message });
+  void boundedCheckpointBeforeExit({
+    exitCode: 0,
+    onFlushError: message
+      ? (err: unknown) => {
+          const flushMessage =
+            err instanceof Error ? err.message : 'Worker checkpoint failed during shutdown';
+          send({ type: 'error', message: flushMessage });
+        }
+      : undefined,
+  });
+};
+
 // Catch uncaught exceptions and unhandled rejections — report them to the parent
 // over IPC (the same channel the analysis path uses), then exit. The report runs
 // in `try` and the exit in `finally` so a throw from send() on a closed channel
@@ -89,21 +109,16 @@ process.on('unhandledRejection', (reason: unknown) => {
 // single cancel can't abort or hang the worker. A CHECKPOINT failure is reported
 // to the parent over IPC, not swallowed; the exit always fires.
 process.on('SIGTERM', () => {
-  // Only report the cancellation if the analysis hasn't already reported a
-  // terminal outcome (#2264 P3) — otherwise this would flip an already-complete
-  // job to failed. The cleanup + exit below run regardless.
-  if (claimTerminal()) {
-    send({ type: 'error', message: 'Analysis cancelled (worker received SIGTERM)' });
-  }
-  void boundedCheckpointBeforeExit({
-    exitCode: 0,
-    onFlushError: (err: unknown) => {
-      const message =
-        err instanceof Error ? err.message : 'Worker checkpoint failed during SIGTERM';
-      send({ type: 'error', message });
-    },
-  });
+  beginBoundedShutdown('Analysis cancelled (worker received SIGTERM)');
 });
+
+// Do not let a forked worker continue mutating the index after its launcher
+// disappears; no terminal IPC report is attempted on the closed channel.
+const handleParentDisconnect = () => {
+  beginBoundedShutdown();
+};
+process.on('disconnect', handleParentDisconnect);
+if (!process.connected) handleParentDisconnect();
 
 // Listen for start command from parent — guarded against re-entry
 let started = false;

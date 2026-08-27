@@ -807,6 +807,8 @@ export const withLbugReadOnlyNonRecovering = async <T>(
 
 export interface LbugOwnershipLease {
   release(): Promise<void>;
+  /** Attach a forked analyzer generation before it receives its start IPC. */
+  attachWorker(workerPid: number): Promise<void>;
 }
 
 export const acquireLbugOwnership = async (
@@ -824,6 +826,7 @@ export const acquireLbugOwnership = async (
     markFailed = reject;
   });
   const { withAnalyzeOwnershipLock } = await import('../staged-promotion.js');
+  const { attachAnalyzeOwnershipWorker } = await import('../staged-promotion.js');
   const ownership = withAnalyzeOwnershipLock(
     storagePath,
     async () => {
@@ -836,6 +839,10 @@ export const acquireLbugOwnership = async (
   await entered;
   let released = false;
   return {
+    attachWorker: async (workerPid: number) => {
+      if (released) throw new Error('Analyze ownership was released before worker attachment');
+      await attachAnalyzeOwnershipWorker(storagePath, repoRoot, workerPid);
+    },
     release: async () => {
       if (!released) {
         released = true;

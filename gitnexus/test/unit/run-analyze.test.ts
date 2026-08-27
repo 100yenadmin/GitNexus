@@ -711,8 +711,8 @@ describe('run-analyze module', () => {
       const result = await runFullAnalysis(tmpRepo.dbPath, {}, { onProgress: () => {} });
       expect(result.alreadyUpToDate).toBe(true);
       const flatMeta = await loadMeta(flat.storagePath);
-      // The informational flat label still restamps…
-      expect(flatMeta?.branch).toBe('feature/x');
+      // Missing registry ownership returns NOT_ADOPTED, so the prior label survives.
+      expect(flatMeta?.branch).toBe('main');
       // …but the pinned sub-index survives untouched.
       await expect(fs.access(path.dirname(branch.metaPath))).resolves.toBeUndefined();
     } finally {
