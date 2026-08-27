@@ -114,7 +114,7 @@ describe('JobManager', () => {
     const job = manager.createJob({ repoUrl: 'https://github.com/user/repo' });
     manager.updateJob(job.id, { status: 'analyzing' });
     const cancelled = manager.cancelJob(job.id, 'Cancelled by user');
-    expect(cancelled).toBe(true);
+    expect(cancelled).toMatchObject({ status: 'failed', error: 'Cancelled by user' });
     expect(manager.getJob(job.id)!.status).toBe('failed');
     expect(manager.getJob(job.id)!.error).toBe('Cancelled by user');
   });
@@ -135,7 +135,10 @@ describe('JobManager', () => {
     manager.updateJob(job.id, { status: 'analyzing' });
     manager.deferCancellationFinalization(job.id);
 
-    expect(manager.cancelJob(job.id, 'Cancelled by user')).toBe(true);
+    expect(manager.cancelJob(job.id, 'Cancelled by user')).toMatchObject({
+      status: 'analyzing',
+      cancellationReason: 'Cancelled by user',
+    });
     expect(manager.getJob(job.id)).toMatchObject({
       status: 'analyzing',
       cancellationReason: 'Cancelled by user',
@@ -148,14 +151,14 @@ describe('JobManager', () => {
     });
   });
 
-  it('cancelJob returns false for terminal jobs', () => {
+  it('cancelJob returns undefined for terminal jobs', () => {
     const job = manager.createJob({ repoUrl: 'https://github.com/user/repo' });
     manager.updateJob(job.id, { status: 'complete' });
-    expect(manager.cancelJob(job.id)).toBe(false);
+    expect(manager.cancelJob(job.id)).toBeUndefined();
   });
 
-  it('cancelJob returns false for unknown job', () => {
-    expect(manager.cancelJob('nonexistent')).toBe(false);
+  it('cancelJob returns undefined for unknown jobs', () => {
+    expect(manager.cancelJob('nonexistent')).toBeUndefined();
   });
 
   // #2264 P3: a job's terminal outcome is immutable, so a late worker message (a

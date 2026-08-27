@@ -2139,8 +2139,12 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
       res.status(400).json({ error: `Job already ${job.status}` });
       return;
     }
-    jobManager.cancelJob(jobId, 'Cancelled by user');
-    res.json({ id: job.id, status: 'failed', error: 'Cancelled by user' });
+    const cancelledJob = jobManager.cancelJob(jobId, 'Cancelled by user');
+    res.json({
+      id: job.id,
+      status: cancelledJob?.status ?? job.status,
+      ...(cancelledJob?.error ? { error: cancelledJob.error } : {}),
+    });
   });
 
   // ── Embedding endpoints ────────────────────────────────────────────
