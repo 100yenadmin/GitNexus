@@ -720,7 +720,7 @@ describe('runFullAnalysis --staged', () => {
     tempDirs.push(repo, registryHome);
     process.env.GITNEXUS_HOME = registryHome;
     await fs.writeFile(path.join(repo, 'index.ts'), 'export const value = 1;\n');
-    execFileSync('git', ['init'], { cwd: repo });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: repo });
     execFileSync('git', ['add', 'index.ts'], { cwd: repo });
     execFileSync(
       'git',

@@ -143,3 +143,46 @@ withTestLbugDB('query-importers-batch-failure', () => {
     }, 120_000);
   });
 });
+
+const strictStatsGraph = (includeRelation: boolean) =>
+  buildTestGraph(
+    [
+      { id: 'File:strict-a.ts', label: 'File', name: 'strict-a.ts', filePath: 'strict-a.ts' },
+      { id: 'File:strict-b.ts', label: 'File', name: 'strict-b.ts', filePath: 'strict-b.ts' },
+    ],
+    includeRelation
+      ? [{ sourceId: 'File:strict-a.ts', targetId: 'File:strict-b.ts', type: 'IMPORTS' }]
+      : [],
+  );
+
+withTestLbugDB('strict-native-counts', (handle) => {
+  describe('getStrictLbugStats native count rows (#254)', () => {
+    it('returns safe nonnegative node and relation counts from LadybugDB', async () => {
+      const { getStrictLbugStats, loadGraphToLbug } =
+        await import('../../src/core/lbug/lbug-adapter.js');
+      await loadGraphToLbug(strictStatsGraph(true), '/tmp/repo', path.dirname(handle.dbPath));
+
+      const stats = await getStrictLbugStats();
+      expect(stats).toEqual({ nodes: 2, edges: 1 });
+      expect(Object.values(stats).every(Number.isSafeInteger)).toBe(true);
+      expect(Object.values(stats).every((count) => count >= 0)).toBe(true);
+    });
+  });
+});
+
+// Dedicated trailing fixture: dropping CodeRelation poisons later relation queries.
+withTestLbugDB('strict-native-missing-relation', (handle) => {
+  describe('getStrictLbugStats native missing-table carve-out (#254)', () => {
+    it('observes the native rejection and counts the expected missing table as zero', async () => {
+      const { executeQuery, getStrictLbugStats, loadGraphToLbug } =
+        await import('../../src/core/lbug/lbug-adapter.js');
+      await loadGraphToLbug(strictStatsGraph(false), '/tmp/repo', path.dirname(handle.dbPath));
+      await executeQuery('DROP TABLE CodeRelation');
+
+      await expect(executeQuery('MATCH ()-[r:CodeRelation]->() RETURN count(r)')).rejects.toThrow(
+        /Table CodeRelation does not exist/,
+      );
+      await expect(getStrictLbugStats()).resolves.toEqual({ nodes: 2, edges: 0 });
+    });
+  });
+});

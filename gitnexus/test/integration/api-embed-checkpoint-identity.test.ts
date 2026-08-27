@@ -14,6 +14,7 @@ import {
 } from '../../src/storage/repo-manager.js';
 import { escapeCypherString } from '../../src/core/lbug/cypher-escape.js';
 import { JobManager } from '../../src/server/analyze-job.js';
+import { createTempDir } from '../helpers/test-db.js';
 import { withAnalyzeOwnershipLock } from '../../src/core/staged-promotion.js';
 
 const MODEL = 'api-checkpoint-test-model';
@@ -106,6 +107,7 @@ const state = {
   getActiveEmbeddingIdentity: vi.fn(() => identity),
   inspectEmbeddingIntegrity: vi.fn(async () => state.liveIntegrity),
   getStrictLbugStats: vi.fn(async () => ({ nodes: 0, edges: 0 })),
+  useRealRegistry: false,
   registerRepo: vi.fn(
     async (
       _repoPath?: string,
@@ -133,6 +135,10 @@ const state = {
   releaseAnalyzeLock: undefined as (() => void) | undefined,
   afterSafeStorageValidation: undefined as (() => void) | undefined,
 };
+
+let actualRegisterRepo: typeof import('../../src/storage/repo-manager.js').registerRepo;
+let actualReadRegistry: typeof import('../../src/storage/repo-manager.js').readRegistry;
+let actualRollbackRegistryCommit: typeof import('../../src/storage/repo-manager.js').rollbackRegistryCommit;
 
 const armDeleteHandlerSignal = (): Promise<void> =>
   new Promise((resolve) => {
@@ -165,17 +171,23 @@ const prepareSymlinkRace = async (prefix: string) => {
     },
   };
 };
-
 vi.doMock('../../src/storage/repo-manager.js', async () => {
   const actual = await vi.importActual<typeof import('../../src/storage/repo-manager.js')>(
     '../../src/storage/repo-manager.js',
   );
+  actualRegisterRepo = actual.registerRepo;
+  actualReadRegistry = actual.readRegistry;
+  actualRollbackRegistryCommit = actual.rollbackRegistryCommit;
   return {
     ...actual,
     listRegisteredRepos: state.listRegisteredRepos,
     loadMeta: state.loadMeta,
-    registerRepo: state.registerRepo,
-    rollbackRegistryCommit: state.rollbackRegistryCommit,
+    registerRepo: (...args: Parameters<typeof actual.registerRepo>) =>
+      state.useRealRegistry ? actual.registerRepo(...args) : state.registerRepo(...args),
+    rollbackRegistryCommit: (...args: Parameters<typeof actual.rollbackRegistryCommit>) =>
+      state.useRealRegistry
+        ? actualRollbackRegistryCommit(...args)
+        : state.rollbackRegistryCommit(...args),
     unregisterRepo: state.unregisterRepo,
     saveMeta: state.saveMeta,
     assertSafeStoragePath: (entry: RegistryEntry) => {
@@ -299,8 +311,69 @@ const runEmbedJob = async (baseUrl: string, repo: string) => {
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ repo }),
   });
-  const { jobId } = (await response.json()) as { jobId: string };
-  return waitForTerminalJob(baseUrl, jobId);
+  return waitForTerminalJob(baseUrl, ((await response.json()) as { jobId: string }).jobId);
+};
+
+const submitEmbed = runEmbedJob;
+
+const withRealRegistry = async (
+  run: (seed: { canonical: RegistryEntry; unrelated: RegistryEntry }) => Promise<void>,
+) => {
+  const home = await createTempDir();
+  const previousHome = process.env.GITNEXUS_HOME;
+  try {
+    process.env.GITNEXUS_HOME = home.dbPath;
+    const canonicalPath = path.join(home.dbPath, 'repo-under-test');
+    const canonicalMeta: RepoMeta = {
+      ...makeMeta(LIVE_DIGEST),
+      repoPath: canonicalPath,
+      remoteUrl: 'https://example.test/proof/repo.git',
+      branch: 'main',
+      stats: { files: 7, nodes: 17, edges: 19, communities: 2, embeddings: 3 },
+    };
+    await actualRegisterRepo(canonicalPath, canonicalMeta, { name: 'durable-proof-alias' });
+    await actualRegisterRepo(
+      canonicalPath,
+      { ...canonicalMeta, indexedAt: '2026-08-22T01:00:00.000Z', lastCommit: 'feature-head' },
+      { name: 'durable-proof-alias', branch: 'feature/proof', allowDuplicateName: true },
+    );
+    await actualRegisterRepo(
+      path.join(home.dbPath, 'unrelated-repo'),
+      {
+        ...canonicalMeta,
+        repoPath: path.join(home.dbPath, 'unrelated-repo'),
+        remoteUrl: undefined,
+      },
+      { name: 'unrelated-proof' },
+    );
+    const seeded = await actualReadRegistry();
+    const canonical = seeded.find((entry) => entry.path === canonicalPath);
+    const unrelatedEntry = seeded.find((entry) => entry.name === 'unrelated-proof');
+    const checkpoint = canonicalMeta.embeddingCheckpoint;
+    if (!canonical || !unrelatedEntry || !checkpoint) throw new Error('registry seed failed');
+    const unrelated = structuredClone(unrelatedEntry);
+    canonicalMeta.embeddingCheckpoint = {
+      ...checkpoint,
+      nodesProcessed: 0,
+      totalNodes: 0,
+      chunksProcessed: 0,
+      provider: undefined,
+      physicalRows: undefined,
+      validRows: undefined,
+      recoverableIdentitySha256: undefined,
+    };
+    state.currentMeta = canonicalMeta;
+    state.listRegisteredRepos.mockResolvedValue([canonical]);
+    state.liveIntegrity = makeIntegrity(LIVE_DIGEST, 0);
+    state.executeQuery.mockResolvedValue([]);
+    state.useRealRegistry = true;
+    await run({ canonical, unrelated });
+  } finally {
+    state.useRealRegistry = false;
+    if (previousHome === undefined) delete process.env.GITNEXUS_HOME;
+    else process.env.GITNEXUS_HOME = previousHome;
+    await home.cleanup();
+  }
 };
 
 const runSymlinkRace = async (
@@ -347,7 +420,6 @@ describe('canonical repository lock keys', () => {
     }
   });
 });
-
 describe('POST /api/embed completed-checkpoint identity', () => {
   let baseUrl = '';
   let shutdown: (() => Promise<void>) | undefined;
@@ -412,6 +484,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     state.runEmbeddingPipeline.mockReset();
     state.runEmbeddingPipeline.mockResolvedValue(undefined);
     state.registerRepo.mockReset();
+    state.useRealRegistry = false;
     state.registerRepo.mockImplementation(
       async (
         _repoPath?: string,
@@ -934,7 +1007,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     expect(state.registerRepo).toHaveBeenCalledWith(
       REPO.path,
       expect.objectContaining({
-        stats: { nodes: 0, edges: 0, embeddings: 0 },
+        stats: { nodes: 0, edges: 0, communities: 0, embeddings: 0 },
         embeddingCheckpoint: undefined,
       }),
       {
@@ -943,13 +1016,21 @@ describe('POST /api/embed completed-checkpoint identity', () => {
         commitReceipt: expect.objectContaining({ value: expect.anything() }),
         expectedOwner: expect.objectContaining({
           ...enrichedRepo,
-          canonicalPath: enrichedRepo.path,
-          canonicalStoragePath: enrichedRepo.storagePath,
+          canonicalPath: canonicalizePath(enrichedRepo.path),
+          canonicalStoragePath: canonicalizePath(enrichedRepo.storagePath),
         }),
       },
     );
-    expect(state.saveMeta).toHaveBeenCalledWith(REPO.storagePath, expect.anything());
-    expect(state.currentMeta.stats).toEqual({ nodes: 0, edges: 0, embeddings: 0 });
+    expect(state.saveMeta).toHaveBeenCalledWith(
+      canonicalizePath(REPO.storagePath),
+      expect.anything(),
+    );
+    expect(state.currentMeta.stats).toEqual({
+      nodes: 0,
+      edges: 0,
+      communities: 0,
+      embeddings: 0,
+    });
     expect(state.currentMeta.remoteUrl).toBeUndefined();
     expect(state.currentMeta.embeddingCheckpoint).toBeUndefined();
   });
@@ -1180,7 +1261,11 @@ describe('POST /api/embed completed-checkpoint identity', () => {
       const removeResponse = fetch(`${baseUrl}/api/repo?repo=${encodeURIComponent(entry.name)}`, {
         method: 'DELETE',
       });
-      await vi.waitFor(() => expect(state.unregisterRepo).toHaveBeenCalledOnce());
+      // Windows obtains real process-generation tokens for the nested companion
+      // and storage ownership claims before entering the delete callback.
+      await vi.waitFor(() => expect(state.unregisterRepo).toHaveBeenCalledOnce(), {
+        timeout: 30_000,
+      });
       await expect(fs.lstat(entry.storagePath)).rejects.toMatchObject({ code: 'ENOENT' });
 
       await expect(
@@ -1584,7 +1669,12 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     expect((await waitForTerminalJob(baseUrl, retryJobId)).status).toBe('complete');
     expect(state.registerRepo).toHaveBeenCalledTimes(2);
     expect(state.saveMeta).toHaveBeenCalledTimes(2);
-    expect(state.currentMeta.stats).toEqual({ nodes: 0, edges: 0, embeddings: 0 });
+    expect(state.currentMeta.stats).toEqual({
+      nodes: 0,
+      edges: 0,
+      communities: 0,
+      embeddings: 0,
+    });
     expect(state.currentMeta.embeddingCheckpoint).toBeUndefined();
   });
 
@@ -1614,8 +1704,53 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     const job = await waitForTerminalJob(baseUrl, jobId);
 
     expect(job).toMatchObject({ status: 'failed', error: message });
+    expect(state.registerRepo).not.toHaveBeenCalled();
     expect(state.saveMeta).not.toHaveBeenCalled();
     expect(JSON.stringify(state.currentMeta.embeddingCheckpoint)).toBe(checkpointBefore);
+  });
+
+  it('persists zero-clear identity through the real temporary registry', async () => {
+    await withRealRegistry(async ({ canonical, unrelated }) => {
+      expect((await submitEmbed(baseUrl, canonical.name)).status).toBe('complete');
+
+      const registry = await actualReadRegistry();
+      const matches = registry.filter((entry) => entry.path === canonical.path);
+      expect(matches).toHaveLength(1);
+      expect(matches[0]).toEqual({
+        ...canonical,
+        stats: { ...canonical.stats, nodes: 0, edges: 0, communities: 0, embeddings: 0 },
+      });
+      expect(matches[0]).not.toHaveProperty('embeddingCheckpoint');
+      expect(registry.find((entry) => entry.name === unrelated.name)).toEqual(unrelated);
+      expect(state.currentMeta.stats).toEqual(matches[0]?.stats);
+      expect(state.currentMeta.embeddingCheckpoint).toBeUndefined();
+    });
+  });
+
+  it('keeps real registry convergence unique across primary-save failure and retry', async () => {
+    await withRealRegistry(async ({ canonical, unrelated }) => {
+      const checkpointBefore = structuredClone(state.currentMeta.embeddingCheckpoint);
+      state.saveMeta.mockRejectedValueOnce(new Error('primary persistence failed'));
+
+      expect(await submitEmbed(baseUrl, canonical.name)).toMatchObject({
+        status: 'failed',
+        error: 'primary persistence failed',
+      });
+      const afterFailure = await actualReadRegistry();
+      expect(afterFailure.filter((entry) => entry.path === canonical.path)).toEqual([canonical]);
+      expect(state.currentMeta.embeddingCheckpoint).toEqual(checkpointBefore);
+
+      expect((await submitEmbed(baseUrl, canonical.name)).status).toBe('complete');
+      const afterRetry = await actualReadRegistry();
+      const converged = {
+        ...canonical,
+        stats: { ...canonical.stats, nodes: 0, edges: 0, communities: 0, embeddings: 0 },
+      };
+      expect(afterRetry.filter((entry) => entry.path === canonical.path)).toEqual([converged]);
+      expect(afterRetry.find((entry) => entry.name === unrelated.name)).toEqual(unrelated);
+      expect(state.currentMeta.stats).toEqual(converged?.stats);
+      expect(state.currentMeta.embeddingCheckpoint).toBeUndefined();
+    });
   });
 
   it('runs the pipeline after read-only proof finds current graph nodes', async () => {
