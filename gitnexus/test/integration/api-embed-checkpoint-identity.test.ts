@@ -1007,7 +1007,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     expect(state.registerRepo).toHaveBeenCalledWith(
       REPO.path,
       expect.objectContaining({
-        stats: { nodes: 0, edges: 0, embeddings: 0 },
+        stats: { nodes: 0, edges: 0, communities: 0, embeddings: 0 },
         embeddingCheckpoint: undefined,
       }),
       {
@@ -1025,7 +1025,12 @@ describe('POST /api/embed completed-checkpoint identity', () => {
       canonicalizePath(REPO.storagePath),
       expect.anything(),
     );
-    expect(state.currentMeta.stats).toEqual({ nodes: 0, edges: 0, embeddings: 0 });
+    expect(state.currentMeta.stats).toEqual({
+      nodes: 0,
+      edges: 0,
+      communities: 0,
+      embeddings: 0,
+    });
     expect(state.currentMeta.remoteUrl).toBeUndefined();
     expect(state.currentMeta.embeddingCheckpoint).toBeUndefined();
   });
@@ -1664,7 +1669,12 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     expect((await waitForTerminalJob(baseUrl, retryJobId)).status).toBe('complete');
     expect(state.registerRepo).toHaveBeenCalledTimes(2);
     expect(state.saveMeta).toHaveBeenCalledTimes(2);
-    expect(state.currentMeta.stats).toEqual({ nodes: 0, edges: 0, embeddings: 0 });
+    expect(state.currentMeta.stats).toEqual({
+      nodes: 0,
+      edges: 0,
+      communities: 0,
+      embeddings: 0,
+    });
     expect(state.currentMeta.embeddingCheckpoint).toBeUndefined();
   });
 
