@@ -2139,8 +2139,12 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
       res.status(400).json({ error: `Job already ${job.status}` });
       return;
     }
-    jobManager.cancelJob(jobId, 'Cancelled by user');
-    res.json({ id: job.id, status: 'failed', error: 'Cancelled by user' });
+    const cancelledJob = jobManager.cancelJob(jobId, 'Cancelled by user');
+    res.json({
+      id: job.id,
+      status: cancelledJob?.status ?? job.status,
+      ...(cancelledJob?.error ? { error: cancelledJob.error } : {}),
+    });
   });
 
   // ── Embedding endpoints ────────────────────────────────────────────
@@ -2367,6 +2371,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
             const withOwnedLbugDb = <T>(operation: () => Promise<T>): Promise<T> =>
               withLbugDb(lbugPath, operation);
             await withOwnedLbugDb(async () => {
+              let reconciledGraphStats: { nodes: number; edges: number } | undefined;
               let embeddingMeta = await loadMeta(frozenOwner.canonicalStoragePath);
               const authoritativeLegacy = isEmptyLegacyCheckpoint(
                 embeddingMeta?.embeddingCheckpoint,
@@ -2378,6 +2383,11 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
               ) {
                 throw new Error(API_METADATA_DRIFT_CONTEXT);
               }
+              const persistedCheckpointNeedsRegistryReconciliation =
+                !authoritativeLegacy &&
+                embeddingMeta.embeddingCheckpoint !== undefined &&
+                (embeddingMeta.stats?.nodes !== frozenOwner.stats?.nodes ||
+                  embeddingMeta.stats?.edges !== frozenOwner.stats?.edges);
               let priorCheckpoint = embeddingMeta.embeddingCheckpoint;
               if (isEmptyLegacyCheckpoint(priorCheckpoint)) {
                 const integrity = await inspectEmbeddingIntegrity();
@@ -2414,12 +2424,18 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                       const owner = await assertZeroClearRegistryOwner(frozenOwner, clearedMeta);
                       const commitReceipt: import('../storage/repo-manager.js').RegistryCommitReceiptRef =
                         {};
-                      await registerRepo(owner.path, clearedMeta, {
-                        name: owner.name,
-                        allowDuplicateName: true,
-                        expectedOwner: owner,
-                        commitReceipt,
-                      });
+                      await registerRepo(
+                        owner.path,
+                        owner.remoteUrl === undefined
+                          ? clearedMeta
+                          : { ...clearedMeta, remoteUrl: owner.remoteUrl },
+                        {
+                          name: owner.name,
+                          allowDuplicateName: true,
+                          expectedOwner: owner,
+                          commitReceipt,
+                        },
+                      );
                       let metadataCommitted = false;
                       try {
                         const provenStoragePath = assertFrozenZeroClearRegistryOwner(
@@ -2460,6 +2476,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                     embeddingMeta = clearedMeta;
                     return;
                   }
+                  reconciledGraphStats = graphStats;
                 }
                 // Keep the old checkpoint persisted until the fresh pipeline
                 // either records a new window or finalizes successfully.
@@ -2511,6 +2528,14 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
               ): Promise<void> => {
                 const checkpointMeta = {
                   ...embeddingMeta,
+                  ...(reconciledGraphStats
+                    ? {
+                        stats: {
+                          ...embeddingMeta.stats,
+                          ...reconciledGraphStats,
+                        },
+                      }
+                    : {}),
                   embeddingCheckpoint: {
                     at: new Date().toISOString(),
                     ...checkpoint,
@@ -2593,12 +2618,69 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
               }
               const terminalMeta = {
                 ...embeddingMeta,
-                stats: { ...embeddingMeta.stats, embeddings: terminalIntegrity.validRows },
+                stats: {
+                  ...embeddingMeta.stats,
+                  ...reconciledGraphStats,
+                  embeddings: terminalIntegrity.validRows,
+                },
                 embeddingCheckpoint: undefined,
               };
-              await commitEmbedMetadata(barrier, 'COMMITTING_TERMINAL', () =>
-                saveMeta(frozenOwner.canonicalStoragePath, terminalMeta),
-              );
+              if (reconciledGraphStats || persistedCheckpointNeedsRegistryReconciliation) {
+                await commitEmbedMetadata(barrier, 'COMMITTING_TERMINAL', async () => {
+                  const owner = await assertZeroClearRegistryOwner(frozenOwner, terminalMeta);
+                  const commitReceipt: import('../storage/repo-manager.js').RegistryCommitReceiptRef =
+                    {};
+                  await registerRepo(
+                    owner.path,
+                    owner.remoteUrl === undefined
+                      ? terminalMeta
+                      : { ...terminalMeta, remoteUrl: owner.remoteUrl },
+                    {
+                      name: owner.name,
+                      allowDuplicateName: true,
+                      expectedOwner: owner,
+                      commitReceipt,
+                    },
+                  );
+                  let metadataCommitted = false;
+                  try {
+                    const provenStoragePath = assertFrozenZeroClearRegistryOwner(
+                      owner,
+                      terminalMeta,
+                    );
+                    await saveMeta(provenStoragePath, terminalMeta);
+                    metadataCommitted = true;
+                    await assertZeroClearRegistryOwner(owner, terminalMeta);
+                  } catch (error) {
+                    const rollbackErrors: unknown[] = [error];
+                    if (commitReceipt.value) {
+                      try {
+                        await rollbackRegistryCommit(commitReceipt.value);
+                      } catch (rollbackError) {
+                        rollbackErrors.push(rollbackError);
+                      }
+                    }
+                    if (metadataCommitted) {
+                      try {
+                        await saveMeta(owner.canonicalStoragePath, embeddingMeta);
+                      } catch (rollbackError) {
+                        rollbackErrors.push(rollbackError);
+                      }
+                    }
+                    if (rollbackErrors.length > 1) {
+                      throw new AggregateError(
+                        rollbackErrors,
+                        'Embedding metadata commit failed and transactional rollback was incomplete',
+                      );
+                    }
+                    throw error;
+                  }
+                });
+              } else {
+                await commitEmbedMetadata(barrier, 'COMMITTING_TERMINAL', () =>
+                  saveMeta(frozenOwner.canonicalStoragePath, terminalMeta),
+                );
+              }
               embeddingMeta = terminalMeta;
               terminalOwnerMeta = terminalMeta;
             });

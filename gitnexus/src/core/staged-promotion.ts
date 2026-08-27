@@ -1557,6 +1557,8 @@ export const prepareStagedWorkspace = async (
   if (canonicalDb && canonicalMeta) {
     const tempDb = `${paths.stagedLbugPath}.copy-${randomBytes(8).toString('hex')}`;
     await fs.copyFile(paths.canonicalLbugPath, tempDb);
+    const copiedMode = (await fs.stat(tempDb)).mode;
+    await fs.chmod(tempDb, copiedMode | 0o200);
     // Windows requires a writable handle for FlushFileBuffers even though the
     // bytes are not modified here. The copied stage file is private and will
     // be atomically moved only after this durability barrier succeeds.

@@ -172,9 +172,9 @@ export class JobManager {
   }
 
   /** Cancel a running job — sends SIGTERM to child process. */
-  cancelJob(jobId: string, reason?: string): boolean {
+  cancelJob(jobId: string, reason?: string): AnalyzeJob | undefined {
     const job = this.jobs.get(jobId);
-    if (!job || this.isTerminal(job.status)) return false;
+    if (!job || this.isTerminal(job.status)) return undefined;
 
     const cancellationReason = reason || 'Analysis cancelled';
     if (job.deferCancellationUntilCleanup) {
@@ -188,14 +188,14 @@ export class JobManager {
     this.abortControllers.get(jobId)?.abort();
     this.abortControllers.delete(jobId);
 
-    if (job.deferCancellationUntilCleanup) return true;
+    if (job.deferCancellationUntilCleanup) return job;
 
     this.updateJob(jobId, {
       status: 'failed',
       error: cancellationReason,
     });
 
-    return true;
+    return job;
   }
 
   /** Subscribe to progress events for a job. Returns unsubscribe function. */

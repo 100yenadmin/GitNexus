@@ -409,6 +409,25 @@ describe('staged promotion journal', () => {
     expect(await fs.readFile(paths.stagedLbugPath, 'utf8')).toBe('externally-changed-canonical');
   });
 
+  it('makes a private stage copy writable when the canonical database is read-only', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-stage-readonly-'));
+    tempDirs.push(root);
+    const metaDir = path.join(root, '.gitnexus');
+    const lbugPath = path.join(metaDir, 'lbug');
+    await fs.mkdir(metaDir, { recursive: true });
+    await fs.writeFile(lbugPath, 'read-only-canonical');
+    await fs.chmod(lbugPath, 0o444);
+    const meta = makeMeta('old');
+    await saveMeta(metaDir, meta);
+    const paths = getStagedAnalyzePaths(lbugPath, metaDir);
+
+    await expect(prepareStagedWorkspace(paths, meta)).resolves.toMatchObject({ resumed: false });
+    expect(await fs.readFile(paths.stagedLbugPath, 'utf8')).toBe('read-only-canonical');
+    if (process.platform !== 'win32') {
+      expect((await fs.stat(paths.stagedLbugPath)).mode & 0o200).toBe(0o200);
+    }
+  });
+
   it('refuses to copy a canonical DB with unresolved WAL state', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-stage-wal-'));
     tempDirs.push(root);
