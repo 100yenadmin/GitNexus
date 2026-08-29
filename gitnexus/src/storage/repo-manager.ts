@@ -1106,7 +1106,7 @@ export const readRegistryStrict = async (): Promise<RegistryReadResult> => {
   try {
     raw = await fs.readFile(getGlobalRegistryPath(), 'utf-8');
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+    if (isMissingFilesystemError(error)) {
       return { status: 'available', entries: [] };
     }
     return { status: 'failed', reason: 'unreadable' };

@@ -209,6 +209,18 @@ describe('read-only doctor CLI modes (#127, #133)', () => {
     });
   });
 
+  it('treats an ENOTDIR registry path as a healthy empty installation', async () => {
+    const nonDirectoryHome = path.join(home.dbPath, 'not-a-directory');
+    await fs.writeFile(nonDirectoryHome, '');
+
+    const result = runDoctor(['--registry', '--json'], { GITNEXUS_HOME: nonDirectoryHome });
+    expect(result.status).toBe(0);
+    expect(JSON.parse(result.stdout)).toMatchObject({
+      registryRead: { status: 'available' },
+      summary: { entries: 0 },
+    });
+  });
+
   it('diagnoses malformed HTTP dimensions through registry Doctor JSON', async () => {
     const repoPath = path.join(home.dbPath, 'repo');
     await fs.writeFile(
