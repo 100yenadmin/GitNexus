@@ -65,6 +65,13 @@ export const getQueryEmbeddingRuntimeStatus = async (): Promise<QueryEmbeddingRu
       return { available: false, mode: 'http', reason: 'http-config-invalid' };
     }
     try {
+      new Headers({
+        Authorization: `Bearer ${process.env.GITNEXUS_EMBEDDING_API_KEY ?? 'unused'}`,
+      });
+    } catch {
+      return { available: false, mode: 'http', reason: 'http-config-invalid' };
+    }
+    try {
       const endpoint = new URL(rawUrl);
       if (
         rawUrl.includes('?') ||

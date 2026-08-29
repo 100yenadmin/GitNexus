@@ -51,6 +51,7 @@ describe('provider-free query embedding runtime status', () => {
     for (const key of [
       'GITNEXUS_EMBEDDING_URL',
       'GITNEXUS_EMBEDDING_MODEL',
+      'GITNEXUS_EMBEDDING_API_KEY',
       'GITNEXUS_EMBEDDING_DIMS',
       'GITNEXUS_EMBEDDING_THREADS',
       'GITNEXUS_EMBEDDING_DEVICE',
@@ -110,6 +111,19 @@ describe('provider-free query embedding runtime status', () => {
     process.env.GITNEXUS_EMBEDDING_URL = 'https://embedding.example/v1';
     process.env.GITNEXUS_EMBEDDING_MODEL = 'test-model';
     process.env.GITNEXUS_EMBEDDING_DIMS = '';
+
+    await expectStatus({
+      available: false,
+      mode: 'http',
+      reason: 'http-config-invalid',
+    });
+    expect(hookCalls).toEqual([]);
+  });
+
+  it('rejects an HTTP API key that cannot be used as an authorization header', async () => {
+    process.env.GITNEXUS_EMBEDDING_URL = 'https://embedding.example/v1';
+    process.env.GITNEXUS_EMBEDDING_MODEL = 'test-model';
+    process.env.GITNEXUS_EMBEDDING_API_KEY = 'synthetic\r\nkey';
 
     await expectStatus({
       available: false,
