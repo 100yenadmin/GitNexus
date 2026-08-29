@@ -86,3 +86,34 @@ Lists all repositories registered in `~/.gitnexus/registry.json`. The MCP `list_
 - **"Not inside a git repository"**: Run from a directory inside a git repo
 - **Index is stale after re-analyzing**: Restart Claude Code to reload the MCP server
 - **Embeddings slow**: Omit `--embeddings` (it's off by default) or set `OPENAI_API_KEY` for faster API-based embedding
+
+## Post-Merge Reconciliation
+
+Run this workflow after merging one PR or a deliberate batch into the indexed
+default branch, only when the current task owns the post-merge path and indexed
+source actually changed. At most one initial refresh plus one forced retry
+(two total attempts) per merge or batch.
+
+1. Resolve the exact registered alias and the canonical absolute checkout first
+   (`node .gitnexus/run.cjs list` — the project-local runner); never assume the
+   active worktree is the registered one.
+2. Resolve `<analyze-wrapper>` once: the machine's registered semantic-analyze
+   wrapper when one is pinned (machines managed by an operating kit document
+   the exact path in that kit's runbook — never invoke raw gitnexus for
+   machine-registered repos); on machines with no registered wrapper, the
+   project-local runner `node .gitnexus/run.cjs` fills the role. Then run:
+   `<analyze-wrapper> analyze --name <existing-alias> --embeddings --index-only <absolute-repository-path>`
+3. Verify from that repository:
+   `<analyze-wrapper> status`
+4. If incremental analysis reports an up-to-date index but status still shows
+   an older indexed commit, rerun once with `--force --embeddings
+   --index-only`. One retry only.
+5. Never refresh per commit, install a raw Git post-merge hook, or run blind
+   recurring analysis; machine-wide reconciliation belongs to the reviewed
+   `gitnexus-refresh-coordinator` scan/queue admission path.
+
+Deep refresh discipline (worker counts, staged embedding rebuilds, heap
+envelope, lock rules) lives in the codex-operating-kit runbook
+`runbooks/gitnexus-index-refresh.md` — read it before any non-routine refresh.
+
+(If this section and the codex-operating-kit runbook `runbooks/gitnexus-index-refresh.md` §Routine post-merge reconciliation ever differ, the runbook is canonical.)

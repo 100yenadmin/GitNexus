@@ -99,3 +99,11 @@ When no path exists, `trace` reports the furthest reachable node — exactly whe
 
 4. Root cause: fetchRates calls external API without proper timeout
 ```
+
+
+## Advanced graph instruments (de-cataloged 2026-08-26 — read directly when debugging GitNexus itself)
+
+- Program-dependence deep dive: read `../gitnexus-pdg-query/SKILL.md` (sibling dir) for `pdg_query` recipes.
+- Taint/flow tracing: read `../gitnexus-taint-analysis/SKILL.md` (sibling dir).
+- Full tool/table reference: read `../gitnexus-guide/SKILL.md` (sibling dir).
+These were removed from the startup catalog for zero invocation, not retired — they are the right instruments when a graph query itself misbehaves.
