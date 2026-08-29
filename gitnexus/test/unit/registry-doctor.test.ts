@@ -10,17 +10,45 @@ const doctorPoolMocks = vi.hoisted(() => ({
 vi.mock('../../src/cli/doctor-pool-probe.js', () => doctorPoolMocks);
 
 import {
-  buildRegistryDoctorReport,
+  buildRegistryDoctorReport as buildRegistryDoctorReportImpl,
   isLegacyMissingChunkIndexError,
   probeRegistryDatabaseCounts,
   type RegistryDatabaseCounts,
+  type RegistryDoctorOptions,
 } from '../../src/cli/registry-doctor.js';
+import { getQueryEmbeddingRuntimeStatus } from '../../src/core/embeddings/runtime-support.js';
 import {
   INDEX_METADATA_FILE,
+  readRegistryStrict,
   type RegistryEntry,
   type RepoMeta,
 } from '../../src/storage/repo-manager.js';
 import { createTempDir } from '../helpers/test-db.js';
+
+const buildRegistryDoctorReport = (options: RegistryDoctorOptions = {}) =>
+  buildRegistryDoctorReportImpl({
+    embeddingRuntimeProbe: () => ({ available: true, mode: 'local', reason: null }),
+    ...options,
+  });
+
+const withEnv = async <T>(
+  values: Record<string, string | undefined>,
+  callback: () => T | PromiseLike<T>,
+): Promise<T> => {
+  const previous = Object.fromEntries(Object.keys(values).map((key) => [key, process.env[key]]));
+  try {
+    for (const [key, value] of Object.entries(values)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    return await callback();
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+};
 
 const CAPABILITIES: NonNullable<RepoMeta['capabilities']> = {
   graph: { provider: 'ladybugdb', status: 'available' },
@@ -136,6 +164,87 @@ describe('doctor --registry read-only report (#133)', () => {
         new Error('Runtime exception: Binder exception: Column chunkIndex does not exist'),
       ),
     ).toBe(false);
+  });
+
+  it('probes query runtime once and reuses the result across the report', async () => {
+    const first = await createEntry(
+      fixture.dbPath,
+      'runtime-probe-first',
+      'RuntimeProbeFirst',
+      'https://github.com/owner/runtime-probe-first.git',
+      { nodes: 1, edges: 0, embeddings: 1 },
+    );
+    const second = await createEntry(
+      fixture.dbPath,
+      'runtime-probe-second',
+      'RuntimeProbeSecond',
+      'https://github.com/owner/runtime-probe-second.git',
+      { nodes: 1, edges: 0, embeddings: 1 },
+    );
+    const embeddingRuntimeProbe = vi.fn(async () => ({
+      available: false as const,
+      mode: 'local' as const,
+      reason: 'local-runtime-unloadable' as const,
+    }));
+
+    const report = await buildRegistryDoctorReport({
+      entries: [first.entry, second.entry],
+      embeddingRuntimeProbe,
+      databaseProbe: async () => ({
+        nodes: 1,
+        edges: 0,
+        embeddings: 1,
+        integrity: cleanIntegrity(1),
+      }),
+      headProbe: () => 'a'.repeat(40),
+    });
+
+    expect(embeddingRuntimeProbe).toHaveBeenCalledTimes(1);
+    expect(report.entries).toHaveLength(2);
+    expect(
+      report.entries.every((entry) =>
+        entry.health.reasons.includes('embedding-query-local-runtime-unloadable'),
+      ),
+    ).toBe(true);
+  });
+
+  it('skips the query runtime probe for failed, empty, and graph-only registries', async () => {
+    const embeddingRuntimeProbe = vi.fn(async () => ({
+      available: false as const,
+      mode: 'local' as const,
+      reason: 'local-runtime-unloadable' as const,
+    }));
+
+    const emptyReport = await buildRegistryDoctorReport({ entries: [], embeddingRuntimeProbe });
+    expect(emptyReport.summary.entries).toBe(0);
+    expect(embeddingRuntimeProbe).not.toHaveBeenCalled();
+
+    await fs.writeFile(path.join(fixture.dbPath, 'registry.json'), '{');
+    const failedReport = await withEnv({ GITNEXUS_HOME: fixture.dbPath }, () =>
+      buildRegistryDoctorReport({ embeddingRuntimeProbe }),
+    );
+    expect(failedReport.registryRead).toEqual({ status: 'failed', reason: 'malformed' });
+    expect(embeddingRuntimeProbe).not.toHaveBeenCalled();
+
+    const graphOnly = await createEntry(
+      fixture.dbPath,
+      'runtime-probe-graph-only',
+      'RuntimeProbeGraphOnly',
+      'https://github.com/owner/runtime-probe-graph-only.git',
+      { nodes: 1, edges: 0, embeddings: 0 },
+    );
+    await buildRegistryDoctorReport({
+      entries: [graphOnly.entry],
+      embeddingRuntimeProbe,
+      databaseProbe: async () => ({
+        nodes: 1,
+        edges: 0,
+        embeddings: 0,
+        integrity: cleanIntegrity(0),
+      }),
+      headProbe: () => 'a'.repeat(40),
+    });
+    expect(embeddingRuntimeProbe).not.toHaveBeenCalled();
   });
 
   it('reports canonical remote and alias collisions, count drift, and local-only entries', async () => {
@@ -284,6 +393,313 @@ describe('doctor --registry read-only report (#133)', () => {
     });
   });
 
+  it('requires provider-free query embedding readiness for embedding-bearing entries', async () => {
+    const indexed = await createEntry(
+      fixture.dbPath,
+      'query-runtime-missing',
+      'QueryRuntimeMissing',
+      'https://github.com/owner/query-runtime-missing.git',
+      { nodes: 1, edges: 0, embeddings: 1 },
+    );
+    const report = await buildRegistryDoctorReport({
+      entries: [indexed.entry],
+      databaseProbe: async () => ({
+        nodes: 1,
+        edges: 0,
+        embeddings: 1,
+        integrity: cleanIntegrity(1),
+      }),
+      capabilityProbe: async () => ({
+        fts: true,
+        vector: true,
+        vectorIndex: true,
+        vectorIndexReason: null,
+        exercisedConnections: 8,
+        connectionCount: 8,
+        reason: null,
+      }),
+      headProbe: () => 'a'.repeat(40),
+      embeddingRuntimeProbe: () => ({
+        available: false,
+        mode: 'local',
+        reason: 'local-runtime-unavailable',
+      }),
+    });
+
+    expect(report.entries[0]?.health).toMatchObject({
+      state: 'degraded',
+      semantic_ready: false,
+      reasons: ['embedding-query-local-runtime-unavailable'],
+    });
+  });
+
+  it('keeps a clean HTTP endpoint available but rejects raw query and fragment markers', async () => {
+    const keys = [
+      'GITNEXUS_EMBEDDING_URL',
+      'GITNEXUS_EMBEDDING_MODEL',
+      'GITNEXUS_EMBEDDING_DIMS',
+    ] as const;
+    const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+    try {
+      process.env.GITNEXUS_EMBEDDING_MODEL = 'test-model';
+      process.env.GITNEXUS_EMBEDDING_DIMS = '384';
+      for (const suffix of ['', '?', '#']) {
+        process.env.GITNEXUS_EMBEDDING_URL = `https://embedding.example/v1${suffix}`;
+        await expect(getQueryEmbeddingRuntimeStatus()).resolves.toEqual(
+          suffix === ''
+            ? { available: true, mode: 'http', reason: null }
+            : { available: false, mode: 'http', reason: 'http-config-invalid' },
+        );
+      }
+    } finally {
+      for (const key of keys) {
+        if (previous[key] === undefined) delete process.env[key];
+        else process.env[key] = previous[key];
+      }
+    }
+  });
+
+  it('rejects leading and trailing whitespace in raw HTTP URL/model values', async () => {
+    const incompleteHttp = {
+      mode: 'http',
+      available: false,
+      reason: 'http-config-incomplete',
+    };
+    for (const [url, model, expected] of [
+      [' https://embedding.example/v1', 'model', { mode: 'http', available: false }],
+      ['https://embedding.example/v1', 'model ', { mode: 'http', available: false }],
+      ['', '', { mode: 'local' }],
+      [undefined, undefined, { mode: 'local' }],
+      ['', 'model', incompleteHttp],
+      ['https://embedding.example/v1', '', incompleteHttp],
+      ['https://embedding.example/v1', undefined, incompleteHttp],
+      [undefined, 'model', incompleteHttp],
+    ]) {
+      await withEnv({ GITNEXUS_EMBEDDING_URL: url, GITNEXUS_EMBEDDING_MODEL: model }, () =>
+        expect(getQueryEmbeddingRuntimeStatus()).resolves.toMatchObject(expected),
+      );
+    }
+  });
+
+  it('rejects invalid local query config without loading a model', async () => {
+    await withEnv(
+      {
+        GITNEXUS_EMBEDDING_URL: undefined,
+        GITNEXUS_EMBEDDING_MODEL: undefined,
+        GITNEXUS_EMBEDDING_THREADS: '0',
+      },
+      () =>
+        expect(getQueryEmbeddingRuntimeStatus()).resolves.toEqual({
+          available: false,
+          mode: 'local',
+          reason: 'local-config-invalid',
+        }),
+    );
+  });
+
+  it('requires query runtime when metadata reports embeddings despite zero registry/database counts', async () => {
+    const indexed = await createEntry(
+      fixture.dbPath,
+      'metadata-embedding-bearing',
+      'MetadataEmbeddingBearing',
+      'https://github.com/owner/metadata-embedding-bearing.git',
+      { nodes: 1, edges: 0, embeddings: 1 },
+    );
+    indexed.entry.stats = { nodes: 1, edges: 0, embeddings: 0 };
+    const report = await buildRegistryDoctorReport({
+      entries: [indexed.entry],
+      databaseProbe: async () => ({
+        nodes: 1,
+        edges: 0,
+        embeddings: 0,
+        integrity: cleanIntegrity(0),
+      }),
+      embeddingRuntimeProbe: () => ({
+        available: false,
+        mode: 'local',
+        reason: 'local-runtime-unavailable',
+      }),
+      headProbe: () => 'a'.repeat(40),
+    });
+
+    expect(report.entries[0]?.health.reasons).toContain(
+      'embedding-query-local-runtime-unavailable',
+    );
+  });
+
+  it('compares explicit and default HTTP query dimensions with stored index width', async () => {
+    const indexed = await createEntry(
+      fixture.dbPath,
+      'dimension-check',
+      'DimensionCheck',
+      'https://github.com/owner/dimension-check.git',
+      { nodes: 1, edges: 0, embeddings: 1 },
+    );
+    const reportFor = (dimensions: string | undefined, stored: number) =>
+      withEnv(
+        {
+          GITNEXUS_EMBEDDING_URL: 'https://embedding.example/v1',
+          GITNEXUS_EMBEDDING_MODEL: 'test-model',
+          GITNEXUS_EMBEDDING_DIMS: dimensions,
+        },
+        () =>
+          buildRegistryDoctorReport({
+            entries: [indexed.entry],
+            databaseProbe: async () => ({
+              nodes: 1,
+              edges: 0,
+              embeddings: 1,
+              embeddingDimensions: stored,
+              integrity: cleanIntegrity(1),
+            }),
+            headProbe: () => 'a'.repeat(40),
+          }),
+      );
+
+    const explicitMismatch = await reportFor('512', 384);
+    expect(explicitMismatch.entries[0]?.health.reasons).toEqual([
+      'embedding-query-dimensions-mismatch',
+    ]);
+    expect(explicitMismatch.entries[0]?.health.semantic_ready).toBe(false);
+    const unsetMismatch = await reportFor(undefined, 512);
+    expect(unsetMismatch.entries[0]?.health.reasons).toContain(
+      'embedding-query-dimensions-mismatch',
+    );
+  });
+
+  it('rejects malformed registry stats values while accepting missing and safe-integer stats', async () => {
+    const previousHome = process.env.GITNEXUS_HOME;
+    process.env.GITNEXUS_HOME = fixture.dbPath;
+    const base = {
+      name: 'stats-shape',
+      path: path.join(fixture.dbPath, 'repo'),
+      storagePath: path.join(fixture.dbPath, 'repo', '.gitnexus'),
+      indexedAt: '2026-07-20T00:00:00.000Z',
+      lastCommit: 'a'.repeat(40),
+    };
+    try {
+      for (const stats of [
+        undefined,
+        {},
+        { nodes: 0, edges: 0, embeddings: 0 },
+        {
+          files: 4,
+          nodes: 2,
+          edges: 1,
+          communities: 1,
+          processes: 3,
+          embeddings: Number.MAX_SAFE_INTEGER,
+        },
+      ]) {
+        await fs.writeFile(
+          path.join(fixture.dbPath, 'registry.json'),
+          JSON.stringify([stats === undefined ? base : { ...base, stats }]),
+        );
+        expect((await readRegistryStrict()).status).toBe('available');
+      }
+
+      await fs.writeFile(
+        path.join(fixture.dbPath, 'registry.json'),
+        JSON.stringify([
+          {
+            ...base,
+            branches: [
+              {
+                branch: 'main',
+                indexedAt: base.indexedAt,
+                lastCommit: 'b'.repeat(40),
+                stats: { nodes: 0, edges: Number.MAX_SAFE_INTEGER },
+              },
+            ],
+          },
+        ]),
+      );
+      expect((await readRegistryStrict()).status).toBe('available');
+
+      for (const [key, value] of [
+        ['files', true],
+        ['nodes', null],
+        ['edges', '1'],
+        ['communities', [1]],
+        ['processes', -1],
+        ['embeddings', Number.NaN],
+        ['nodes', 1.5],
+        ['edges', Number.MAX_SAFE_INTEGER + 1],
+        ['unexpected', 1],
+      ] as const) {
+        await fs.writeFile(
+          path.join(fixture.dbPath, 'registry.json'),
+          JSON.stringify([{ ...base, stats: { [key]: value } }]),
+        );
+        expect(await readRegistryStrict()).toEqual({ status: 'failed', reason: 'malformed' });
+      }
+
+      for (const invalidPath of ['', '.', 'repo', 'repo/.gitnexus']) {
+        await fs.writeFile(
+          path.join(fixture.dbPath, 'registry.json'),
+          JSON.stringify([
+            invalidPath.endsWith('.gitnexus')
+              ? { ...base, storagePath: invalidPath }
+              : { ...base, path: invalidPath },
+          ]),
+        );
+        expect(await readRegistryStrict()).toEqual({ status: 'failed', reason: 'malformed' });
+      }
+
+      const baseJson = JSON.stringify(base);
+      const branchJson = JSON.stringify({
+        branch: 'main',
+        indexedAt: base.indexedAt,
+        lastCommit: 'b'.repeat(40),
+      });
+      const writeRawStats = async (stats: string, branchSummary = false) => {
+        const entry = branchSummary
+          ? `${baseJson.slice(0, -1)},"branches":[${branchJson.slice(0, -1)},"stats":${stats}}]}`
+          : `${baseJson.slice(0, -1)},"stats":${stats}}`;
+        await fs.writeFile(path.join(fixture.dbPath, 'registry.json'), `[${entry}]`);
+      };
+
+      for (const stats of ['{"nodes":NaN}', '{"nodes":Infinity}', '{"nodes":-Infinity}']) {
+        await writeRawStats(stats);
+        expect(await readRegistryStrict()).toEqual({ status: 'failed', reason: 'malformed' });
+      }
+      for (const stats of ['-0', '-1e-324', '9007199254740991.1', '9007199254740992.0']) {
+        for (const branchSummary of [false, true]) {
+          await writeRawStats(`{"nodes":${stats}}`, branchSummary);
+          expect(await readRegistryStrict()).toEqual({ status: 'failed', reason: 'malformed' });
+        }
+      }
+      for (const stats of [
+        '{"unexpected":1},"stats":{"nodes":1}',
+        '{"nodes":1},"stats":{"nodes":1}',
+      ]) {
+        for (const branchSummary of [false, true]) {
+          await writeRawStats(stats, branchSummary);
+          expect(await readRegistryStrict()).toEqual({ status: 'failed', reason: 'malformed' });
+        }
+      }
+
+      await writeRawStats('{"nodes":90071992547409910e-1}');
+      expect(await readRegistryStrict()).toEqual({
+        status: 'available',
+        entries: [{ ...base, stats: { nodes: Number.MAX_SAFE_INTEGER } }],
+      });
+
+      await writeRawStats(`{"nodes":1${'0'.repeat(1_000_000)}e-1}`);
+      expect(await readRegistryStrict()).toEqual({ status: 'failed', reason: 'malformed' });
+
+      for (const firstValue of ['"corrupt"', 'null', 'true']) {
+        for (const branchSummary of [false, true]) {
+          await writeRawStats(`{"nodes":${firstValue},"nodes":1}`, branchSummary);
+          expect(await readRegistryStrict()).toEqual({ status: 'failed', reason: 'malformed' });
+        }
+      }
+    } finally {
+      if (previousHome === undefined) delete process.env.GITNEXUS_HOME;
+      else process.env.GITNEXUS_HOME = previousHome;
+    }
+  });
+
   it('keeps a graph-only index healthy when the embedding table is absent', async () => {
     const indexed = await createEntry(
       fixture.dbPath,
@@ -292,16 +708,25 @@ describe('doctor --registry read-only report (#133)', () => {
       'https://github.com/owner/graph-only.git',
       { nodes: 1, edges: 0, embeddings: 0 },
     );
-    const report = await buildRegistryDoctorReport({
-      entries: [indexed.entry],
-      databaseProbe: async () => ({
-        nodes: 1,
-        edges: 0,
-        embeddings: 0,
-        integrity: { ...cleanIntegrity(0), tablePresent: false },
-      }),
-      headProbe: () => 'a'.repeat(40),
-    });
+    const report = await withEnv(
+      {
+        GITNEXUS_EMBEDDING_URL: 'https://embedding.example/v1',
+        GITNEXUS_EMBEDDING_MODEL: 'model',
+        GITNEXUS_EMBEDDING_DIMS: '512',
+      },
+      () =>
+        buildRegistryDoctorReport({
+          entries: [indexed.entry],
+          databaseProbe: async () => ({
+            nodes: 1,
+            edges: 0,
+            embeddings: 0,
+            embeddingDimensions: 384,
+            integrity: { ...cleanIntegrity(0), tablePresent: false },
+          }),
+          headProbe: () => 'a'.repeat(40),
+        }),
+    );
     expect(report.entries[0]?.health).toMatchObject({
       state: 'healthy',
       semantic_ready: false,

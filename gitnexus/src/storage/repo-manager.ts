@@ -20,6 +20,7 @@ import path from 'path';
 import os from 'os';
 import { randomBytes } from 'crypto';
 import { isDeepStrictEqual } from 'util';
+import { visit } from 'jsonc-parser';
 import {
   getInferredRepoName,
   getRemoteUrl,
@@ -956,6 +957,171 @@ export const getGlobalDir = (): string => {
  */
 export const getGlobalRegistryPath = (): string => {
   return path.join(getGlobalDir(), 'registry.json');
+};
+
+export type RegistryReadFailure = 'unreadable' | 'malformed' | 'not-array';
+
+export type RegistryReadResult =
+  | { status: 'available'; entries: RegistryEntry[] }
+  | { status: 'failed'; reason: RegistryReadFailure };
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value);
+
+const REGISTRY_STATS_KEYS = [
+  'files',
+  'nodes',
+  'edges',
+  'communities',
+  'processes',
+  'embeddings',
+] as const;
+
+const isFiniteNonnegativeSafeInteger = (value: unknown): value is number =>
+  typeof value === 'number' && Number.isSafeInteger(value) && !Object.is(value, -0) && value >= 0;
+
+// JSON.parse can round a raw decimal such as 9007199254740991.1 to a safe
+// integer. Validate the exact numeric token before trusting the parsed value.
+const isRawSafeIntegerToken = (token: string): boolean => {
+  const match = /^-?(\d+)(?:\.(\d+))?(?:[eE]([+-]?\d+))?$/.exec(token);
+  if (!match) return false;
+
+  const negative = token.startsWith('-');
+  const integerPart = match[1];
+  const fractionPart = match[2] ?? '';
+  const coefficient = `${integerPart}${fractionPart}`.replace(/^0+/, '');
+  if (coefficient.length === 0) return true;
+
+  const exponent = Number(match[3] ?? 0);
+  if (!Number.isSafeInteger(exponent)) return false;
+  const scale = exponent - fractionPart.length;
+  let integerDigits: string;
+  if (scale >= 0) {
+    if (coefficient.length + scale > 16) return false;
+    integerDigits = `${coefficient}${'0'.repeat(scale)}`;
+  } else {
+    const shift = -scale;
+    if (shift >= coefficient.length) return false;
+    const split = coefficient.length - shift;
+    if (!/^0+$/.test(coefficient.slice(split))) return false;
+    integerDigits = coefficient.slice(0, split);
+  }
+
+  if (integerDigits.length > 16) return false;
+  const magnitude = BigInt(integerDigits);
+  return magnitude <= BigInt(Number.MAX_SAFE_INTEGER) && !(negative && magnitude === 0n);
+};
+
+const hasValidRawRegistryStatsNumbers = (raw: string): boolean => {
+  let valid = true;
+  const seenStatsObjects = new Set<string>();
+  const seenStatKeys = new Set<string>();
+  visit(raw, {
+    onObjectProperty(name, _offset, _length, _line, _character, pathSupplier) {
+      if (!valid) return;
+      const jsonPath = pathSupplier();
+      const isEntryStatsObject = jsonPath.length === 1 && typeof jsonPath[0] === 'number';
+      const isBranchStatsObject =
+        jsonPath.length === 3 &&
+        typeof jsonPath[0] === 'number' &&
+        jsonPath[1] === 'branches' &&
+        typeof jsonPath[2] === 'number';
+      if (name === 'stats' && (isEntryStatsObject || isBranchStatsObject)) {
+        const pathKey = JSON.stringify(jsonPath);
+        if (seenStatsObjects.has(pathKey)) valid = false;
+        else seenStatsObjects.add(pathKey);
+        return;
+      }
+      const isEntryStatProperty =
+        jsonPath.length === 2 && typeof jsonPath[0] === 'number' && jsonPath[1] === 'stats';
+      const isBranchStatProperty =
+        jsonPath.length === 4 &&
+        typeof jsonPath[0] === 'number' &&
+        jsonPath[1] === 'branches' &&
+        typeof jsonPath[2] === 'number' &&
+        jsonPath[3] === 'stats';
+      if (!isEntryStatProperty && !isBranchStatProperty) return;
+      const statKey = `${JSON.stringify(jsonPath)}:${JSON.stringify(name)}`;
+      if (seenStatKeys.has(statKey)) valid = false;
+      else seenStatKeys.add(statKey);
+    },
+    onLiteralValue(value, offset, length, _line, _character, pathSupplier) {
+      if (!valid || typeof value !== 'number') return;
+      const jsonPath = pathSupplier();
+      const isEntryStat =
+        jsonPath.length === 3 && typeof jsonPath[0] === 'number' && jsonPath[1] === 'stats';
+      const isBranchStat =
+        jsonPath.length === 5 &&
+        typeof jsonPath[0] === 'number' &&
+        jsonPath[1] === 'branches' &&
+        typeof jsonPath[2] === 'number' &&
+        jsonPath[3] === 'stats';
+      if (!isEntryStat && !isBranchStat) return;
+      const statKey = jsonPath[jsonPath.length - 1];
+      valid =
+        typeof statKey === 'string' &&
+        REGISTRY_STATS_KEYS.includes(statKey as (typeof REGISTRY_STATS_KEYS)[number]) &&
+        isFiniteNonnegativeSafeInteger(value) &&
+        isRawSafeIntegerToken(raw.slice(offset, offset + length));
+    },
+    onError() {
+      valid = false;
+    },
+  });
+  return valid;
+};
+
+const isStatsShape = (value: unknown): boolean =>
+  value === undefined ||
+  (isRecord(value) &&
+    Object.entries(value).every(
+      ([key, stat]) =>
+        REGISTRY_STATS_KEYS.includes(key as (typeof REGISTRY_STATS_KEYS)[number]) &&
+        isFiniteNonnegativeSafeInteger(stat),
+    ));
+
+const isBranchSummaryShape = (value: unknown): boolean =>
+  isRecord(value) &&
+  typeof value.branch === 'string' &&
+  typeof value.indexedAt === 'string' &&
+  typeof value.lastCommit === 'string' &&
+  isStatsShape(value.stats);
+
+const isAbsoluteRegistryPath = (value: unknown): value is string =>
+  typeof value === 'string' && (path.isAbsolute(value) || path.win32.isAbsolute(value));
+
+const isRegistryEntryShape = (value: unknown): value is RegistryEntry =>
+  isRecord(value) &&
+  ['name', 'indexedAt', 'lastCommit'].every((key) => typeof value[key] === 'string') &&
+  isAbsoluteRegistryPath(value.path) &&
+  isAbsoluteRegistryPath(value.storagePath) &&
+  (value.remoteUrl === undefined || typeof value.remoteUrl === 'string') &&
+  (value.branch === undefined || typeof value.branch === 'string') &&
+  isStatsShape(value.stats) &&
+  (value.branches === undefined ||
+    (Array.isArray(value.branches) && value.branches.every(isBranchSummaryShape)));
+
+export const readRegistryStrict = async (): Promise<RegistryReadResult> => {
+  let raw: string;
+  try {
+    raw = await fs.readFile(getGlobalRegistryPath(), 'utf-8');
+  } catch (error) {
+    if (isMissingFilesystemError(error)) {
+      return { status: 'available', entries: [] };
+    }
+    return { status: 'failed', reason: 'unreadable' };
+  }
+
+  let data: unknown;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    return { status: 'failed', reason: 'malformed' };
+  }
+  if (!Array.isArray(data)) return { status: 'failed', reason: 'not-array' };
+  if (!hasValidRawRegistryStatsNumbers(raw)) return { status: 'failed', reason: 'malformed' };
+  if (!data.every(isRegistryEntryShape)) return { status: 'failed', reason: 'malformed' };
+  return { status: 'available', entries: data };
 };
 
 /**

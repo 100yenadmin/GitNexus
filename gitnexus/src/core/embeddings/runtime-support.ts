@@ -10,14 +10,147 @@
  * cannot rescue this — the failure is at native-module import time, not backend
  * selection (#1516).
  *
- * This module is intentionally free of any native or transformers.js import (at
- * module scope or inside its functions) so it can be consulted *before* the
- * dynamic import that would crash. HTTP embedding mode never touches the native
- * runtime, so callers in HTTP mode must skip this guard.
- * (The runtime-install import below only resolves paths — it never loads the
- * embedding stack.)
+ * This module has no native or transformers.js import at module scope, so it
+ * can be consulted *before* the dynamic import that would crash. Its query
+ * readiness probe performs the production resolver-hook chain and one guarded,
+ * lazy transformers.js import only after local config/platform gates pass. HTTP
+ * embedding mode never touches the native runtime, so callers in HTTP mode must
+ * skip this guard.
  */
-import { resolveEmbeddingRuntime } from './runtime-install.js';
+import {
+  ensureEmbeddingStackResolvable,
+  isPrefixRuntimeLoadable,
+  resolveEmbeddingRuntime,
+} from './runtime-install.js';
+import { ensureOnnxRuntimeCommonResolvable } from './onnxruntime-common-resolver.js';
+import { ensureOnnxRuntimeNodeMatchesSystem } from './onnxruntime-node-resolver.js';
+import { resolveEmbeddingConfig } from './config.js';
+import { DEFAULT_EMBEDDING_CONFIG } from './types.js';
+
+export type QueryEmbeddingRuntimeStatus = {
+  available: boolean;
+  mode: 'http' | 'local';
+  reason:
+    | 'http-config-incomplete'
+    | 'http-config-invalid'
+    | 'local-config-invalid'
+    | 'local-runtime-unavailable'
+    | 'local-runtime-unloadable'
+    | null;
+};
+
+const validHttpInteger = (name: string, max: number, allowZero: boolean): boolean => {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return true;
+  if (!/^\d+$/.test(raw)) return false;
+  const parsed = Number(raw);
+  return Number.isSafeInteger(parsed) && parsed <= max && (allowZero ? parsed >= 0 : parsed > 0);
+};
+
+/**
+ * Provider-free readiness for the query embedding path. This validates local
+ * module resolution/platform gates and imports the local runtime module, or
+ * validates the shape of an installed HTTP wrapper configuration. It never
+ * initializes a model, opens a socket, or stores an endpoint, model, or secret
+ * in the returned status.
+ */
+export const getQueryEmbeddingRuntimeStatus = async (): Promise<QueryEmbeddingRuntimeStatus> => {
+  const rawUrl = process.env.GITNEXUS_EMBEDDING_URL;
+  const rawModel = process.env.GITNEXUS_EMBEDDING_MODEL;
+  if (Boolean(rawUrl) !== Boolean(rawModel)) {
+    return { available: false, mode: 'http', reason: 'http-config-incomplete' };
+  }
+  if (rawUrl && rawModel) {
+    if (rawUrl !== rawUrl.trim() || rawModel !== rawModel.trim()) {
+      return { available: false, mode: 'http', reason: 'http-config-invalid' };
+    }
+    try {
+      new Headers({
+        Authorization: `Bearer ${process.env.GITNEXUS_EMBEDDING_API_KEY ?? 'unused'}`,
+      });
+    } catch {
+      return { available: false, mode: 'http', reason: 'http-config-invalid' };
+    }
+    try {
+      const endpoint = new URL(rawUrl);
+      if (
+        rawUrl.includes('?') ||
+        rawUrl.includes('#') ||
+        (endpoint.protocol !== 'http:' && endpoint.protocol !== 'https:') ||
+        endpoint.username !== '' ||
+        endpoint.password !== '' ||
+        endpoint.search !== '' ||
+        endpoint.hash !== ''
+      ) {
+        return { available: false, mode: 'http', reason: 'http-config-invalid' };
+      }
+    } catch {
+      return { available: false, mode: 'http', reason: 'http-config-invalid' };
+    }
+    if (
+      process.env.GITNEXUS_EMBEDDING_DIMS === '' ||
+      !validHttpInteger('GITNEXUS_EMBEDDING_DIMS', Number.MAX_SAFE_INTEGER, false)
+    ) {
+      return { available: false, mode: 'http', reason: 'http-config-invalid' };
+    }
+    if (!validHttpInteger('GITNEXUS_EMBEDDING_MAX_ATTEMPTS', 20, false)) {
+      return { available: false, mode: 'http', reason: 'http-config-invalid' };
+    }
+    if (!validHttpInteger('GITNEXUS_EMBEDDING_RETRY_CAP_MS', 300_000, false)) {
+      return { available: false, mode: 'http', reason: 'http-config-invalid' };
+    }
+    if (!validHttpInteger('GITNEXUS_EMBEDDING_MIN_INTERVAL_MS', 300_000, true)) {
+      return { available: false, mode: 'http', reason: 'http-config-invalid' };
+    }
+    return { available: true, mode: 'http', reason: null };
+  }
+
+  try {
+    // Keep this in lockstep with the production MCP query path, but stop before
+    // any model or native runtime import. The resolver only validates the local
+    // batch/device/thread environment values and applies production defaults.
+    resolveEmbeddingConfig();
+  } catch {
+    return { available: false, mode: 'local', reason: 'local-config-invalid' };
+  }
+
+  const blocker = getLocalEmbeddingRuntimeBlocker();
+  if (blocker) return { available: false, mode: 'local', reason: 'local-runtime-unavailable' };
+  const resolution = resolveEmbeddingRuntime();
+  if (resolution === null) {
+    return { available: false, mode: 'local', reason: 'local-runtime-unavailable' };
+  }
+  if (resolution.source === 'runtime-prefix' && !isPrefixRuntimeLoadable()) {
+    return { available: false, mode: 'local', reason: 'local-runtime-unloadable' };
+  }
+
+  // Mirror the production hook order. These hooks only register in-process ESM
+  // resolution fallbacks; importing transformers.js loads the native runtime
+  // without creating a pipeline, loading a model, or making a provider/network
+  // request.
+  try {
+    ensureEmbeddingStackResolvable();
+    ensureOnnxRuntimeCommonResolvable();
+    ensureOnnxRuntimeNodeMatchesSystem();
+    await import('@huggingface/transformers');
+  } catch {
+    return { available: false, mode: 'local', reason: 'local-runtime-unloadable' };
+  }
+  return { available: true, mode: 'local', reason: null };
+};
+
+/**
+ * Return the dimensions produced by the query path without loading a model or
+ * importing the HTTP client. Validated HTTP callers use the configured value;
+ * an unset value and local queries use the production default.
+ */
+export const getQueryEmbeddingDimensions = (): number => {
+  if (process.env.GITNEXUS_EMBEDDING_URL && process.env.GITNEXUS_EMBEDDING_MODEL) {
+    const raw = process.env.GITNEXUS_EMBEDDING_DIMS;
+    return raw === undefined ? DEFAULT_EMBEDDING_CONFIG.dimensions : Number(raw);
+  }
+  return DEFAULT_EMBEDDING_CONFIG.dimensions;
+};
 
 /**
  * Stable lead line of the macOS-Intel blocker message. Also used to recognise

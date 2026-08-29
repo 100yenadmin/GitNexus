@@ -326,8 +326,22 @@ Before starting MCP, `gitnexus doctor --mcp-config --json` checks the configured
 allowlist/default with the production resolver but does not bind a transport or
 open an index. `gitnexus doctor --registry --json` reports remote/alias
 collisions, registry/metadata/database count agreement, recovery sidecars,
-locks, and live read-pool capabilities through read-only handles. Absolute paths are
-omitted unless `--show-paths` is supplied explicitly.
+locks, and live read-pool capabilities through read-only handles. Its additive
+`registryRead` field reports `available` or a sanitized `failed` reason
+(`unreadable`, `malformed`, or `not-array`); a failed registry read is distinct
+from a valid empty array. Absolute paths are omitted unless `--show-paths` is
+supplied explicitly.
+
+Each entry is `healthy`, `degraded`, or `quarantined`. Health covers identity
+integrity, freshness, count alignment, recovery state, collisions, and live
+query capabilities. For an embedding-bearing entry, `semantic_ready: true`
+also requires the provider-free query embedding runtime check: a loadable local
+runtime or a syntactically valid installed HTTP wrapper configuration. The
+check does not call a provider, download a model, or prove endpoint reachability
+or model compatibility. A healthy graph-only entry may therefore have
+`semantic_ready: false` because it has no embeddings. The command exits nonzero
+for any degraded/quarantined entry or registry-read failure, including malformed,
+non-array, or unreadable `registry.json`; a valid empty registry exits zero.
 
 ## Supported Languages
 

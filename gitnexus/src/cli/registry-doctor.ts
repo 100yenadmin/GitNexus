@@ -5,16 +5,18 @@ import {
   assertSafeStoragePath,
   getStoragePaths,
   loadMeta,
-  readRegistry,
+  readRegistryStrict,
   type RegistryEntry,
+  type RegistryReadFailure,
   type RepoMeta,
 } from '../storage/repo-manager.js';
-import {
-  EXPECTED_POOL_CONNECTIONS,
-  probeDoctorPool,
-  type DoctorPoolProbe,
-} from './doctor-pool-probe.js';
+import type { DoctorPoolProbe } from './doctor-pool-probe.js';
 import type { EmbeddingIntegrityReport } from '../core/lbug/lbug-adapter.js';
+import {
+  getQueryEmbeddingDimensions,
+  getQueryEmbeddingRuntimeStatus,
+  type QueryEmbeddingRuntimeStatus,
+} from '../core/embeddings/runtime-support.js';
 
 export interface RegistryCounts {
   nodes: number | null;
@@ -64,6 +66,13 @@ export interface RegistryHealthReport {
  * Typed integration seam for the production non-recovering read-pool probe.
  */
 export type RegistryCapabilityProbe = (lbugPath: string) => Promise<DoctorPoolProbe>;
+
+const EXPECTED_POOL_CONNECTIONS = 8;
+
+const probeRegistryDoctorPool: RegistryCapabilityProbe = async (lbugPath) => {
+  const { probeDoctorPool } = await import('./doctor-pool-probe.js');
+  return probeDoctorPool(lbugPath);
+};
 
 interface FileState {
   status: 'absent' | 'present' | 'inaccessible';
@@ -145,6 +154,7 @@ export interface RegistryDoctorReport {
   mode: 'registry';
   readOnly: true;
   pathsShown: boolean;
+  registryRead: { status: 'available' } | { status: 'failed'; reason: RegistryReadFailure };
   summary: {
     entries: number;
     remoteIdentities: number;
@@ -177,6 +187,10 @@ export interface RegistryDoctorOptions {
   entries?: readonly RegistryEntry[];
   databaseProbe?: RegistryDatabaseProbe;
   capabilityProbe?: RegistryCapabilityProbe;
+  /** Provider-free query-runtime seam for deterministic semantic readiness. */
+  embeddingRuntimeProbe?: () =>
+    | QueryEmbeddingRuntimeStatus
+    | PromiseLike<QueryEmbeddingRuntimeStatus>;
   /** Injectable live-head seam for deterministic registry diagnostics. */
   headProbe?: (repoPath: string) => string;
 }
@@ -525,6 +539,7 @@ const inspectEntry = async (
   entry: RegistryEntry,
   entryPosition: number,
   options: RegistryDoctorOptions,
+  getEmbeddingRuntime: () => Promise<QueryEmbeddingRuntimeStatus>,
 ): Promise<RegistryEntryDoctorReport> => {
   const normalizedRemote = normalizeRepositoryRemote(entry.remoteUrl);
   const identity: RegistryEntryDoctorReport['identity'] = normalizedRemote
@@ -611,6 +626,7 @@ const inspectEntry = async (
 
   let database: RegistryEntryDoctorReport['database'];
   let availableCounts: RegistryDatabaseCounts | null = null;
+  let storedEmbeddingDimensions: number | undefined;
   if (databaseFile.status === 'absent') {
     database = { status: 'skipped', reason: 'database-missing' };
   } else if (databaseFile.status === 'inaccessible') {
@@ -630,6 +646,7 @@ const inspectEntry = async (
         embeddingDimensions,
         ...scannedCounts
       } = await (options.databaseProbe ?? probeRegistryDatabaseCounts)(lbugPath);
+      storedEmbeddingDimensions = embeddingDimensions;
       availableCounts = scannedCounts;
       let integrity =
         scannedIntegrity ??
@@ -694,7 +711,7 @@ const inspectEntry = async (
   if (availableCounts) {
     try {
       capabilities = liveCapabilities(
-        await (options.capabilityProbe ?? probeDoctorPool)(lbugPath),
+        await (options.capabilityProbe ?? probeRegistryDoctorPool)(lbugPath),
         availableCounts.embeddings,
       );
     } catch {
@@ -705,6 +722,16 @@ const inspectEntry = async (
   const countComparison = compareCounts(base.registry.counts, counts, availableCounts);
   const indexedSha = nonEmptySha(meta?.lastCommit);
   const freshness = freshnessFor(indexedSha, base.registry_sha, headSha);
+  const embeddings = database.status === 'available' ? database.counts.embeddings : 0;
+  const embeddingBearing =
+    embeddings > 0 || (base.registry.counts.embeddings ?? 0) > 0 || (counts.embeddings ?? 0) > 0;
+  const embeddingRuntime = embeddingBearing ? await getEmbeddingRuntime() : null;
+  const queryDimensions = getQueryEmbeddingDimensions();
+  const queryDimensionMismatch =
+    embeddingBearing &&
+    storedEmbeddingDimensions !== undefined &&
+    Number.isSafeInteger(queryDimensions) &&
+    queryDimensions !== storedEmbeddingDimensions;
   const semanticReady =
     database.status === 'available' &&
     database.counts.embeddings > 0 &&
@@ -715,7 +742,9 @@ const inspectEntry = async (
     capabilities.source === 'active-probe' &&
     capabilities.graph === 'available' &&
     capabilities.fts === 'available' &&
-    capabilities.vectorSearch === 'vector-index';
+    capabilities.vectorSearch === 'vector-index' &&
+    embeddingRuntime?.available === true &&
+    !queryDimensionMismatch;
   const reasons: string[] = [];
   const integrity = database.status === 'available' ? database.integrity.status : 'unavailable';
   if (integrity !== 'clean') reasons.push(`embedding-identity-${integrity}`);
@@ -726,10 +755,13 @@ const inspectEntry = async (
   if (capabilities.source !== 'active-probe') reasons.push('capabilities-unavailable');
   if (capabilities.graph !== 'available') reasons.push('graph-unavailable');
   if (capabilities.fts !== 'available') reasons.push('fts-unavailable');
-  const embeddings = database.status === 'available' ? database.counts.embeddings : 0;
   if (embeddings > 0 && capabilities.vectorSearch !== 'vector-index') {
     reasons.push('vector-index-unavailable');
   }
+  if (embeddingBearing && embeddingRuntime?.available !== true) {
+    reasons.push(`embedding-query-${embeddingRuntime?.reason ?? 'runtime-unavailable'}`);
+  }
+  if (queryDimensionMismatch) reasons.push('embedding-query-dimensions-mismatch');
 
   return {
     ...base,
@@ -754,7 +786,10 @@ const inspectEntry = async (
 export async function buildRegistryDoctorReport(
   options: RegistryDoctorOptions = {},
 ): Promise<RegistryDoctorReport> {
-  const entries = options.entries ? [...options.entries] : await readRegistry();
+  const registryResult = options.entries
+    ? ({ status: 'available', entries: [...options.entries] } as const)
+    : await readRegistryStrict();
+  const entries = registryResult.status === 'available' ? registryResult.entries : [];
   const indexed = entries.map((entry, index) => ({ entry, entryPosition: index + 1 }));
 
   const remoteGroups = new Map<string, typeof indexed>();
@@ -785,12 +820,20 @@ export async function buildRegistryDoctorReport(
       ...(options.showPaths ? { paths: items.map((item) => item.entry.path) } : {}),
     }));
 
+  let embeddingRuntimePromise: Promise<QueryEmbeddingRuntimeStatus> | undefined;
+  const getEmbeddingRuntime = (): Promise<QueryEmbeddingRuntimeStatus> => {
+    embeddingRuntimePromise ??= Promise.resolve(
+      (options.embeddingRuntimeProbe ?? getQueryEmbeddingRuntimeStatus)(),
+    );
+    return embeddingRuntimePromise;
+  };
+
   // Open at most one LadybugDB handle at a time. Registry diagnosis is an
   // operator preflight, not a throughput path, and concurrent read-only opens
   // across a large fleet would create avoidable native-runtime pressure.
   const reports: RegistryEntryDoctorReport[] = [];
   for (const { entry, entryPosition } of indexed) {
-    reports.push(await inspectEntry(entry, entryPosition, options));
+    reports.push(await inspectEntry(entry, entryPosition, options, getEmbeddingRuntime));
   }
   const remoteCollisionPositions = new Set(
     remotes.flatMap((collision) => collision.entryPositions),
@@ -820,6 +863,10 @@ export async function buildRegistryDoctorReport(
     mode: 'registry',
     readOnly: true,
     pathsShown: options.showPaths === true,
+    registryRead:
+      registryResult.status === 'available'
+        ? { status: 'available' }
+        : { status: 'failed', reason: registryResult.reason },
     summary: {
       entries: healthReports.length,
       remoteIdentities,

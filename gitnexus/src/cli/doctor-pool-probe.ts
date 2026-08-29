@@ -1,5 +1,3 @@
-import { EMBEDDING_INDEX_NAME, EMBEDDING_TABLE_NAME } from '../core/lbug/schema.js';
-
 export interface DoctorPoolProbe {
   fts: boolean;
   vector: boolean;
@@ -28,7 +26,6 @@ interface DoctorPoolAdapter {
 
 export const EXPECTED_POOL_CONNECTIONS = 8;
 const MAX_DOCTOR_VECTOR_DIMENSIONS = 65_536;
-const EMBEDDING_TABLE_INFO_QUERY = `CALL TABLE_INFO('${EMBEDDING_TABLE_NAME}') RETURN *`;
 
 const storedEmbeddingDimensions = (rows: unknown[]): number | null => {
   for (const row of rows) {
@@ -44,10 +41,14 @@ const storedEmbeddingDimensions = (rows: unknown[]): number | null => {
   return null;
 };
 
-const vectorIndexProbeQuery = (dimensions: number): string => {
+const vectorIndexProbeQuery = (
+  embeddingTableName: string,
+  embeddingIndexName: string,
+  dimensions: number,
+): string => {
   const zeroVector = `[${Array.from({ length: dimensions }, () => '0').join(',')}]`;
   return `
-  CALL QUERY_VECTOR_INDEX('${EMBEDDING_TABLE_NAME}', '${EMBEDDING_INDEX_NAME}',
+  CALL QUERY_VECTOR_INDEX('${embeddingTableName}', '${embeddingIndexName}',
     CAST(${zeroVector} AS FLOAT[${dimensions}]), 1)
   YIELD node AS emb, distance
   RETURN distance
@@ -63,6 +64,8 @@ export async function probeDoctorPool(dbPath: string): Promise<DoctorPoolProbe> 
   const repoId = `doctor:${process.pid}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
   let closePool: DoctorPoolAdapter['closeLbug'] | undefined;
   try {
+    const { EMBEDDING_INDEX_NAME, EMBEDDING_TABLE_NAME } = await import('../core/lbug/schema.js');
+    const embeddingTableInfoQuery = `CALL TABLE_INFO('${EMBEDDING_TABLE_NAME}') RETURN *`;
     // Keep the native pool out of the static CLI import graph so diagnostics
     // can still report a missing or broken lbugjs.node module.
     const pool =
@@ -92,14 +95,17 @@ export async function probeDoctorPool(dbPath: string): Promise<DoctorPoolProbe> 
     let vectorIndexReason: DoctorPoolProbe['vectorIndexReason'] = 'vector-extension-unavailable';
     if (capabilities.vector) {
       try {
-        const tableInfo = await pool.executeQuery(repoId, EMBEDDING_TABLE_INFO_QUERY);
+        const tableInfo = await pool.executeQuery(repoId, embeddingTableInfoQuery);
         const dimensions = storedEmbeddingDimensions(tableInfo);
         if (dimensions === null) throw new Error('stored embedding dimension is unavailable');
         // A successful zero-result query is still proof that the named HNSW
         // index exists and is queryable. Extension loading alone is not:
         // QUERY_VECTOR_INDEX prepares successfully only when this database has
         // the exact index production semantic retrieval uses.
-        await pool.executeQuery(repoId, vectorIndexProbeQuery(dimensions));
+        await pool.executeQuery(
+          repoId,
+          vectorIndexProbeQuery(EMBEDDING_TABLE_NAME, EMBEDDING_INDEX_NAME, dimensions),
+        );
         vectorIndex = true;
         vectorIndexReason = null;
       } catch {
