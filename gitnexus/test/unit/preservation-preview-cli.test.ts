@@ -1,5 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { preservationPreviewCommand } from '../../src/cli/preservation-preview-cli.js';
+import {
+  derivePreservationChunkIndices,
+  preservationPreviewCommand,
+} from '../../src/cli/preservation-preview-cli.js';
 
 describe('preservation preview CLI admission', () => {
   const originalExitCode = process.exitCode;
@@ -8,6 +11,22 @@ describe('preservation preview CLI admission', () => {
     process.exitCode = originalExitCode;
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
+  });
+
+  it('uses one chunk for long short labels just like production embedding', async () => {
+    const node = {
+      id: 'TypeAlias:long',
+      name: 'long',
+      label: 'TypeAlias',
+      filePath: 'types.ts',
+      content: 'x'.repeat(1_300),
+      startLine: 4,
+      endLine: 8,
+    };
+    const chunkNode = vi.fn(async () => [{ chunkIndex: 1 }]);
+
+    await expect(derivePreservationChunkIndices(node, chunkNode)).resolves.toEqual([0]);
+    expect(chunkNode).not.toHaveBeenCalled();
   });
 
   it('refuses an incomplete preview before repository or provider work', async () => {

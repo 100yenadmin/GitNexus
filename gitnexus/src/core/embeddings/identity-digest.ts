@@ -45,9 +45,9 @@ const updatePart = (digest: ReturnType<typeof createHash>, _name: string, value:
 };
 const updateVectorValue = (digest: ReturnType<typeof createHash>, value: unknown): void => {
   if (typeof value === 'number') {
-    // Persisted embedding values are FLOAT32; hash their canonical bytes.
-    const bytes = Buffer.allocUnsafe(4);
-    bytes.writeFloatBE(value);
+    // Physical evidence retains the v1 Float64 value encoding.
+    const bytes = Buffer.allocUnsafe(8);
+    bytes.writeDoubleBE(value);
     digest.update(Buffer.from([1])).update(bytes);
     return;
   }

@@ -4,6 +4,14 @@
  * canonical index merely because it shares the `analyze` command surface.
  */
 export const analyzeAction = async (inputPath?: string, options?: Record<string, unknown>) => {
+  const hasPreservationOnlyOption =
+    options?.dryRun === true ||
+    options?.json === true ||
+    options?.planDigest !== undefined ||
+    options?.maxReembedNodes !== undefined;
+  if (hasPreservationOnlyOption && options?.preserveVerifiedEmbeddings !== true) {
+    throw new Error('preservation-only options require --preserve-verified-embeddings');
+  }
   if (options?.preserveVerifiedEmbeddings === true) {
     if (options?.dryRun === true) {
       const { preservationPreviewCommand } = await import('./preservation-preview-cli.js');

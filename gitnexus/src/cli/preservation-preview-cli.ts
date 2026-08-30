@@ -18,7 +18,12 @@ import {
   PRESERVATION_PLANNER_VERSION,
 } from '../core/embeddings/preservation-plan.js';
 import { httpEmbeddingProvider } from '../core/embeddings/embedding-identity.js';
-import { DEFAULT_EMBEDDING_CONFIG, type EmbeddableNode } from '../core/embeddings/types.js';
+import {
+  DEFAULT_EMBEDDING_CONFIG,
+  isShortLabel,
+  type EmbeddableNode,
+} from '../core/embeddings/types.js';
+import type { Chunk } from '../core/embeddings/chunker.js';
 import { canonicalizePath, getStoragePaths, loadMeta } from '../storage/repo-manager.js';
 import { getCurrentBranch, getCurrentCommit, getGitRoot } from '../storage/git.js';
 import type { PreservationPlan } from '../core/embeddings/preservation-plan.js';
@@ -42,6 +47,29 @@ export interface PreservationPreviewCliOptions extends Record<string, unknown> {
   repairFts?: boolean;
   repairVector?: boolean;
 }
+
+type ChunkNode = (
+  label: string,
+  content: string,
+  filePath: string,
+  startLine: number,
+  endLine: number,
+  chunkSize?: number,
+  overlap?: number,
+) => Promise<Chunk[]>;
+
+/** Match the production embedding pipeline's exact chunk-index admission rule. */
+export const derivePreservationChunkIndices = async (
+  node: EmbeddableNode,
+  chunkNodeForNode: ChunkNode,
+): Promise<number[]> => {
+  if (isShortLabel(node.label)) return [0];
+  const startLine = Number.isSafeInteger(node.startLine) ? Number(node.startLine) : 1;
+  const endLine = Number.isSafeInteger(node.endLine) ? Number(node.endLine) : 1;
+  return (await chunkNodeForNode(node.label, node.content, node.filePath, startLine, endLine)).map(
+    ({ chunkIndex }) => chunkIndex,
+  );
+};
 
 const sha256 = (value: Uint8Array | string): string =>
   createHash('sha256').update(value).digest('hex');
@@ -204,16 +232,7 @@ export const computePreservationPlan = async (
       acceptedRows,
       nodes,
       derivation: {
-        chunkIndicesForNode: async (node) =>
-          (
-            await chunkNode(
-              node.label,
-              node.content,
-              node.filePath,
-              Number.isSafeInteger(node.startLine) ? Number(node.startLine) : 1,
-              Number.isSafeInteger(node.endLine) ? Number(node.endLine) : 1,
-            )
-          ).map(({ chunkIndex }) => chunkIndex),
+        chunkIndicesForNode: (node) => derivePreservationChunkIndices(node, chunkNode),
         contentHashForNode,
       },
     });
