@@ -103,9 +103,7 @@ describe('preservation preview CLI admission', () => {
 
   it('does not inherit a real .git identity when --skip-git is set', async () => {
     const requestedPath = '/definitely/not/a/repository';
-    const resolvePlacement = vi
-      .spyOn(repoManager, 'resolveBranchPlacement')
-      .mockResolvedValue({});
+    const resolvePlacement = vi.spyOn(repoManager, 'resolveBranchPlacement').mockResolvedValue({});
     const getStorage = vi.spyOn(repoManager, 'getStoragePaths').mockReturnValue({
       storagePath: `${requestedPath}/.gitnexus`,
       lbugPath: `${requestedPath}/.gitnexus/lbug`,
