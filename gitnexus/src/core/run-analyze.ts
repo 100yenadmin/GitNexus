@@ -3082,9 +3082,7 @@ const runFullAnalysisImpl = async (
               // not an unconditional insert that trips LadybugDB's PK.
               const restoreIds = [
                 ...new Set(
-                  rowsToRestore.map(
-                    (embedding) => `${embedding.nodeId}:${embedding.chunkIndex}`,
-                  ),
+                  rowsToRestore.map((embedding) => `${embedding.nodeId}:${embedding.chunkIndex}`),
                 ),
               ];
               const existingRows = await executeQuery(

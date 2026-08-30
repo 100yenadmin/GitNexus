@@ -99,102 +99,96 @@ const rowPayload = (row: EmbeddingRow): string =>
   });
 
 describe('M8b incremental embedding restore', () => {
-  it(
-    'restores only missing snapshot PKs during a positive-cap one-file incremental run',
-    async () => {
-      const previousEnv = new Map(
-        EMBEDDING_ENV_KEYS.map((key) => [key, process.env[key]] as const),
-      );
-      const home = await mkdtemp(path.join(os.tmpdir(), 'gitnexus-m8b-restore-home-'));
-      const repo = await setupMiniRepo('gitnexus-m8b-restore-');
-      try {
-        process.env.GITNEXUS_HOME = home;
-        process.env.GITNEXUS_LBUG_EXTENSION_INSTALL = 'never';
-        process.env.GITNEXUS_EMBEDDING_URL = 'http://in-process.invalid/v1';
-        process.env.GITNEXUS_EMBEDDING_MODEL = 'm8b-deterministic';
-        process.env.GITNEXUS_EMBEDDING_DIMS = String(EMBEDDING_DIMS);
-        process.env.GITNEXUS_EMBEDDING_MAX_ATTEMPTS = '1';
-        process.env.GITNEXUS_EMBEDDING_RETRY_CAP_MS = '1';
-        process.env.GITNEXUS_EMBEDDING_MIN_INTERVAL_MS = '0';
-        delete process.env.GITNEXUS_EMBEDDING_API_KEY;
-        const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
-          const body = JSON.parse(String(init?.body ?? '{}')) as { input?: unknown };
-          const inputs = Array.isArray(body.input) ? body.input.map(String) : [];
-          return new Response(
-            JSON.stringify({
-              data: inputs.map((text) => ({ embedding: deterministicEmbedding(text) })),
-            }),
-            { status: 200, headers: { 'content-type': 'application/json' } },
-          );
-        });
-        vi.stubGlobal('fetch', fetchMock);
-
-        const { runFullAnalysis } = await import('../../src/core/run-analyze.js');
-        const options = {
-          skipAgentsMd: true,
-          skipSkills: true,
-          embeddings: true,
-          embeddingsNodeLimit: 1000,
-        };
-        await runFullAnalysis(repo.dbPath, options, { onProgress: () => {} });
-        const before = await readEmbeddingRows(repo.dbPath);
-        expect(before.length).toBeGreaterThan(0);
-        expect(new Set(before.map((row) => row.id)).size).toBe(before.length);
-
-        const handlerPath = path.join(repo.dbPath, 'src', 'handler.ts');
-        const handlerSource = await readFile(handlerPath, 'utf8');
-        await writeFile(
-          handlerPath,
-          handlerSource.replace(
-            'return formatResponse(saved);',
-            "return formatResponse(saved) + '!';",
-          ),
-          'utf8',
+  it('restores only missing snapshot PKs during a positive-cap one-file incremental run', async () => {
+    const previousEnv = new Map(EMBEDDING_ENV_KEYS.map((key) => [key, process.env[key]] as const));
+    const home = await mkdtemp(path.join(os.tmpdir(), 'gitnexus-m8b-restore-home-'));
+    const repo = await setupMiniRepo('gitnexus-m8b-restore-');
+    try {
+      process.env.GITNEXUS_HOME = home;
+      process.env.GITNEXUS_LBUG_EXTENSION_INSTALL = 'never';
+      process.env.GITNEXUS_EMBEDDING_URL = 'http://in-process.invalid/v1';
+      process.env.GITNEXUS_EMBEDDING_MODEL = 'm8b-deterministic';
+      process.env.GITNEXUS_EMBEDDING_DIMS = String(EMBEDDING_DIMS);
+      process.env.GITNEXUS_EMBEDDING_MAX_ATTEMPTS = '1';
+      process.env.GITNEXUS_EMBEDDING_RETRY_CAP_MS = '1';
+      process.env.GITNEXUS_EMBEDDING_MIN_INTERVAL_MS = '0';
+      delete process.env.GITNEXUS_EMBEDDING_API_KEY;
+      const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+        const body = JSON.parse(String(init?.body ?? '{}')) as { input?: unknown };
+        const inputs = Array.isArray(body.input) ? body.input.map(String) : [];
+        return new Response(
+          JSON.stringify({
+            data: inputs.map((text) => ({ embedding: deterministicEmbedding(text) })),
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
         );
-        gitCommitAll(repo.dbPath, 'm8b restore regression');
+      });
+      vi.stubGlobal('fetch', fetchMock);
 
-        const incremental = await runFullAnalysis(repo.dbPath, options, {
-          onProgress: () => {},
-        });
-        expect(incremental.alreadyUpToDate).not.toBe(true);
-        const after = await readEmbeddingRows(repo.dbPath);
-        const adapter = await import('../../src/core/lbug/lbug-adapter.js');
-        const { lbugPath } = getStoragePaths(repo.dbPath);
-        await adapter.initLbug(lbugPath);
-        const integrity = await adapter
-          .inspectEmbeddingIntegrity(undefined, true)
-          .finally(() => adapter.closeLbug());
+      const { runFullAnalysis } = await import('../../src/core/run-analyze.js');
+      const options = {
+        skipAgentsMd: true,
+        skipSkills: true,
+        embeddings: true,
+        embeddingsNodeLimit: 1000,
+      };
+      await runFullAnalysis(repo.dbPath, options, { onProgress: () => {} });
+      const before = await readEmbeddingRows(repo.dbPath);
+      expect(before.length).toBeGreaterThan(0);
+      expect(new Set(before.map((row) => row.id)).size).toBe(before.length);
 
-        const beforeByKey = new Map(before.map((row) => [rowKey(row), row]));
-        const afterByKey = new Map(after.map((row) => [rowKey(row), row]));
-        const changed = before.filter((row) => {
-          const current = afterByKey.get(rowKey(row));
-          return current !== undefined && rowPayload(current) !== rowPayload(row);
-        });
-        const added = after.filter((row) => !beforeByKey.has(rowKey(row)));
-        const handlerOwner = (nodeId: string): boolean => /src[\\/]handler\.ts/.test(nodeId);
+      const handlerPath = path.join(repo.dbPath, 'src', 'handler.ts');
+      const handlerSource = await readFile(handlerPath, 'utf8');
+      await writeFile(
+        handlerPath,
+        handlerSource.replace(
+          'return formatResponse(saved);',
+          "return formatResponse(saved) + '!';",
+        ),
+        'utf8',
+      );
+      gitCommitAll(repo.dbPath, 'm8b restore regression');
 
-        expect(integrity.duplicateIdRows).toBe(0);
-        expect(integrity.duplicateSemanticRows).toBe(0);
-        expect(integrity.physicalRows).toBe(integrity.validRows);
-        expect(changed.length + added.length).toBeGreaterThan(0);
-        expect([...changed, ...added].every((row) => handlerOwner(row.nodeId))).toBe(true);
-        expect(
-          before
-            .filter((row) => !handlerOwner(row.nodeId))
-            .every((row) => rowPayload(afterByKey.get(rowKey(row))!) === rowPayload(row)),
-        ).toBe(true);
-        expect(fetchMock).toHaveBeenCalled();
-      } finally {
-        await repo.cleanup();
-        await rm(home, { recursive: true, force: true });
-        for (const [key, value] of previousEnv) {
-          if (value === undefined) delete process.env[key];
-          else process.env[key] = value;
-        }
-        vi.unstubAllGlobals();
+      const incremental = await runFullAnalysis(repo.dbPath, options, {
+        onProgress: () => {},
+      });
+      expect(incremental.alreadyUpToDate).not.toBe(true);
+      const after = await readEmbeddingRows(repo.dbPath);
+      const adapter = await import('../../src/core/lbug/lbug-adapter.js');
+      const { lbugPath } = getStoragePaths(repo.dbPath);
+      await adapter.initLbug(lbugPath);
+      const integrity = await adapter
+        .inspectEmbeddingIntegrity(undefined, true)
+        .finally(() => adapter.closeLbug());
+
+      const beforeByKey = new Map(before.map((row) => [rowKey(row), row]));
+      const afterByKey = new Map(after.map((row) => [rowKey(row), row]));
+      const changed = before.filter((row) => {
+        const current = afterByKey.get(rowKey(row));
+        return current !== undefined && rowPayload(current) !== rowPayload(row);
+      });
+      const added = after.filter((row) => !beforeByKey.has(rowKey(row)));
+      const handlerOwner = (nodeId: string): boolean => /src[\\/]handler\.ts/.test(nodeId);
+
+      expect(integrity.duplicateIdRows).toBe(0);
+      expect(integrity.duplicateSemanticRows).toBe(0);
+      expect(integrity.physicalRows).toBe(integrity.validRows);
+      expect(changed.length + added.length).toBeGreaterThan(0);
+      expect([...changed, ...added].every((row) => handlerOwner(row.nodeId))).toBe(true);
+      expect(
+        before
+          .filter((row) => !handlerOwner(row.nodeId))
+          .every((row) => rowPayload(afterByKey.get(rowKey(row))!) === rowPayload(row)),
+      ).toBe(true);
+      expect(fetchMock).toHaveBeenCalled();
+    } finally {
+      await repo.cleanup();
+      await rm(home, { recursive: true, force: true });
+      for (const [key, value] of previousEnv) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
       }
-    },
-    180_000,
-  );
+      vi.unstubAllGlobals();
+    }
+  }, 180_000);
 });
