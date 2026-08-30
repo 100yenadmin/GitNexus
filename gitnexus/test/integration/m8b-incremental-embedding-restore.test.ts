@@ -175,10 +175,12 @@ describe('M8b incremental embedding restore', () => {
       expect(integrity.physicalRows).toBe(integrity.validRows);
       expect(changed.length + added.length).toBeGreaterThan(0);
       expect([...changed, ...added].every((row) => handlerOwner(row.nodeId))).toBe(true);
+      const unaffectedBefore = before.filter((row) => !handlerOwner(row.nodeId));
+      expect(unaffectedBefore.length).toBeGreaterThan(0);
       expect(
-        before
-          .filter((row) => !handlerOwner(row.nodeId))
-          .every((row) => rowPayload(afterByKey.get(rowKey(row))!) === rowPayload(row)),
+        unaffectedBefore.every(
+          (row) => rowPayload(afterByKey.get(rowKey(row))!) === rowPayload(row),
+        ),
       ).toBe(true);
       expect(fetchMock).toHaveBeenCalled();
     } finally {
