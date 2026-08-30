@@ -1618,6 +1618,32 @@ export const discardStagedWorkspace = async (paths: StagedAnalyzePaths): Promise
   await fs.rm(paths.stageIntentPath, { force: true });
 };
 
+const isSafeNonNegativeInteger = (value: unknown): value is number =>
+  typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+
+const isSha256Digest = (value: unknown): value is string =>
+  typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
+
+const isCompletedEmbeddingCheckpoint = (
+  value: unknown,
+): value is NonNullable<RepoMeta['embeddingCheckpoint']> => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const checkpoint = value as Partial<NonNullable<RepoMeta['embeddingCheckpoint']>>;
+  return (
+    isSafeNonNegativeInteger(checkpoint.nodesProcessed) &&
+    isSafeNonNegativeInteger(checkpoint.totalNodes) &&
+    checkpoint.nodesProcessed === checkpoint.totalNodes &&
+    isSafeNonNegativeInteger(checkpoint.chunksProcessed) &&
+    Array.isArray(checkpoint.pendingNodeIds) &&
+    checkpoint.pendingNodeIds.length === 0 &&
+    isSafeNonNegativeInteger(checkpoint.physicalRows) &&
+    isSafeNonNegativeInteger(checkpoint.validRows) &&
+    checkpoint.validRows === checkpoint.physicalRows &&
+    isSha256Digest(checkpoint.recoverableIdentitySha256) &&
+    isSha256Digest(checkpoint.physicalRowsSha256)
+  );
+};
+
 /** Validate the staged DB/meta pair before the first canonical rename. */
 export const validateStagedGeneration = async (paths: StagedAnalyzePaths): Promise<RepoMeta> => {
   const manifest = await readManifest(paths);
@@ -1627,7 +1653,11 @@ export const validateStagedGeneration = async (paths: StagedAnalyzePaths): Promi
   await assertNoDbSidecars(paths.stagedLbugPath, 'Staged index');
   const meta = await loadMeta(paths.stagedMetaDir);
   if (!meta) throw new Error('Staged generation has no readable metadata');
-  if (meta.incrementalInProgress || meta.embeddingCheckpoint) {
+  if (
+    meta.incrementalInProgress !== undefined ||
+    (meta.embeddingCheckpoint !== undefined &&
+      !isCompletedEmbeddingCheckpoint(meta.embeddingCheckpoint))
+  ) {
     throw new Error('Staged generation still carries an incomplete write/checkpoint marker');
   }
   return meta;

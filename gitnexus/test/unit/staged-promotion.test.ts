@@ -11,6 +11,7 @@ import {
   getStagedAnalyzePaths,
   prepareStagedWorkspace,
   promoteStagedGeneration,
+  validateStagedGeneration,
   withAnalyzeOwnershipLock,
   type AnalyzeStorageOwnershipToken,
   type PromotionBoundary,
@@ -112,6 +113,23 @@ const makeMeta = (generation: string): RepoMeta => ({
   lastCommit: generation,
   indexedAt: `2026-07-20T00:00:0${generation === 'old' ? '0' : '1'}.000Z`,
   stats: { nodes: generation === 'old' ? 1 : 2, edges: 0 },
+});
+
+type EmbeddingCheckpoint = NonNullable<RepoMeta['embeddingCheckpoint']>;
+
+const completedEmbeddingCheckpoint = (): EmbeddingCheckpoint => ({
+  at: '2026-07-20T00:00:02.000Z',
+  nodesProcessed: 2,
+  totalNodes: 2,
+  chunksProcessed: 2,
+  provider: 'local',
+  model: 'model-a',
+  dimensions: 384,
+  pendingNodeIds: [],
+  physicalRows: 2,
+  validRows: 2,
+  recoverableIdentitySha256: 'a'.repeat(64),
+  physicalRowsSha256: 'b'.repeat(64),
 });
 
 const setup = async (withCanonical = true) => {
@@ -392,6 +410,60 @@ describe('staged promotion journal', () => {
 
     expect(await fs.readFile(canonicalLbugPath, 'utf8')).toBe('new-generation');
     expect(await exists(paths.backupLbugPath)).toBe(false);
+  });
+
+  it('promotes and preserves a completed embedding checkpoint in committed metadata', async () => {
+    const { paths, canonicalMetaDir, newMeta } = await setup();
+    const checkpoint = completedEmbeddingCheckpoint();
+    await saveMeta(paths.stagedMetaDir, { ...newMeta, embeddingCheckpoint: checkpoint });
+
+    await expect(
+      promoteStagedGeneration(paths, async (meta) => {
+        await saveMeta(canonicalMetaDir, meta);
+        return 'repo';
+      }),
+    ).resolves.toMatchObject({ projectName: 'repo', recovered: false });
+
+    expect((await loadMeta(canonicalMetaDir))?.embeddingCheckpoint).toEqual(checkpoint);
+  });
+
+  it.each([
+    ['pending nodes', { pendingNodeIds: ['Function:pending'] }],
+    ['non-terminal progress', { nodesProcessed: 1 }],
+    ['missing physical row count', { physicalRows: undefined }],
+    ['malformed physical row count', { physicalRows: 1.5 }],
+    ['missing valid row count', { validRows: undefined }],
+    ['malformed valid row count', { validRows: -1 }],
+    ['missing recoverable identity', { recoverableIdentitySha256: undefined }],
+    ['malformed recoverable identity', { recoverableIdentitySha256: 'not-a-digest' }],
+    ['missing physical row identity', { physicalRowsSha256: undefined }],
+    ['malformed physical row identity', { physicalRowsSha256: 'not-a-digest' }],
+  ] as Array<[string, Partial<EmbeddingCheckpoint>]>)(
+    'rejects a staged checkpoint with %s',
+    async (_reason, overrides) => {
+      const { paths, newMeta } = await setup();
+      await saveMeta(paths.stagedMetaDir, {
+        ...newMeta,
+        embeddingCheckpoint: { ...completedEmbeddingCheckpoint(), ...overrides },
+      });
+
+      await expect(validateStagedGeneration(paths)).rejects.toThrow(
+        'incomplete write/checkpoint marker',
+      );
+    },
+  );
+
+  it('rejects a staged checkpoint alongside incremental progress', async () => {
+    const { paths, newMeta } = await setup();
+    await saveMeta(paths.stagedMetaDir, {
+      ...newMeta,
+      incrementalInProgress: { startedAt: 1, toWriteCount: 1 },
+      embeddingCheckpoint: completedEmbeddingCheckpoint(),
+    });
+
+    await expect(validateStagedGeneration(paths)).rejects.toThrow(
+      'incomplete write/checkpoint marker',
+    );
   });
 
   it('reuses an interrupted stage only while canonical source identity is unchanged', async () => {
