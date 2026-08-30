@@ -121,7 +121,24 @@ describe('provider-free preservation preview core', () => {
     expect(plan.counts.reembedChunkCount).toBe(8);
   });
 
-  it('fails closed when a rejected-only implicated owner is absent from enumeration', () => {
+  it('allows a rejected-only implicated owner to be repaired when enumeration is complete', () => {
+    const plan = buildEmbeddingPreservationPreview({
+      base,
+      scan: scan({
+        physicalRows: 1,
+        acceptedRows: 0,
+        rejectedRows: 1,
+        implicatedOwnerIds: ['Function:rejected-only'],
+      }),
+      acceptedRows: [],
+      owners: [owner('Function:known', 'known', [0])],
+    });
+
+    expect(plan.observations.map(({ ownerId }) => ownerId)).toEqual(['Function:known']);
+    expect(plan.reembedOwners).toEqual(['Function:known']);
+  });
+
+  it('fails closed when an absent implicated owner has an incompletely enumerated label', () => {
     expect(() =>
       buildEmbeddingPreservationPreview({
         base,
@@ -130,11 +147,12 @@ describe('provider-free preservation preview core', () => {
           acceptedRows: 0,
           rejectedRows: 1,
           implicatedOwnerIds: ['Function:rejected-only'],
+          missingOwnerLabels: ['Function'],
         }),
         acceptedRows: [],
         owners: [owner('Function:known', 'known', [0])],
       }),
-    ).toThrow('implicated owners absent from the current owner enumeration');
+    ).toThrow('owner enumeration is incomplete');
   });
 
   it('fails closed when accepted rows reference an owner absent from enumeration', () => {

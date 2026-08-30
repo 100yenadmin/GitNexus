@@ -160,9 +160,13 @@ export const derivePreservationOwnerObservations = ({
   const implicatedOwnersAbsentFromEnumeration = scan.implicatedOwnerIds.filter(
     (ownerId) => !ownerMap.has(ownerId),
   );
-  if (implicatedOwnersAbsentFromEnumeration.length > 0) {
+  if (
+    implicatedOwnersAbsentFromEnumeration.length > 0 &&
+    (scan.missingOwnerLabels?.length ?? 0) > 0
+  ) {
     throw new Error(
-      'Preservation scanner implicated owners absent from the current owner enumeration',
+      'Preservation scanner implicated owners absent from the current owner enumeration; ' +
+        'owner enumeration is incomplete',
     );
   }
 

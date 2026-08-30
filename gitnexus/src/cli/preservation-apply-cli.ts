@@ -2,10 +2,12 @@ import path from 'node:path';
 import {
   executeQuery,
   executeWithReusedStatement,
+  inspectEmbeddingIntegrity,
   recreateCodeEmbeddingTable,
   scanEmbeddingPreservationRows,
   withLbugDb,
 } from '../core/lbug/lbug-adapter.js';
+import { assertEmbeddingIntegrity } from '../core/embeddings/checkpoint-identity.js';
 import { executePreservationApply } from '../core/embeddings/preservation-apply.js';
 import {
   getStagedAnalyzePaths,
@@ -101,6 +103,13 @@ export const preservationApplyCommand = async (
         }
 
         let semanticMode: 'vector-index' | 'exact-scan' = 'exact-scan';
+        let terminalIntegrity: Awaited<ReturnType<typeof inspectEmbeddingIntegrity>> | undefined;
+        let observedTotalNodes = context.plan.reembedOwners.length;
+        let terminalProgress = {
+          nodesProcessed: 0,
+          totalNodes: observedTotalNodes,
+          chunksProcessed: 0,
+        };
         const result = await executePreservationApply({
           plan: context.plan,
           acceptedRows: context.acceptedRows,
@@ -149,17 +158,26 @@ export const preservationApplyCommand = async (
                   {
                     forceReembedNodeIds: new Set(plan.reembedOwners),
                     existingEmbeddingRowIds: existingRowIds,
-                    onCheckpointWindowStart: async ({ nodeIds }) =>
-                      void regeneratedOwners.push(...nodeIds),
+                    onCheckpointWindowStart: async ({ nodeIds, totalNodes }) => {
+                      observedTotalNodes = totalNodes;
+                      regeneratedOwners.push(...nodeIds);
+                    },
                   },
                 );
                 semanticMode = pipeline.semanticMode;
+                terminalProgress = {
+                  nodesProcessed: pipeline.nodesProcessed,
+                  totalNodes: observedTotalNodes,
+                  chunksProcessed: pipeline.chunksProcessed,
+                };
                 const terminalRows: typeof context.acceptedRows = [];
                 const terminalScan = await scanEmbeddingPreservationRows({
                   onBatch: (batch) => {
                     terminalRows.push(...batch);
                   },
                 });
+                terminalIntegrity = await inspectEmbeddingIntegrity(undefined, true);
+                assertEmbeddingIntegrity(terminalIntegrity, 'Preservation terminal embedding');
                 return {
                   restoredRows,
                   restoredScan,
@@ -169,11 +187,30 @@ export const preservationApplyCommand = async (
                 };
               }),
             saveStageMetadata: async (stage, plan) => {
+              if (
+                !terminalIntegrity ||
+                terminalProgress.nodesProcessed !== terminalProgress.totalNodes
+              ) {
+                throw new Error(
+                  'preservation apply did not produce a completed embedding checkpoint',
+                );
+              }
               await saveMeta(stage.stagedMetaDir, {
                 ...context.meta,
                 stats: { ...context.meta.stats, embeddings: plan.counts.expectedChunkCount },
                 incrementalInProgress: undefined,
-                embeddingCheckpoint: undefined,
+                embeddingCheckpoint: {
+                  at: new Date().toISOString(),
+                  ...terminalProgress,
+                  provider: plan.embedding.provider,
+                  model: plan.embedding.model,
+                  dimensions: plan.embedding.dimensions,
+                  pendingNodeIds: [],
+                  physicalRows: terminalIntegrity.physicalRows,
+                  validRows: terminalIntegrity.validRows,
+                  recoverableIdentitySha256: terminalIntegrity.recoverableIdentitySha256,
+                  physicalRowsSha256: terminalIntegrity.physicalRowsSha256,
+                },
                 capabilities: context.meta.capabilities
                   ? {
                       ...context.meta.capabilities,

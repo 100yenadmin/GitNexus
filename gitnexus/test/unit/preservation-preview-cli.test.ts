@@ -14,6 +14,7 @@ import * as lbugAdapter from '../../src/core/lbug/lbug-adapter.js';
 import * as embeddingPipeline from '../../src/core/embeddings/embedding-pipeline.js';
 import * as stagedPromotion from '../../src/core/staged-promotion.js';
 import { httpEmbeddingProvider } from '../../src/core/embeddings/embedding-identity.js';
+import { embeddingAcceptedPayloadDigest } from '../../src/core/embeddings/identity-digest.js';
 
 describe('preservation preview CLI admission', () => {
   const originalExitCode = process.exitCode;
@@ -30,10 +31,12 @@ describe('preservation preview CLI admission', () => {
     provider = 'local',
     model = 'Snowflake/snowflake-arctic-embed-xs',
     config,
+    checkpoint,
   }: {
     provider?: string;
     model?: string;
     config?: Record<string, unknown>;
+    checkpoint?: Record<string, unknown>;
   } = {}) => {
     const repoPath = await mkdtemp(path.join(tmpdir(), 'gitnexus-preservation-'));
     tempDirs.push(repoPath);
@@ -59,6 +62,7 @@ describe('preservation preview CLI admission', () => {
           validRows: 0,
           recoverableIdentitySha256: 'a'.repeat(64),
           physicalRowsSha256: 'a'.repeat(64),
+          ...checkpoint,
         },
       }),
     );
@@ -105,7 +109,7 @@ describe('preservation preview CLI admission', () => {
       labelMismatchRows: 0,
       physicalRowsSha256,
       rejectedRowsSha256: 'rejected',
-      acceptedPayloadSha256: 'accepted',
+      acceptedPayloadSha256: embeddingAcceptedPayloadDigest([]),
       implicatedOwnerIds: [],
       missingOwnerLabels: [],
     });
@@ -220,6 +224,58 @@ describe('preservation preview CLI admission', () => {
     },
   );
 
+  it.each(['physicalRows', 'validRows', 'recoverableIdentitySha256', 'physicalRowsSha256'])(
+    'refuses a completed checkpoint missing %s before scan, provider, or lock work',
+    async (field) => {
+      const repoPath = await createPreservationRepo({ checkpoint: { [field]: undefined } });
+      const { scan } = mockEmptyPreservationDatabase();
+      const lock = vi.spyOn(stagedPromotion, 'withAnalyzeOwnershipLock');
+      const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+
+      await preservationPreviewCommand(repoPath, {
+        preserveVerifiedEmbeddings: true,
+        dryRun: true,
+        json: true,
+        staged: true,
+        embeddings: true,
+        skipGit: true,
+      });
+
+      expect(process.exitCode).toBe(1);
+      expect(stderr).toHaveBeenCalledWith(expect.stringContaining('lacks durable'));
+      expect(scan).not.toHaveBeenCalled();
+      expect(lock).not.toHaveBeenCalled();
+    },
+  );
+
+  it('refuses a non-terminal compatibility checkpoint without durable row proof', async () => {
+    const repoPath = await createPreservationRepo({
+      checkpoint: {
+        nodesProcessed: 1,
+        totalNodes: 2,
+        physicalRows: undefined,
+        validRows: undefined,
+        recoverableIdentitySha256: undefined,
+        physicalRowsSha256: undefined,
+      },
+    });
+    const { scan } = mockEmptyPreservationDatabase();
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+
+    await preservationPreviewCommand(repoPath, {
+      preserveVerifiedEmbeddings: true,
+      dryRun: true,
+      json: true,
+      staged: true,
+      embeddings: true,
+      skipGit: true,
+    });
+
+    expect(process.exitCode).toBe(1);
+    expect(stderr).toHaveBeenCalledWith(expect.stringContaining('lacks durable'));
+    expect(scan).not.toHaveBeenCalled();
+  });
+
   it('does not inherit a real .git identity when --skip-git is set', async () => {
     const requestedPath = '/definitely/not/a/repository';
     const resolvePlacement = vi.spyOn(repoManager, 'resolveBranchPlacement').mockResolvedValue({});
@@ -306,6 +362,82 @@ describe('preservation preview CLI admission', () => {
       expect(fetchSpy).not.toHaveBeenCalled();
     },
   );
+
+  it('retains a completed terminal embedding checkpoint through promotion', async () => {
+    const repoPath = await createPreservationRepo();
+    mockEmptyPreservationDatabase();
+    const expectedDigest = (await computePreservationPlan(repoPath, { skipGit: true })).plan
+      .planDigest;
+    vi.spyOn(stagedPromotion, 'withAnalyzeOwnershipLock').mockImplementation(
+      async (_storagePath, operation) => operation(),
+    );
+    vi.spyOn(stagedPromotion, 'hasPendingPromotion').mockResolvedValue(false);
+    vi.spyOn(stagedPromotion, 'inspectStagedWorkspaceSource').mockResolvedValue({
+      exists: false,
+      matchesSource: false,
+    });
+    vi.spyOn(stagedPromotion, 'prepareStagedWorkspace').mockResolvedValue({
+      resumed: false,
+      generationId: 'synthetic-generation',
+    });
+    vi.spyOn(lbugAdapter, 'withLbugDb').mockImplementation(async (_dbPath, operation) =>
+      operation(),
+    );
+    vi.spyOn(lbugAdapter, 'closeLbug').mockResolvedValue(undefined);
+    vi.spyOn(lbugAdapter, 'recreateCodeEmbeddingTable').mockResolvedValue(undefined);
+    vi.spyOn(embeddingPipeline, 'batchInsertEmbeddings').mockResolvedValue(undefined);
+    vi.spyOn(embeddingPipeline, 'runEmbeddingPipeline').mockResolvedValue({
+      nodesProcessed: 0,
+      chunksProcessed: 0,
+      vectorIndexReady: false,
+      semanticMode: 'exact-scan',
+    });
+    const saveMeta = vi.spyOn(repoManager, 'saveMeta').mockResolvedValue(undefined);
+    vi.spyOn(repoManager, 'registerRepo').mockResolvedValue('repository');
+    let promotedStagedMetaDir: string | undefined;
+    const promote = vi
+      .spyOn(stagedPromotion, 'promoteStagedGeneration')
+      .mockImplementation(async (paths, commitMetadataAndRegistry) => {
+        promotedStagedMetaDir = paths.stagedMetaDir;
+        const stagedMeta = saveMeta.mock.calls.find(
+          ([metaDir, meta]) =>
+            metaDir === paths.stagedMetaDir && meta.embeddingCheckpoint !== undefined,
+        )?.[1];
+        if (!stagedMeta) throw new Error('synthetic staged metadata was not saved');
+        await commitMetadataAndRegistry(stagedMeta);
+        return { projectName: 'repository', recovered: false };
+      });
+    const stdout = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+
+    await preservationApplyCommand(repoPath, {
+      preserveVerifiedEmbeddings: true,
+      staged: true,
+      embeddings: true,
+      planDigest: expectedDigest,
+      maxReembedNodes: '1',
+      skipGit: true,
+    });
+
+    expect(stdout).toHaveBeenCalledWith(expect.stringContaining('Preservation repair promoted'));
+    expect(promote).toHaveBeenCalledOnce();
+    const stagedMeta = saveMeta.mock.calls.find(
+      ([metaDir, meta]) =>
+        metaDir === promotedStagedMetaDir && meta.embeddingCheckpoint !== undefined,
+    )?.[1];
+    expect(stagedMeta?.embeddingCheckpoint).toMatchObject({
+      nodesProcessed: 0,
+      totalNodes: 0,
+      chunksProcessed: 0,
+      provider: 'local',
+      model: 'Snowflake/snowflake-arctic-embed-xs',
+      dimensions: 384,
+      pendingNodeIds: [],
+      physicalRows: 0,
+      validRows: 0,
+      recoverableIdentitySha256: 'a'.repeat(64),
+      physicalRowsSha256: 'a'.repeat(64),
+    });
+  });
 
   it('dispatches preservation apply without loading the ordinary analyzer', async () => {
     const apply = vi.fn(async () => undefined);

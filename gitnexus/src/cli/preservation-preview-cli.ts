@@ -31,6 +31,7 @@ import {
   getStoragePaths,
   loadMeta,
   resolveBranchPlacement,
+  type RepoMeta,
 } from '../storage/repo-manager.js';
 import { getCurrentBranch, getCurrentCommit, getGitRoot, hasGitDir } from '../storage/git.js';
 import type { PreservationPlan } from '../core/embeddings/preservation-plan.js';
@@ -161,6 +162,21 @@ const validatePreviewOptions = (options: PreservationPreviewCliOptions): void =>
   }
 };
 
+const assertPreservationCheckpointProof = (checkpoint: RepoMeta['embeddingCheckpoint']): void => {
+  if (!checkpoint) return;
+  const requiredFields = [
+    'physicalRows',
+    'validRows',
+    'recoverableIdentitySha256',
+    'physicalRowsSha256',
+  ] as const;
+  if (requiredFields.some((field) => checkpoint[field] === undefined)) {
+    throw new Error(
+      'Preservation completed embedding checkpoint lacks durable physical and identity proof',
+    );
+  }
+};
+
 export interface PreservationPlanContext {
   plan: PreservationPlan;
   acceptedRows: EmbeddingPreservationRow[];
@@ -213,12 +229,13 @@ export const computePreservationPlan = async (
     throw new Error('metadata branch differs from the requested branch');
   }
 
+  const expectedCheckpoint = meta.embeddingCheckpoint;
+  assertPreservationCheckpointProof(expectedCheckpoint);
   const metadataBytes = await fs.readFile(storage.metaPath);
   const databaseSha256 = await sha256File(storage.lbugPath);
   const { queryEmbeddableNodes, contentHashForNode, EMBEDDING_TEXT_VERSION } =
     await import('../core/embeddings/embedding-pipeline.js');
   const identity = resolveEmbeddingIdentity(effectiveOptions, EMBEDDING_TEXT_VERSION);
-  const expectedCheckpoint = meta.embeddingCheckpoint;
   if (
     expectedCheckpoint?.provider === undefined ||
     expectedCheckpoint.provider !== identity.provider ||
