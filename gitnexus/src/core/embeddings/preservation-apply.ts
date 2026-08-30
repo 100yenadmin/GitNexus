@@ -1,6 +1,7 @@
 import { embeddingAcceptedPayloadDigest } from './identity-digest.js';
 import type { PreservationPlan } from './preservation-plan.js';
 import type { PreservationPreviewRow, PreservationPreviewScan } from './preservation-preview.js';
+import { closeLbug } from '../lbug/lbug-adapter.js';
 
 type CompleteRow = PreservationPreviewRow & {
   startLine: number;
@@ -153,7 +154,15 @@ export const executePreservationApply = async <TStage, TResult>(input: {
   );
   const restoreRows = selectPreservationRestoreRows(input.plan, input.acceptedRows);
   const stage = await input.runtime.prepareStage();
-  const mutation = await input.runtime.mutateStage(stage, restoreRows, input.plan);
+  let mutation: PreservationApplyMutation;
+  try {
+    mutation = await input.runtime.mutateStage(stage, restoreRows, input.plan);
+  } finally {
+    // The apply runtime opens the staged database for mutation through the
+    // shared Lbug adapter. Close it before any promotion admission checks so
+    // close-time CHECKPOINT and sidecar finalization can settle the stage WAL.
+    await closeLbug();
+  }
   verifyPreservationApplyMutation(input.plan, restoreRows, mutation);
   await input.runtime.saveStageMetadata(stage, input.plan);
   return input.runtime.promoteStage(stage, input.plan);

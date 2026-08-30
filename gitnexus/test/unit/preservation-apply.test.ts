@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { preservationApplyCommand } from '../../src/cli/preservation-apply-cli.js';
+import * as lbugAdapter from '../../src/core/lbug/lbug-adapter.js';
 import { embeddingAcceptedPayloadDigest } from '../../src/core/embeddings/identity-digest.js';
 import {
   executePreservationApply,
@@ -235,5 +236,51 @@ describe('preservation apply admission and orchestration', () => {
       }),
     ).resolves.toBe('promoted');
     expect(events).toEqual(['prepare', 'mutate', 'metadata', 'promote']);
+  });
+
+  it('closes the staged connection before promotion admission can observe its WAL', async () => {
+    const events: string[] = [];
+    let stagedWalPresent = false;
+    const closeLbug = vi.spyOn(lbugAdapter, 'closeLbug').mockImplementation(async () => {
+      events.push('close');
+      stagedWalPresent = false;
+    });
+    const callbacks = {
+      prepareStage: vi.fn(async () => {
+        events.push('prepare');
+        return 'stage';
+      }),
+      mutateStage: vi.fn(async () => {
+        events.push('mutate');
+        stagedWalPresent = true;
+        return mutation();
+      }),
+      saveStageMetadata: vi.fn(async () => {
+        events.push('metadata');
+      }),
+      promoteStage: vi.fn(async () => {
+        expect(stagedWalPresent).toBe(false);
+        events.push('promote');
+        return 'promoted';
+      }),
+    };
+
+    try {
+      await expect(
+        executePreservationApply({
+          plan,
+          acceptedRows: [keepRow],
+          expectedDigest: plan.planDigest,
+          maxReembedNodes: 2,
+          costAdmission: 'local-zero',
+          runtime: callbacks,
+        }),
+      ).resolves.toBe('promoted');
+      expect(closeLbug).toHaveBeenCalledOnce();
+    } finally {
+      closeLbug.mockRestore();
+    }
+
+    expect(events).toEqual(['prepare', 'mutate', 'close', 'metadata', 'promote']);
   });
 });
