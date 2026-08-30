@@ -2971,8 +2971,8 @@ const runFullAnalysisImpl = async (
     // would finalize metadata with fewer vectors than the preserved snapshot.
     let restoredEmbeddingCount = 0;
     let skippedPendingEmbeddingRows = 0;
-    // Keep exact known row identities and one restored hash per owner node; vectors
-    // still stream through the bounded 256-row snapshot batches above. The
+    // Keep exact snapshot row identities and one live-row hash per owner node;
+    // vectors still stream through the bounded 256-row snapshot batches above. The
     // exact row IDs are required because LadybugDB can make freshly restored
     // non-PK nodeId predicates temporarily miss rows even while the PK sees
     // them. Without this sidecar, stale regeneration can issue CREATE for a
@@ -3050,6 +3050,23 @@ const runFullAnalysisImpl = async (
                 }
                 continue;
               }
+              // Keep the snapshot's exact identities and hashes for every live
+              // row, including rows outside this surgical restore scope. The
+              // embedding pipeline uses these maps to avoid a lossy nodeId
+              // lookup when it later detects a stale owner. Pending checkpoint
+              // rows intentionally take the branch above: their IDs are kept,
+              // but their hashes stay absent so they remain force-selected.
+              const restoredHash = embedding.contentHash || STALE_HASH_SENTINEL;
+              const priorHash = restoredEmbeddingHashes.get(embedding.nodeId);
+              restoredEmbeddingHashes.set(
+                embedding.nodeId,
+                priorHash === undefined || priorHash === restoredHash
+                  ? restoredHash
+                  : STALE_HASH_SENTINEL,
+              );
+              const rowIds = restoredEmbeddingRowIds.get(embedding.nodeId) ?? [];
+              rowIds.push(`${embedding.nodeId}:${embedding.chunkIndex}`);
+              restoredEmbeddingRowIds.set(embedding.nodeId, rowIds);
               if (deletedFilePathsForRestore !== null) {
                 const filePath = liveNode.properties?.filePath;
                 if (typeof filePath !== 'string' || !deletedFilePathsForRestore.has(filePath)) {
@@ -3059,20 +3076,33 @@ const runFullAnalysisImpl = async (
               rowsToRestore.push(embedding);
             }
             if (rowsToRestore.length > 0) {
-              await batchInsert(executeWithReusedStatement, rowsToRestore);
-              restoredEmbeddingCount += rowsToRestore.length;
-              for (const embedding of rowsToRestore) {
-                const restoredHash = embedding.contentHash || STALE_HASH_SENTINEL;
-                const priorHash = restoredEmbeddingHashes.get(embedding.nodeId);
-                restoredEmbeddingHashes.set(
-                  embedding.nodeId,
-                  priorHash === undefined || priorHash === restoredHash
-                    ? restoredHash
-                    : STALE_HASH_SENTINEL,
-                );
-                const rowIds = restoredEmbeddingRowIds.get(embedding.nodeId) ?? [];
-                rowIds.push(`${embedding.nodeId}:${embedding.chunkIndex}`);
-                restoredEmbeddingRowIds.set(embedding.nodeId, rowIds);
+              // A surgical delete can leave a row temporarily visible by its
+              // primary key even when a nodeId lookup misses it. Probe exact
+              // snapshot IDs before CREATE so restore is compare-and-create,
+              // not an unconditional insert that trips LadybugDB's PK.
+              const restoreIds = [
+                ...new Set(
+                  rowsToRestore.map(
+                    (embedding) => `${embedding.nodeId}:${embedding.chunkIndex}`,
+                  ),
+                ),
+              ];
+              const existingRows = await executeQuery(
+                `MATCH (e:${EMBEDDING_TABLE_NAME}) WHERE e.id IN [` +
+                  `${restoreIds.map((id) => `'${escapeCypherString(id)}'`).join(', ')}] ` +
+                  'RETURN e.id AS id',
+              );
+              const existingIds = new Set(
+                existingRows
+                  .map((row: any) => String(row.id ?? row[0] ?? ''))
+                  .filter((id: string) => id.length > 0),
+              );
+              const missingRows = rowsToRestore.filter(
+                (embedding) => !existingIds.has(`${embedding.nodeId}:${embedding.chunkIndex}`),
+              );
+              if (missingRows.length > 0) {
+                await batchInsert(executeWithReusedStatement, missingRows);
+                restoredEmbeddingCount += missingRows.length;
               }
             }
             if (orphanRowIds.length > 0) {
