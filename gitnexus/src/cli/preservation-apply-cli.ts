@@ -26,8 +26,18 @@ const fail = (message: string): void => {
 };
 
 const parseApplyOptions = (options: PreservationPreviewCliOptions) => {
-  if (!options.preserveVerifiedEmbeddings || !options.staged || !options.embeddings) {
+  if (
+    !options.preserveVerifiedEmbeddings ||
+    !options.staged ||
+    options.embeddings === undefined ||
+    options.embeddings === false
+  ) {
     throw new Error('apply requires --preserve-verified-embeddings --staged --embeddings');
+  }
+  if (options.embeddings !== true) {
+    throw new Error(
+      'apply does not accept a valued --embeddings argument; use --max-reembed-nodes',
+    );
   }
   if (options.incrementalOnly) {
     throw new Error('apply cannot be combined with --incremental-only');
