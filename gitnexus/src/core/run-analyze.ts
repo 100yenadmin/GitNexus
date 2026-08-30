@@ -1863,10 +1863,20 @@ const runFullAnalysisImpl = async (
   // but only after dirty-recovery sidecars have been quarantined: opening the
   // database before that point can replay a poisoned interrupted WAL.
   const checkpointToVerify = existingMeta?.embeddingCheckpoint;
+  const resumableCheckpointCarriesProof =
+    resumeEmbeddingCheckpoint &&
+    checkpointToVerify !== undefined &&
+    !checkpointToVerify.pendingNodeIds?.length &&
+    [
+      checkpointToVerify.physicalRows,
+      checkpointToVerify.validRows,
+      checkpointToVerify.recoverableIdentitySha256,
+      checkpointToVerify.physicalRowsSha256,
+    ].some((value) => value !== undefined);
   if (
     !options.dropEmbeddings &&
     checkpointToVerify &&
-    isCompletedEmbeddingCheckpoint(checkpointToVerify)
+    (isCompletedEmbeddingCheckpoint(checkpointToVerify) || resumableCheckpointCarriesProof)
   ) {
     try {
       const completedIntegrity = await withLbugDb(
