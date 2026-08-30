@@ -136,7 +136,8 @@ export const preservationApplyCommand = async (
                   {
                     forceReembedNodeIds: new Set(plan.reembedOwners),
                     existingEmbeddingRowIds: existingRowIds,
-                    onCheckpointWindowStart: async ({ nodeIds }) => void regeneratedOwners.push(...nodeIds),
+                    onCheckpointWindowStart: async ({ nodeIds }) =>
+                      void regeneratedOwners.push(...nodeIds),
                   },
                 );
                 semanticMode = pipeline.semanticMode;

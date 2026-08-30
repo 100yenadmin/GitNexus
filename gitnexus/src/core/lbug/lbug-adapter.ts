@@ -833,9 +833,8 @@ export const acquireLbugOwnership = async (
     markEntered = resolve;
     markFailed = reject;
   });
-  const { analyzeStorageOwnershipIsHeld, withAnalyzeOwnershipLock } = await import(
-    '../staged-promotion.js'
-  );
+  const { analyzeStorageOwnershipIsHeld, withAnalyzeOwnershipLock } =
+    await import('../staged-promotion.js');
   const { attachAnalyzeOwnershipWorker } = await import('../staged-promotion.js');
   let initialStorageOwnership: AnalyzeStorageOwnershipToken | undefined;
   const ownership = withAnalyzeOwnershipLock(

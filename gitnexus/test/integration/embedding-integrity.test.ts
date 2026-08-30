@@ -6,9 +6,8 @@ import * as d from '../../src/core/embeddings/identity-digest.js';
 
 describe('embedding writer identity preflight', () => {
   it('validates the whole batch before executing and prepares once per row', async () => {
-    const { batchInsertEmbeddings } = await import(
-      '../../src/core/embeddings/embedding-pipeline.js'
-    );
+    const { batchInsertEmbeddings } =
+      await import('../../src/core/embeddings/embedding-pipeline.js');
     const execute = vi.fn(async () => undefined);
     const vector = new Array(EMBEDDING_DIMS).fill(0);
 
@@ -144,9 +143,8 @@ withTestLbugDB(
   () => {
     it('keeps every identity canonical across a high-volume real-Ladybug write', async () => {
       const adapter = await import('../../src/core/lbug/lbug-adapter.js');
-      const { batchInsertEmbeddings } = await import(
-        '../../src/core/embeddings/embedding-pipeline.js'
-      );
+      const { batchInsertEmbeddings } =
+        await import('../../src/core/embeddings/embedding-pipeline.js');
       const rowCount = 1_024;
       const vector = new Array(EMBEDDING_DIMS).fill(0);
       await batchInsertEmbeddings(
@@ -199,9 +197,8 @@ withTestLbugDB(
 
     it('rejects a same-count snapshot with a different semantic identity set', async () => {
       const adapter = await import('../../src/core/lbug/lbug-adapter.js');
-      const { createEmbeddingSnapshot, embeddingSnapshotMatchesIdentityDigest } = await import(
-        '../../src/core/embeddings/cache-snapshot.js'
-      );
+      const { createEmbeddingSnapshot, embeddingSnapshotMatchesIdentityDigest } =
+        await import('../../src/core/embeddings/cache-snapshot.js');
       const snapshotPath = `${handle.tmpHandle.dbPath}/different-identity.jsonl`;
       const source = { lastCommit: 'fixture', indexedAt: '2026-07-22T00:00:00.000Z' };
       const info = await createEmbeddingSnapshot(snapshotPath, source, async () => [
@@ -273,9 +270,8 @@ withTestLbugDB(
     seed: ["CREATE (:File {id: 'File:live', name: 'live.ts', filePath: 'live.ts', content: ''})"],
     beforeFTS: async () => {
       const adapter = await import('../../src/core/lbug/lbug-adapter.js');
-      const { batchInsertEmbeddings } = await import(
-        '../../src/core/embeddings/embedding-pipeline.js'
-      );
+      const { batchInsertEmbeddings } =
+        await import('../../src/core/embeddings/embedding-pipeline.js');
       await batchInsertEmbeddings(adapter.executeWithReusedStatement, [
         {
           nodeId: 'File:live',
