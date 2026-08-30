@@ -73,25 +73,22 @@ describe('preservation preview CLI admission', () => {
     ['zero cap', '0'],
     ['malformed cap', 'not-a-number'],
     ['numeric zero value', 0],
-  ])(
-    'rejects a valued --embeddings argument before planning (%s)',
-    async (_label, embeddings) => {
-      const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
-      const stdout = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+  ])('rejects a valued --embeddings argument before planning (%s)', async (_label, embeddings) => {
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const stdout = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
 
-      await preservationApplyCommand('/definitely/not/a/repository', {
-        preserveVerifiedEmbeddings: true,
-        staged: true,
-        embeddings,
-        planDigest: 'a'.repeat(64),
-        maxReembedNodes: '1',
-      });
+    await preservationApplyCommand('/definitely/not/a/repository', {
+      preserveVerifiedEmbeddings: true,
+      staged: true,
+      embeddings,
+      planDigest: 'a'.repeat(64),
+      maxReembedNodes: '1',
+    });
 
-      expect(process.exitCode).toBe(1);
-      expect(stderr).toHaveBeenCalledWith(expect.stringContaining('max-reembed-nodes'));
-      expect(stdout).not.toHaveBeenCalled();
-    },
-  );
+    expect(process.exitCode).toBe(1);
+    expect(stderr).toHaveBeenCalledWith(expect.stringContaining('max-reembed-nodes'));
+    expect(stdout).not.toHaveBeenCalled();
+  });
 
   it.each([
     ['flat owner', 'main', undefined],
