@@ -2673,9 +2673,14 @@ export const inspectEmbeddingIntegrity = async (
           const rawId = projectionField(row, 'id', 0);
           const rawNodeId = projectionField(row, 'nodeId', 1);
           const rawChunkIndex = projectionField(row, 'chunkIndex', 2);
+          const rawStartLine = projectionField(row, 'startLine', 3);
+          const rawEndLine = projectionField(row, 'endLine', 4);
+          const rawContentHash = withHash ? projectionField(row, 'contentHash', 6) : undefined;
           const id = normalizedText(rawId);
           const nodeId = normalizedText(rawNodeId);
           const chunkIndex = strictInteger(rawChunkIndex);
+          const startLine = strictInteger(rawStartLine);
+          const endLine = strictInteger(rawEndLine);
           const vector = embeddingPhysicalVectorInfo(projectionField(row, 'embedding', 5));
           const label = ownerLabelForNodeId(nodeId);
           const supported = label === 'File' || EMBEDDABLE_LABELS.includes(label as any);
@@ -2690,15 +2695,26 @@ export const inspectEmbeddingIntegrity = async (
           const emptyId = !id.trim();
           const emptyNode = !nodeId.trim();
           const badChunk = !Number.isSafeInteger(chunkIndex) || chunkIndex < 0;
+          const badLines =
+            !Number.isSafeInteger(startLine) ||
+            startLine < 0 ||
+            !Number.isSafeInteger(endLine) ||
+            endLine < 0 ||
+            (Number.isSafeInteger(startLine) &&
+              Number.isSafeInteger(endLine) &&
+              endLine < startLine);
           if (emptyId) reasons.add('id-empty');
           if (emptyNode) reasons.add('node-id-empty');
           if (badChunk) reasons.add('chunk-index-invalid');
+          if (badLines) reasons.add('line-metadata-invalid');
           if (!emptyId && !emptyNode && !badChunk && id !== `${nodeId}:${chunkIndex}`) {
             reasons.add('id-noncanonical');
           }
           if (vector.finite !== 'finite') reasons.add(`vector-${vector.finite}`);
           if (vector.dimensions !== expectedDimensions) reasons.add('wrong-dimensions');
           if (ownerState !== 'present') reasons.add(`owner-${ownerState}`);
+          if (withHash && normalizedText(rawContentHash).trim() === '')
+            reasons.add('content-hash-missing');
           if ((idCounts.get(id) ?? 0) > 1) reasons.add('duplicate-id');
           const semantic =
             !emptyNode && !badChunk ? embeddingSemanticIdentity(nodeId, chunkIndex) : '';
@@ -2713,12 +2729,12 @@ export const inspectEmbeddingIntegrity = async (
               nodeId,
               rawChunkIndex,
               chunkIndex,
-              rawStartLine: projectionField(row, 'startLine', 3),
-              startLine: strictInteger(projectionField(row, 'startLine', 3)),
-              rawEndLine: projectionField(row, 'endLine', 4),
-              endLine: strictInteger(projectionField(row, 'endLine', 4)),
-              contentHashPresent: withHash && projectionField(row, 'contentHash', 6) !== undefined,
-              rawContentHash: withHash ? projectionField(row, 'contentHash', 6) : undefined,
+              rawStartLine,
+              startLine,
+              rawEndLine,
+              endLine,
+              contentHashPresent: withHash,
+              rawContentHash,
               vector,
               ownerLabel: label,
               ownerState,

@@ -200,7 +200,7 @@ const scannerExplainsCheckpointDrift = (
   scan.acceptedRows + scan.rejectedRows === scan.physicalRows &&
   scan.physicalRowsSha256 === integrity.physicalRowsSha256 &&
   integrity.physicalRows === checkpoint.physicalRows &&
-  integrity.validRows === checkpoint.validRows &&
+  integrity.validRows === scan.acceptedRows &&
   integrity.recoverableRows === checkpoint.physicalRows;
 
 export interface PreservationPlanContext {

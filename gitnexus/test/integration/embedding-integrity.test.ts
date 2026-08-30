@@ -403,6 +403,9 @@ withTestLbugDB(
         missingContentHashRows: 1,
         labelMismatchRows: 2,
       });
+      const integrity = await adapter.inspectEmbeddingIntegrity(EMBEDDING_DIMS, true);
+      expect(base.physicalRowsSha256).toBe(integrity.physicalRowsSha256);
+      expect(base.acceptedRows).toBe(integrity.validRows);
       expect(d.embeddingAcceptedPayloadDigest([...accepted].reverse())).toBe(
         base.acceptedPayloadSha256,
       );

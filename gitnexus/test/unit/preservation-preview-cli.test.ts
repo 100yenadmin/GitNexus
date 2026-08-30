@@ -342,7 +342,7 @@ describe('preservation preview CLI admission', () => {
     inspect.mockResolvedValue({
       tablePresent: true,
       physicalRows: 2,
-      validRows: 2,
+      validRows: 1,
       recoverableRows: 2,
       emptyIdRows: 0,
       emptyNodeIdRows: 0,
