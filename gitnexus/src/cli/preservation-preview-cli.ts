@@ -5,6 +5,7 @@ import path from 'node:path';
 import { normalizeEmbeddingDims } from './embedding-dims.js';
 import {
   executeQuery,
+  inspectEmbeddingIntegrity,
   scanEmbeddingPreservationRows,
   type EmbeddingPreservationRow,
   withLbugReadOnlyNonRecovering,
@@ -13,6 +14,7 @@ import {
   buildEmbeddingPreservationPreviewFromNodes,
   type PreservationPreviewBase,
 } from '../core/embeddings/preservation-preview.js';
+import { assertCompletedCheckpointIdentity } from '../core/embeddings/checkpoint-identity.js';
 import {
   PRESERVATION_PLAN_SCHEMA,
   PRESERVATION_PLANNER_VERSION,
@@ -32,6 +34,7 @@ import {
 } from '../storage/repo-manager.js';
 import { getCurrentBranch, getCurrentCommit, getGitRoot, hasGitDir } from '../storage/git.js';
 import type { PreservationPlan } from '../core/embeddings/preservation-plan.js';
+import { loadAnalyzeConfig, mergeAnalyzeOptions } from './analyze-config.js';
 
 export interface PreservationPreviewCliOptions extends Record<string, unknown> {
   preserveVerifiedEmbeddings?: boolean;
@@ -100,7 +103,10 @@ const resolveRepoPath = (inputPath: string | undefined, skipGit: boolean): strin
 };
 
 const resolveEmbeddingIdentity = (
-  options: PreservationPreviewCliOptions,
+  options: Pick<
+    PreservationPreviewCliOptions,
+    'embeddingBaseUrl' | 'embeddingModel' | 'embeddingDims'
+  >,
   textVersion: string,
 ): PreservationPreviewBase['embedding'] & {
   costAdmission: 'local-zero' | 'external-price-required';
@@ -172,6 +178,7 @@ export const computePreservationPlan = async (
   options: PreservationPreviewCliOptions,
 ): Promise<PreservationPlanContext> => {
   const repoPath = resolveRepoPath(inputPath, options.skipGit === true);
+  const effectiveOptions = mergeAnalyzeOptions(options, loadAnalyzeConfig(repoPath));
   // Match runFullAnalysis: only a `.git` entry at the requested root grants
   // Git identity. `git rev-parse` walks parent directories, so calling it for
   // an arbitrary --skip-git subdirectory would silently bind this plan to the
@@ -210,7 +217,7 @@ export const computePreservationPlan = async (
   const databaseSha256 = await sha256File(storage.lbugPath);
   const { queryEmbeddableNodes, contentHashForNode, EMBEDDING_TEXT_VERSION } =
     await import('../core/embeddings/embedding-pipeline.js');
-  const identity = resolveEmbeddingIdentity(options, EMBEDDING_TEXT_VERSION);
+  const identity = resolveEmbeddingIdentity(effectiveOptions, EMBEDDING_TEXT_VERSION);
   const expectedCheckpoint = meta.embeddingCheckpoint;
   if (
     expectedCheckpoint?.provider === undefined ||
@@ -224,6 +231,17 @@ export const computePreservationPlan = async (
   const acceptedRows: EmbeddingPreservationRow[] = [];
   const nodes: EmbeddableNode[] = [];
   const plan = await withLbugReadOnlyNonRecovering(storage.lbugPath, async () => {
+    if (expectedCheckpoint) {
+      const integrity = await inspectEmbeddingIntegrity(
+        undefined,
+        expectedCheckpoint.physicalRowsSha256 !== undefined,
+      );
+      assertCompletedCheckpointIdentity(
+        expectedCheckpoint,
+        integrity,
+        'Preservation completed embedding checkpoint',
+      );
+    }
     const scan = await scanEmbeddingPreservationRows({
       onBatch: (batch) => {
         acceptedRows.push(...batch);

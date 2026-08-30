@@ -92,7 +92,7 @@ describe('provider-free preservation preview core', () => {
         physicalRows: 6,
         acceptedRows: 5,
         rejectedRows: 1,
-        implicatedOwnerIds: ['Function:rejected', 'orphan:bad'],
+        implicatedOwnerIds: ['Function:rejected'],
         duplicateOwnerIds: ['Function:duplicate'],
       }),
       acceptedRows: [
@@ -119,7 +119,22 @@ describe('provider-free preservation preview core', () => {
       'Function:rejected',
     ]);
     expect(plan.counts.reembedChunkCount).toBe(8);
-    expect(plan.observations.some(({ ownerId }) => ownerId === 'orphan:bad')).toBe(false);
+  });
+
+  it('fails closed when a rejected-only implicated owner is absent from enumeration', () => {
+    expect(() =>
+      buildEmbeddingPreservationPreview({
+        base,
+        scan: scan({
+          physicalRows: 1,
+          acceptedRows: 0,
+          rejectedRows: 1,
+          implicatedOwnerIds: ['Function:rejected-only'],
+        }),
+        acceptedRows: [],
+        owners: [owner('Function:known', 'known', [0])],
+      }),
+    ).toThrow('implicated owners absent from the current owner enumeration');
   });
 
   it('fails closed when accepted rows reference an owner absent from enumeration', () => {

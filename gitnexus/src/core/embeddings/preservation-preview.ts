@@ -157,6 +157,15 @@ export const derivePreservationOwnerObservations = ({
     );
   }
 
+  const implicatedOwnersAbsentFromEnumeration = scan.implicatedOwnerIds.filter(
+    (ownerId) => !ownerMap.has(ownerId),
+  );
+  if (implicatedOwnersAbsentFromEnumeration.length > 0) {
+    throw new Error(
+      'Preservation scanner implicated owners absent from the current owner enumeration',
+    );
+  }
+
   const implicated = new Set(scan.implicatedOwnerIds);
   const duplicates = new Set(scan.duplicateOwnerIds ?? []);
   for (const row of acceptedRows) {

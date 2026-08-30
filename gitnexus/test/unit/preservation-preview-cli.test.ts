@@ -1,3 +1,6 @@
+import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   computePreservationPlan,
@@ -7,15 +10,108 @@ import {
 import { preservationApplyCommand } from '../../src/cli/preservation-apply-cli.js';
 import * as git from '../../src/storage/git.js';
 import * as repoManager from '../../src/storage/repo-manager.js';
+import * as lbugAdapter from '../../src/core/lbug/lbug-adapter.js';
+import * as embeddingPipeline from '../../src/core/embeddings/embedding-pipeline.js';
+import * as stagedPromotion from '../../src/core/staged-promotion.js';
+import { httpEmbeddingProvider } from '../../src/core/embeddings/embedding-identity.js';
 
 describe('preservation preview CLI admission', () => {
   const originalExitCode = process.exitCode;
+  const tempDirs: string[] = [];
 
-  afterEach(() => {
+  afterEach(async () => {
     process.exitCode = originalExitCode;
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
+    await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
   });
+
+  const createPreservationRepo = async ({
+    provider = 'local',
+    model = 'Xenova/all-MiniLM-L6-v2',
+    config,
+  }: {
+    provider?: string;
+    model?: string;
+    config?: Record<string, unknown>;
+  } = {}) => {
+    const repoPath = await mkdtemp(path.join(tmpdir(), 'gitnexus-preservation-'));
+    tempDirs.push(repoPath);
+    const storagePath = path.join(repoPath, '.gitnexus');
+    await mkdir(storagePath);
+    await writeFile(path.join(storagePath, 'lbug'), 'provider-free-test-db');
+    await writeFile(
+      path.join(storagePath, 'gitnexus.json'),
+      JSON.stringify({
+        repoPath,
+        lastCommit: '',
+        indexedAt: '2026-08-30T00:00:00.000Z',
+        stats: { embeddings: 0 },
+        embeddingCheckpoint: {
+          at: '2026-08-30T00:00:00.000Z',
+          nodesProcessed: 0,
+          totalNodes: 0,
+          chunksProcessed: 0,
+          provider,
+          model,
+          dimensions: 384,
+          physicalRows: 0,
+          validRows: 0,
+          recoverableIdentitySha256: 'a'.repeat(64),
+          physicalRowsSha256: 'a'.repeat(64),
+        },
+      }),
+    );
+    if (config) await writeFile(path.join(repoPath, '.gitnexusrc'), JSON.stringify(config));
+    return repoPath;
+  };
+
+  const mockEmptyPreservationDatabase = (physicalRowsSha256 = 'a'.repeat(64)) => {
+    vi.spyOn(lbugAdapter, 'withLbugReadOnlyNonRecovering').mockImplementation(
+      async (_dbPath, operation) => operation(),
+    );
+    const inspect = vi.spyOn(lbugAdapter, 'inspectEmbeddingIntegrity').mockResolvedValue({
+      tablePresent: true,
+      physicalRows: 0,
+      validRows: 0,
+      recoverableRows: 0,
+      emptyIdRows: 0,
+      emptyNodeIdRows: 0,
+      invalidChunkRows: 0,
+      noncanonicalIdRows: 0,
+      duplicateIdRows: 0,
+      duplicateSemanticRows: 0,
+      orphanRows: 0,
+      wrongDimensionRows: 0,
+      recoverableIdentitySha256: 'a'.repeat(64),
+      physicalRowsSha256,
+    });
+    const scan = vi.spyOn(lbugAdapter, 'scanEmbeddingPreservationRows').mockResolvedValue({
+      tablePresent: true,
+      physicalRows: 0,
+      acceptedRows: 0,
+      rejectedRows: 0,
+      duplicateIdRows: 0,
+      duplicateSemanticRows: 0,
+      noncanonicalIdRows: 0,
+      emptyIdRows: 0,
+      emptyNodeIdRows: 0,
+      invalidChunkRows: 0,
+      invalidLineRows: 0,
+      nonfiniteRows: 0,
+      malformedVectorRows: 0,
+      wrongDimensionRows: 0,
+      missingContentHashRows: 0,
+      labelMismatchRows: 0,
+      physicalRowsSha256,
+      rejectedRowsSha256: 'rejected',
+      acceptedPayloadSha256: 'accepted',
+      implicatedOwnerIds: [],
+      missingOwnerLabels: [],
+    });
+    vi.spyOn(embeddingPipeline, 'queryEmbeddableNodes').mockImplementation(async function* () {});
+    return { inspect, scan };
+  };
 
   it('uses one chunk for long short labels just like production embedding', async () => {
     const node = {
@@ -150,6 +246,66 @@ describe('preservation preview CLI admission', () => {
     expect(resolvePlacement).toHaveBeenCalledWith(requestedPath, 'main');
     expect(getStorage).toHaveBeenCalledWith(requestedPath, undefined);
   });
+
+  it('uses .gitnexusrc embedding identity without provider construction or credentials', async () => {
+    const endpoint = 'https://synthetic.invalid/v1';
+    const model = 'synthetic-model';
+    const repoPath = await createPreservationRepo({
+      provider: httpEmbeddingProvider(endpoint),
+      model,
+      config: { embeddingBaseUrl: endpoint, embeddingModel: model },
+    });
+    mockEmptyPreservationDatabase();
+    const fetchSpy = vi.fn();
+    vi.stubGlobal('fetch', fetchSpy);
+
+    const context = await computePreservationPlan(repoPath, { skipGit: true });
+
+    expect(context.plan.embedding).toMatchObject({
+      provider: httpEmbeddingProvider(endpoint),
+      model,
+      transport: 'http',
+    });
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it.each(['preview', 'apply'])(
+    'refuses %s when completed-checkpoint vector bytes differ before scan, lock, or provider work',
+    async (mode) => {
+      const repoPath = await createPreservationRepo();
+      const { scan } = mockEmptyPreservationDatabase('b'.repeat(64));
+      const lock = vi.spyOn(stagedPromotion, 'withAnalyzeOwnershipLock');
+      const fetchSpy = vi.fn();
+      vi.stubGlobal('fetch', fetchSpy);
+      const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+
+      if (mode === 'preview') {
+        await preservationPreviewCommand(repoPath, {
+          preserveVerifiedEmbeddings: true,
+          dryRun: true,
+          json: true,
+          staged: true,
+          embeddings: true,
+          skipGit: true,
+        });
+      } else {
+        await preservationApplyCommand(repoPath, {
+          preserveVerifiedEmbeddings: true,
+          staged: true,
+          embeddings: true,
+          planDigest: 'c'.repeat(64),
+          maxReembedNodes: '1',
+          skipGit: true,
+        });
+      }
+
+      expect(process.exitCode).toBe(1);
+      expect(stderr).toHaveBeenCalledWith(expect.stringContaining('durable identity'));
+      expect(scan).not.toHaveBeenCalled();
+      expect(lock).not.toHaveBeenCalled();
+      expect(fetchSpy).not.toHaveBeenCalled();
+    },
+  );
 
   it('dispatches preservation apply without loading the ordinary analyzer', async () => {
     const apply = vi.fn(async () => undefined);
