@@ -24,8 +24,13 @@ import {
   type EmbeddableNode,
 } from '../core/embeddings/types.js';
 import type { Chunk } from '../core/embeddings/chunker.js';
-import { canonicalizePath, getStoragePaths, loadMeta } from '../storage/repo-manager.js';
-import { getCurrentBranch, getCurrentCommit, getGitRoot } from '../storage/git.js';
+import {
+  canonicalizePath,
+  getStoragePaths,
+  loadMeta,
+  resolveBranchPlacement,
+} from '../storage/repo-manager.js';
+import { getCurrentBranch, getCurrentCommit, getGitRoot, hasGitDir } from '../storage/git.js';
 import type { PreservationPlan } from '../core/embeddings/preservation-plan.js';
 
 export interface PreservationPreviewCliOptions extends Record<string, unknown> {
@@ -42,6 +47,7 @@ export interface PreservationPreviewCliOptions extends Record<string, unknown> {
   embeddingDims?: string;
   planDigest?: string;
   maxReembedNodes?: string;
+  incrementalOnly?: boolean;
   force?: boolean;
   dropEmbeddings?: boolean;
   repairFts?: boolean;
@@ -155,7 +161,8 @@ export interface PreservationPlanContext {
   meta: NonNullable<Awaited<ReturnType<typeof loadMeta>>>;
   repoPath: string;
   currentCommit: string;
-  currentBranch: string;
+  currentBranch: string | null;
+  placement: { branch?: string };
   storage: ReturnType<typeof getStoragePaths>;
   costAdmission: 'local-zero' | 'external-price-required';
 }
@@ -165,14 +172,24 @@ export const computePreservationPlan = async (
   options: PreservationPreviewCliOptions,
 ): Promise<PreservationPlanContext> => {
   const repoPath = resolveRepoPath(inputPath, options.skipGit === true);
-  const currentCommit = getCurrentCommit(repoPath);
-  if (!currentCommit) throw new Error('source commit identity is unavailable');
-  const currentBranch = getCurrentBranch(repoPath);
-  if (!currentBranch) throw new Error('source branch identity is unavailable');
-  if (options.branch !== undefined && options.branch !== currentBranch)
+  // Match runFullAnalysis: only a `.git` entry at the requested root grants
+  // Git identity. `git rev-parse` walks parent directories, so calling it for
+  // an arbitrary --skip-git subdirectory would silently bind this plan to the
+  // parent repository rather than the requested non-Git root.
+  const repoHasGit = hasGitDir(repoPath);
+  const currentCommit = repoHasGit ? getCurrentCommit(repoPath) : '';
+  if (repoHasGit && !currentCommit) throw new Error('source commit identity is unavailable');
+  const currentBranch = repoHasGit ? getCurrentBranch(repoPath) : null;
+  if (options.branch !== undefined && currentBranch !== null && options.branch !== currentBranch)
     throw new Error('requested branch differs from the checked-out branch');
 
-  const storage = getStoragePaths(repoPath, options.branch);
+  // Plain runs always use the flat workspace slot. An explicit branch follows
+  // the same owner-aware placement contract as runFullAnalysis: a matching
+  // flat owner stays flat, while a different label gets its branch slot.
+  const branchLabel = options.branch ?? currentBranch;
+  const placement =
+    options.branch !== undefined ? await resolveBranchPlacement(repoPath, branchLabel) : {};
+  const storage = getStoragePaths(repoPath, placement.branch);
   const metaDir = path.dirname(storage.metaPath);
   const meta = await loadMeta(metaDir);
   if (!meta) throw new Error('canonical metadata is missing or unreadable');
@@ -185,7 +202,7 @@ export const computePreservationPlan = async (
   }
   if (meta.lastCommit !== currentCommit)
     throw new Error('source HEAD differs from the indexed commit');
-  if (meta.branch !== undefined && meta.branch !== currentBranch) {
+  if (meta.branch !== undefined && branchLabel !== null && meta.branch !== branchLabel) {
     throw new Error('metadata branch differs from the requested branch');
   }
 
@@ -218,7 +235,7 @@ export const computePreservationPlan = async (
       base: {
         schemaVersion: PRESERVATION_PLAN_SCHEMA,
         plannerVersion: PRESERVATION_PLANNER_VERSION,
-        source: { head: currentCommit, branch: currentBranch, worktree: repoPath },
+        source: { head: currentCommit, branch: branchLabel, worktree: repoPath },
         storage: {
           database: { canonicalPath: canonicalizePath(storage.lbugPath), sha256: databaseSha256 },
           metadata: {
@@ -244,6 +261,7 @@ export const computePreservationPlan = async (
     repoPath,
     currentCommit,
     currentBranch,
+    placement,
     storage,
     costAdmission: identity.costAdmission,
   };

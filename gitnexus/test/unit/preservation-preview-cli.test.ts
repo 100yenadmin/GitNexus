@@ -1,8 +1,11 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
+  computePreservationPlan,
   derivePreservationChunkIndices,
   preservationPreviewCommand,
 } from '../../src/cli/preservation-preview-cli.js';
+import * as git from '../../src/storage/git.js';
+import * as repoManager from '../../src/storage/repo-manager.js';
 
 describe('preservation preview CLI admission', () => {
   const originalExitCode = process.exitCode;
@@ -63,6 +66,40 @@ describe('preservation preview CLI admission', () => {
     expect(stderr).toHaveBeenCalledWith(expect.stringContaining('not accepted'));
     expect(stdout).not.toHaveBeenCalled();
   });
+
+  it.each([
+    ['flat owner', 'main', undefined],
+    ['branch slot', 'feature/x', 'feature/x'],
+  ])(
+    'uses owner-aware placement for an explicit --branch (%s)',
+    async (_label, branch, resolvedBranch) => {
+      const requestedPath = '/definitely/not/a/repository';
+      const resolvePlacement = vi
+        .spyOn(repoManager, 'resolveBranchPlacement')
+        .mockResolvedValue(resolvedBranch === undefined ? {} : { branch: resolvedBranch });
+      const getStorage = vi.spyOn(repoManager, 'getStoragePaths').mockReturnValue({
+        storagePath: `${requestedPath}/.gitnexus`,
+        lbugPath: `${requestedPath}/.gitnexus/lbug`,
+        metaPath: `${requestedPath}/.gitnexus/gitnexus.json`,
+      });
+      vi.spyOn(repoManager, 'loadMeta').mockResolvedValue(null);
+      const hasGit = vi.spyOn(git, 'hasGitDir').mockReturnValue(false);
+      const getCommit = vi.spyOn(git, 'getCurrentCommit');
+      const getBranch = vi.spyOn(git, 'getCurrentBranch');
+
+      await expect(
+        computePreservationPlan(requestedPath, {
+          branch,
+        }),
+      ).rejects.toThrow('canonical metadata');
+
+      expect(hasGit).toHaveBeenCalledWith(requestedPath);
+      expect(getCommit).not.toHaveBeenCalled();
+      expect(getBranch).not.toHaveBeenCalled();
+      expect(resolvePlacement).toHaveBeenCalledWith(requestedPath, branch);
+      expect(getStorage).toHaveBeenCalledWith(requestedPath, resolvedBranch);
+    },
+  );
 
   it('dispatches preservation apply without loading the ordinary analyzer', async () => {
     const apply = vi.fn(async () => undefined);

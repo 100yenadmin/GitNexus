@@ -46,6 +46,15 @@ const input = (): PreservationPlanInput => ({
 });
 
 describe('provider-free embedding preservation planner', () => {
+  it('preserves a detached source identity with a real head and null branch', () => {
+    const planned = planEmbeddingPreservation({
+      ...input(),
+      source: { ...input().source, head: 'detached-head', branch: null },
+    });
+
+    expect(planned.source).toMatchObject({ head: 'detached-head', branch: null });
+  });
+
   it('is order-independent and expands duplicate/implicated owners', () => {
     const planned = planEmbeddingPreservation({
       ...input(),

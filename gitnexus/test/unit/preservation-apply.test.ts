@@ -154,6 +154,29 @@ describe('preservation apply admission and orchestration', () => {
     vi.restoreAllMocks();
   });
 
+  it('refuses incremental-only before repository, provider, or lock setup', async () => {
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const fetchSpy = vi.fn();
+    vi.stubGlobal('fetch', fetchSpy);
+    const previousExitCode = process.exitCode;
+
+    await preservationApplyCommand('/definitely/not/a/repository', {
+      preserveVerifiedEmbeddings: true,
+      staged: true,
+      embeddings: true,
+      incrementalOnly: true,
+      planDigest: 'a'.repeat(64),
+      maxReembedNodes: '1',
+    });
+
+    expect(process.exitCode).toBe(1);
+    expect(stderr).toHaveBeenCalledWith(expect.stringContaining('--incremental-only'));
+    expect(fetchSpy).not.toHaveBeenCalled();
+    process.exitCode = previousExitCode;
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
   it.each([
     ['wrong digest', '0'.repeat(64), 1, 'local-zero' as const],
     ['invalid cap', plan.planDigest, 0, 'local-zero' as const],

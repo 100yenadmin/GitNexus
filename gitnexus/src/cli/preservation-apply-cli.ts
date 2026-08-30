@@ -15,7 +15,7 @@ import {
   promoteStagedGeneration,
   withAnalyzeOwnershipLock,
 } from '../core/staged-promotion.js';
-import { getCurrentBranch, getCurrentCommit } from '../storage/git.js';
+import { getCurrentBranch, getCurrentCommit, hasGitDir } from '../storage/git.js';
 import { canonicalizePath, registerRepo, saveMeta } from '../storage/repo-manager.js';
 import { computePreservationPlan } from './preservation-preview-cli.js';
 import type { PreservationPreviewCliOptions } from './preservation-preview-cli.js';
@@ -28,6 +28,9 @@ const fail = (message: string): void => {
 const parseApplyOptions = (options: PreservationPreviewCliOptions) => {
   if (!options.preserveVerifiedEmbeddings || !options.staged || !options.embeddings) {
     throw new Error('apply requires --preserve-verified-embeddings --staged --embeddings');
+  }
+  if (options.incrementalOnly) {
+    throw new Error('apply cannot be combined with --incremental-only');
   }
   if (options.dryRun) throw new Error('apply cannot be combined with --dry-run');
   if (typeof options.planDigest !== 'string' || !/^[0-9a-f]{64}$/.test(options.planDigest)) {
@@ -180,16 +183,19 @@ export const preservationApplyCommand = async (
                 async (meta) => {
                   await saveMeta(path.dirname(context.storage.metaPath), meta);
                   return registerRepo(context.repoPath, meta, {
-                    branch: options.branch,
+                    branch: context.placement.branch,
                     expectedCanonicalPath: canonicalizePath(context.repoPath),
                     expectedCanonicalStoragePath: canonicalizePath(context.storage.storagePath),
                   });
                 },
                 {
-                  readRepositoryIdentity: () => ({
-                    head: getCurrentCommit(context.repoPath),
-                    branch: getCurrentBranch(context.repoPath),
-                  }),
+                  readRepositoryIdentity: () => {
+                    const repoHasGit = hasGitDir(context.repoPath);
+                    return {
+                      head: repoHasGit ? getCurrentCommit(context.repoPath) : '',
+                      branch: repoHasGit ? getCurrentBranch(context.repoPath) : null,
+                    };
+                  },
                 },
               ),
           },

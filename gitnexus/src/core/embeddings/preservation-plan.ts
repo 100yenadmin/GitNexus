@@ -5,7 +5,7 @@ export const PRESERVATION_PLANNER_VERSION = 'm8b-planner/v1';
 
 export interface PreservationSourceIdentity {
   head: string;
-  branch: string;
+  branch: string | null;
   worktree: string;
 }
 
