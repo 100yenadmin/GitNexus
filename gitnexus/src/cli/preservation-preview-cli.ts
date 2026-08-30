@@ -1,16 +1,17 @@
 import { createHash } from 'node:crypto';
+import { createReadStream } from 'node:fs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { normalizeEmbeddingDims } from './embedding-dims.js';
 import {
   executeQuery,
   scanEmbeddingPreservationRows,
+  type EmbeddingPreservationRow,
   withLbugReadOnlyNonRecovering,
 } from '../core/lbug/lbug-adapter.js';
 import {
   buildEmbeddingPreservationPreviewFromNodes,
   type PreservationPreviewBase,
-  type PreservationPreviewRow,
 } from '../core/embeddings/preservation-preview.js';
 import {
   PRESERVATION_PLAN_SCHEMA,
@@ -20,6 +21,7 @@ import { httpEmbeddingProvider } from '../core/embeddings/embedding-identity.js'
 import { DEFAULT_EMBEDDING_CONFIG, type EmbeddableNode } from '../core/embeddings/types.js';
 import { canonicalizePath, getStoragePaths, loadMeta } from '../storage/repo-manager.js';
 import { getCurrentBranch, getCurrentCommit, getGitRoot } from '../storage/git.js';
+import type { PreservationPlan } from '../core/embeddings/preservation-plan.js';
 
 export interface PreservationPreviewCliOptions extends Record<string, unknown> {
   preserveVerifiedEmbeddings?: boolean;
@@ -43,6 +45,12 @@ export interface PreservationPreviewCliOptions extends Record<string, unknown> {
 
 const sha256 = (value: Uint8Array | string): string =>
   createHash('sha256').update(value).digest('hex');
+
+const sha256File = async (filePath: string): Promise<string> => {
+  const digest = createHash('sha256');
+  for await (const chunk of createReadStream(filePath)) digest.update(chunk);
+  return digest.digest('hex');
+};
 
 const fail = (message: string): void => {
   process.stderr.write(`  Preservation preview refused: ${message}\n`);
@@ -113,6 +121,115 @@ const validatePreviewOptions = (options: PreservationPreviewCliOptions): void =>
   }
 };
 
+export interface PreservationPlanContext {
+  plan: PreservationPlan;
+  acceptedRows: EmbeddingPreservationRow[];
+  meta: NonNullable<Awaited<ReturnType<typeof loadMeta>>>;
+  repoPath: string;
+  currentCommit: string;
+  currentBranch: string;
+  storage: ReturnType<typeof getStoragePaths>;
+  costAdmission: 'local-zero' | 'external-price-required';
+}
+
+export const computePreservationPlan = async (
+  inputPath: string | undefined,
+  options: PreservationPreviewCliOptions,
+): Promise<PreservationPlanContext> => {
+  const repoPath = resolveRepoPath(inputPath, options.skipGit === true);
+  const currentCommit = getCurrentCommit(repoPath);
+  if (!currentCommit) throw new Error('source commit identity is unavailable');
+  const currentBranch = getCurrentBranch(repoPath);
+  if (!currentBranch) throw new Error('source branch identity is unavailable');
+  if (options.branch !== undefined && options.branch !== currentBranch)
+    throw new Error('requested branch differs from the checked-out branch');
+
+  const storage = getStoragePaths(repoPath, options.branch);
+  const metaDir = path.dirname(storage.metaPath);
+  const meta = await loadMeta(metaDir);
+  if (!meta) throw new Error('canonical metadata is missing or unreadable');
+  if (meta.incrementalInProgress) throw new Error('an interrupted analysis marker is present');
+  if ((meta.embeddingCheckpoint?.pendingNodeIds?.length ?? 0) > 0) {
+    throw new Error('an embedding checkpoint is pending');
+  }
+  if (canonicalizePath(meta.repoPath) !== repoPath) {
+    throw new Error('metadata repository identity does not match the requested worktree');
+  }
+  if (meta.lastCommit !== currentCommit)
+    throw new Error('source HEAD differs from the indexed commit');
+  if (meta.branch !== undefined && meta.branch !== currentBranch) {
+    throw new Error('metadata branch differs from the requested branch');
+  }
+
+  const metadataBytes = await fs.readFile(storage.metaPath);
+  const databaseSha256 = await sha256File(storage.lbugPath);
+  const { queryEmbeddableNodes, contentHashForNode, EMBEDDING_TEXT_VERSION } =
+    await import('../core/embeddings/embedding-pipeline.js');
+  const identity = resolveEmbeddingIdentity(options, EMBEDDING_TEXT_VERSION);
+  const expectedCheckpoint = meta.embeddingCheckpoint;
+  if (
+    expectedCheckpoint?.provider === undefined ||
+    expectedCheckpoint.provider !== identity.provider ||
+    expectedCheckpoint.model !== identity.model ||
+    expectedCheckpoint.dimensions !== identity.dimensions
+  ) {
+    throw new Error('metadata does not prove the requested provider, model, and dimensions');
+  }
+
+  const acceptedRows: EmbeddingPreservationRow[] = [];
+  const nodes: EmbeddableNode[] = [];
+  const plan = await withLbugReadOnlyNonRecovering(storage.lbugPath, async () => {
+    const scan = await scanEmbeddingPreservationRows({
+      onBatch: (batch) => {
+        acceptedRows.push(...batch);
+      },
+    });
+    const { chunkNode } = await import('../core/embeddings/chunker.js');
+    for await (const page of queryEmbeddableNodes(executeQuery)) nodes.push(...page);
+    return buildEmbeddingPreservationPreviewFromNodes({
+      base: {
+        schemaVersion: PRESERVATION_PLAN_SCHEMA,
+        plannerVersion: PRESERVATION_PLANNER_VERSION,
+        source: { head: currentCommit, branch: currentBranch, worktree: repoPath },
+        storage: {
+          database: { canonicalPath: canonicalizePath(storage.lbugPath), sha256: databaseSha256 },
+          metadata: {
+            canonicalPath: canonicalizePath(storage.metaPath),
+            sha256: sha256(metadataBytes),
+          },
+        },
+        embedding: identity,
+      },
+      scan,
+      acceptedRows,
+      nodes,
+      derivation: {
+        chunkIndicesForNode: async (node) =>
+          (
+            await chunkNode(
+              node.label,
+              node.content,
+              node.filePath,
+              Number.isSafeInteger(node.startLine) ? Number(node.startLine) : 1,
+              Number.isSafeInteger(node.endLine) ? Number(node.endLine) : 1,
+            )
+          ).map(({ chunkIndex }) => chunkIndex),
+        contentHashForNode,
+      },
+    });
+  });
+  return {
+    plan,
+    acceptedRows,
+    meta,
+    repoPath,
+    currentCommit,
+    currentBranch,
+    storage,
+    costAdmission: identity.costAdmission,
+  };
+};
+
 export const preservationPreviewCommand = async (
   inputPath?: string,
   rawOptions?: Record<string, unknown>,
@@ -121,96 +238,13 @@ export const preservationPreviewCommand = async (
   const priorOrtLogLevel = process.env.ORT_LOG_LEVEL;
   try {
     validatePreviewOptions(options);
-    const repoPath = resolveRepoPath(inputPath, options.skipGit === true);
-    const currentCommit = getCurrentCommit(repoPath);
-    if (!currentCommit) throw new Error('source commit identity is unavailable');
-    const currentBranch = options.branch ?? getCurrentBranch(repoPath);
-    if (!currentBranch) throw new Error('source branch identity is unavailable');
-
-    const storage = getStoragePaths(repoPath, options.branch);
-    const metaDir = path.dirname(storage.metaPath);
-    const meta = await loadMeta(metaDir);
-    if (!meta) throw new Error('canonical metadata is missing or unreadable');
-    if (meta.incrementalInProgress) throw new Error('an interrupted analysis marker is present');
-    if ((meta.embeddingCheckpoint?.pendingNodeIds?.length ?? 0) > 0) {
-      throw new Error('an embedding checkpoint is pending');
-    }
-    if (canonicalizePath(meta.repoPath) !== repoPath) {
-      throw new Error('metadata repository identity does not match the requested worktree');
-    }
-    if (meta.lastCommit !== currentCommit) {
-      throw new Error('source HEAD differs from the indexed commit');
-    }
-    if (meta.branch !== undefined && meta.branch !== currentBranch) {
-      throw new Error('metadata branch differs from the requested branch');
-    }
-
-    const metadataBytes = await fs.readFile(storage.metaPath);
-    const { queryEmbeddableNodes, contentHashForNode, EMBEDDING_TEXT_VERSION } = await import(
-      '../core/embeddings/embedding-pipeline.js'
-    );
-    const identity = resolveEmbeddingIdentity(options, EMBEDDING_TEXT_VERSION);
-    const expectedCheckpoint = meta.embeddingCheckpoint;
-    if (
-      expectedCheckpoint?.provider === undefined ||
-      expectedCheckpoint.provider !== identity.provider ||
-      expectedCheckpoint.model !== identity.model ||
-      expectedCheckpoint.dimensions !== identity.dimensions
-    ) {
-      throw new Error('metadata does not prove the requested provider, model, and dimensions');
-    }
-
-    const acceptedRows: PreservationPreviewRow[] = [];
-    const nodes: EmbeddableNode[] = [];
-    const plan = await withLbugReadOnlyNonRecovering(storage.lbugPath, async () => {
-      const scan = await scanEmbeddingPreservationRows({
-        onBatch: (batch) => {
-          acceptedRows.push(...batch);
-        },
-      });
-      const { chunkNode } = await import('../core/embeddings/chunker.js');
-      for await (const page of queryEmbeddableNodes(executeQuery)) nodes.push(...page);
-      return buildEmbeddingPreservationPreviewFromNodes({
-        base: {
-          schemaVersion: PRESERVATION_PLAN_SCHEMA,
-          plannerVersion: PRESERVATION_PLANNER_VERSION,
-          source: { head: currentCommit, branch: currentBranch, worktree: repoPath },
-          storage: {
-            database: {
-              canonicalPath: canonicalizePath(storage.lbugPath),
-              sha256: scan.physicalRowsSha256,
-            },
-            metadata: {
-              canonicalPath: canonicalizePath(storage.metaPath),
-              sha256: sha256(metadataBytes),
-            },
-          },
-          embedding: identity,
-        },
-        scan,
-        acceptedRows,
-        nodes,
-        derivation: {
-          chunkIndicesForNode: async (node) =>
-            (
-              await chunkNode(
-                node.label,
-                node.content,
-                node.filePath,
-                Number.isSafeInteger(node.startLine) ? Number(node.startLine) : 1,
-                Number.isSafeInteger(node.endLine) ? Number(node.endLine) : 1,
-              )
-            ).map(({ chunkIndex }) => chunkIndex),
-          contentHashForNode,
-        },
-      });
-    });
+    const { plan, costAdmission } = await computePreservationPlan(inputPath, options);
 
     process.stdout.write(
       `${JSON.stringify({
         ...plan,
-        costAdmission: identity.costAdmission,
-        estimatedCostUsd: identity.costAdmission === 'local-zero' ? 0 : null,
+        costAdmission,
+        estimatedCostUsd: costAdmission === 'local-zero' ? 0 : null,
       })}\n`,
     );
   } catch (error) {

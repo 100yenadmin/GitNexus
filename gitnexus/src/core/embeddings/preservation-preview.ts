@@ -14,6 +14,9 @@ export interface PreservationPreviewRow {
   id: string;
   nodeId: string;
   chunkIndex: number;
+  startLine?: number;
+  endLine?: number;
+  embedding?: readonly number[];
   contentHash?: string;
 }
 

@@ -44,4 +44,30 @@ describe('preservation preview CLI admission', () => {
     expect(stderr).toHaveBeenCalledWith(expect.stringContaining('not accepted'));
     expect(stdout).not.toHaveBeenCalled();
   });
+
+  it('dispatches preservation apply without loading the ordinary analyzer', async () => {
+    const apply = vi.fn(async () => undefined);
+    const analyze = vi.fn(async () => undefined);
+    vi.doMock('../../src/cli/preservation-apply-cli.js', () => ({
+      preservationApplyCommand: apply,
+    }));
+    vi.doMock('../../src/cli/analyze.js', () => ({ analyzeCommand: analyze }));
+    vi.resetModules();
+    const { analyzeAction } = await import('../../src/cli/analyze-action.js');
+
+    const options = {
+      preserveVerifiedEmbeddings: true,
+      staged: true,
+      embeddings: true,
+      planDigest: 'a'.repeat(64),
+      maxReembedNodes: '1',
+    };
+    await analyzeAction('/repo', options);
+
+    expect(apply).toHaveBeenCalledWith('/repo', options);
+    expect(analyze).not.toHaveBeenCalled();
+    vi.doUnmock('../../src/cli/preservation-apply-cli.js');
+    vi.doUnmock('../../src/cli/analyze.js');
+    vi.resetModules();
+  });
 });
