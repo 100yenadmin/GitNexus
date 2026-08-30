@@ -244,7 +244,7 @@ const queryLabelNodePages = async function* (
  * Page code-symbol nodes deterministically. If the repository has no code
  * symbols, page text-bearing File nodes instead.
  */
-const queryEmbeddableNodes = async function* (
+export const queryEmbeddableNodes = async function* (
   executeQuery: (cypher: string) => Promise<any[]>,
 ): AsyncGenerator<EmbeddableNode[]> {
   let sawCodeSymbol = false;

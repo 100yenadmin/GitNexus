@@ -275,6 +275,11 @@ describe('CLI help surface', () => {
     expect(result.stdout).toContain('--repair-fts');
     expect(result.stdout).toContain('--incremental-only');
     expect(result.stdout).toContain('--staged');
+    expect(result.stdout).toContain('--preserve-verified-embeddings');
+    expect(result.stdout).toContain('--dry-run');
+    expect(result.stdout).toContain('--json');
+    expect(result.stdout).toContain('--plan-digest <sha256>');
+    expect(result.stdout).toContain('--max-reembed-nodes <n>');
   });
 
   it('doctor help includes the read-only recovery plan option', () => {

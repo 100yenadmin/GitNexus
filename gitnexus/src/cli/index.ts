@@ -80,6 +80,14 @@ program
       'preserves any embeddings already present in the index.',
   )
   .option(
+    '--preserve-verified-embeddings',
+    'Plan or apply a verified embedding-preservation repair',
+  )
+  .option('--dry-run', 'Preview a preservation repair without mutation')
+  .option('--json', 'Emit one machine-readable preservation plan')
+  .option('--plan-digest <sha256>', 'Apply only the exact reviewed preservation plan')
+  .option('--max-reembed-nodes <n>', 'Positive owner cap required for preservation apply')
+  .option(
     '--skills',
     'Generate repo-specific skill files from detected communities ' +
       '(no-op when --index-only is also set).',
@@ -202,7 +210,7 @@ program
       process.env.GITNEXUS_EMBEDDING_DIMS = dimsEnvBaseline;
     }
   })
-  .action(createLbugLazyAction(() => import('./analyze.js'), 'analyzeCommand'));
+  .action(createLbugLazyAction(() => import('./analyze-action.js'), 'analyzeAction'));
 
 program
   .command('index [path...]')

@@ -171,6 +171,11 @@ export const zhCN = {
     '启用语义搜索的嵌入生成（默认关闭）。可选 [limit] 覆盖 50,000 节点安全上限；传 0 可完全禁用上限。',
   'help.option.analyze.dropEmbeddings':
     '重建时删除现有嵌入。默认情况下，未传 `--embeddings` 的 `analyze` 会保留索引中已有嵌入。',
+  'help.option.analyze.preserveVerifiedEmbeddings': '规划或执行已验证的嵌入保留修复',
+  'help.option.analyze.dryRun': '无写入地预览嵌入保留修复',
+  'help.option.analyze.json': '输出一个机器可读的嵌入保留计划',
+  'help.option.analyze.planDigest': '仅执行指定的已审阅嵌入保留计划',
+  'help.option.analyze.maxReembedNodes': '执行保留修复时必需的正数节点上限',
   'help.option.analyze.skills':
     '根据检测到的社区生成仓库专属 skill 文件（同时设置 --index-only 时无效）。',
   'help.option.analyze.skipAgentsMd': '跳过更新 AGENTS.md 和 CLAUDE.md 中的 gitnexus 区块',

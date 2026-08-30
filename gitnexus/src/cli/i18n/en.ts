@@ -180,6 +180,12 @@ export const en = {
     'Enable embedding generation for semantic search (off by default). Local models default to a 50,000-node safety cap; remote HTTP providers default uncapped. Optional [limit] sets an explicit cap; pass 0 to disable it.',
   'help.option.analyze.dropEmbeddings':
     'Drop existing embeddings on rebuild. By default, an `analyze` without `--embeddings` preserves any embeddings already present in the index.',
+  'help.option.analyze.preserveVerifiedEmbeddings':
+    'Plan or apply a verified embedding-preservation repair',
+  'help.option.analyze.dryRun': 'Preview a preservation repair without mutation',
+  'help.option.analyze.json': 'Emit one machine-readable preservation plan',
+  'help.option.analyze.planDigest': 'Apply only the exact reviewed preservation plan',
+  'help.option.analyze.maxReembedNodes': 'Positive owner cap required for preservation apply',
   'help.option.analyze.skills':
     'Generate repo-specific skill files from detected communities (no-op when --index-only is also set).',
   'help.option.analyze.skipAgentsMd':
