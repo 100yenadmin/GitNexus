@@ -28,7 +28,7 @@ describe('preservation preview CLI admission', () => {
 
   const createPreservationRepo = async ({
     provider = 'local',
-    model = 'Xenova/all-MiniLM-L6-v2',
+    model = 'Snowflake/snowflake-arctic-embed-xs',
     config,
   }: {
     provider?: string;
