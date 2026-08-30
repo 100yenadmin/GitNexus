@@ -59,6 +59,7 @@ describe('preservation preview CLI admission', () => {
           provider,
           model,
           dimensions: 384,
+          pendingNodeIds: [],
           physicalRows: 0,
           validRows: 0,
           recoverableIdentitySha256: 'a'.repeat(64),
