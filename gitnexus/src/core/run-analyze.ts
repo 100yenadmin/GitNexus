@@ -2937,6 +2937,51 @@ const runFullAnalysisImpl = async (
       progress('fts', 90, 'Search indexes skipped (FTS unavailable)');
     }
 
+    // Settle embedding admission before streaming the snapshot. Exact row-ID
+    // sidecars are needed only when Phase 4 will run; preserve-only and
+    // cap-refused analyses must keep the snapshot pass bounded to its batches.
+    const stats = await getLbugStats();
+    let embeddingSkipped = true;
+    let semanticMode: 'vector-index' | 'exact-scan' | undefined;
+    let httpMode = false;
+
+    if (shouldGenerateEmbeddings) {
+      const { isHttpMode } = await import('./embeddings/http-client.js');
+      httpMode = isHttpMode();
+      const { skipForCap, capDisabled, nodeLimit } = deriveEmbeddingCap(
+        stats.nodes,
+        resolveEmbeddingNodeLimit(options.embeddingsNodeLimit, resumeEmbeddingCheckpoint),
+        httpMode,
+      );
+      if (!skipForCap) {
+        embeddingSkipped = false;
+        if (capDisabled && stats.nodes > DEFAULT_EMBEDDING_NODE_LIMIT) {
+          if (httpMode) {
+            log(
+              `Remote embedding endpoint selected — generating embeddings for ` +
+                `${stats.nodes.toLocaleString()} nodes; the ` +
+                `${DEFAULT_EMBEDDING_NODE_LIMIT.toLocaleString()}-node local-model cap ` +
+                `does not apply.`,
+            );
+          } else {
+            log(
+              `Embedding node-count cap disabled — generating embeddings for ` +
+                `${stats.nodes.toLocaleString()} nodes. Ensure sufficient memory; the ` +
+                `default ${DEFAULT_EMBEDDING_NODE_LIMIT.toLocaleString()}-node local-model ` +
+                `cap exists to prevent OOM.`,
+            );
+          }
+        }
+      } else {
+        log(
+          `Embeddings skipped: ${stats.nodes.toLocaleString()} nodes exceeds ` +
+            `the ${nodeLimit.toLocaleString()}-node safety cap. ` +
+            `Override with \`--embeddings 0\` to disable the cap, or ` +
+            `\`--embeddings <n>\` to set a custom cap.`,
+        );
+      }
+    }
+
     // ── Phase 3.5: Re-insert cached embeddings ────────────────────────
     // Runs on BOTH the full-rebuild path and the incremental path:
     //   - Full rebuild / escalated write: DB was wiped, every cached row
@@ -3056,17 +3101,19 @@ const runFullAnalysisImpl = async (
               // lookup when it later detects a stale owner. Pending checkpoint
               // rows intentionally take the branch above: their IDs are kept,
               // but their hashes stay absent so they remain force-selected.
-              const restoredHash = embedding.contentHash || STALE_HASH_SENTINEL;
-              const priorHash = restoredEmbeddingHashes.get(embedding.nodeId);
-              restoredEmbeddingHashes.set(
-                embedding.nodeId,
-                priorHash === undefined || priorHash === restoredHash
-                  ? restoredHash
-                  : STALE_HASH_SENTINEL,
-              );
-              const rowIds = restoredEmbeddingRowIds.get(embedding.nodeId) ?? [];
-              rowIds.push(`${embedding.nodeId}:${embedding.chunkIndex}`);
-              restoredEmbeddingRowIds.set(embedding.nodeId, rowIds);
+              if (!embeddingSkipped) {
+                const restoredHash = embedding.contentHash || STALE_HASH_SENTINEL;
+                const priorHash = restoredEmbeddingHashes.get(embedding.nodeId);
+                restoredEmbeddingHashes.set(
+                  embedding.nodeId,
+                  priorHash === undefined || priorHash === restoredHash
+                    ? restoredHash
+                    : STALE_HASH_SENTINEL,
+                );
+                const rowIds = restoredEmbeddingRowIds.get(embedding.nodeId) ?? [];
+                rowIds.push(`${embedding.nodeId}:${embedding.chunkIndex}`);
+                restoredEmbeddingRowIds.set(embedding.nodeId, rowIds);
+              }
               if (deletedFilePathsForRestore !== null) {
                 const filePath = liveNode.properties?.filePath;
                 if (typeof filePath !== 'string' || !deletedFilePathsForRestore.has(filePath)) {
@@ -3139,48 +3186,6 @@ const runFullAnalysisImpl = async (
     }
 
     // ── Phase 4: Embeddings (90–98%) ──────────────────────────────────
-    const stats = await getLbugStats();
-    let embeddingSkipped = true;
-    let semanticMode: 'vector-index' | 'exact-scan' | undefined;
-    let httpMode = false;
-
-    if (shouldGenerateEmbeddings) {
-      const { isHttpMode } = await import('./embeddings/http-client.js');
-      httpMode = isHttpMode();
-      const { skipForCap, capDisabled, nodeLimit } = deriveEmbeddingCap(
-        stats.nodes,
-        resolveEmbeddingNodeLimit(options.embeddingsNodeLimit, resumeEmbeddingCheckpoint),
-        httpMode,
-      );
-      if (!skipForCap) {
-        embeddingSkipped = false;
-        if (capDisabled && stats.nodes > DEFAULT_EMBEDDING_NODE_LIMIT) {
-          if (httpMode) {
-            log(
-              `Remote embedding endpoint selected — generating embeddings for ` +
-                `${stats.nodes.toLocaleString()} nodes; the ` +
-                `${DEFAULT_EMBEDDING_NODE_LIMIT.toLocaleString()}-node local-model cap ` +
-                `does not apply.`,
-            );
-          } else {
-            log(
-              `Embedding node-count cap disabled — generating embeddings for ` +
-                `${stats.nodes.toLocaleString()} nodes. Ensure sufficient memory; ` +
-                `the default ${DEFAULT_EMBEDDING_NODE_LIMIT.toLocaleString()}-node ` +
-                `local-model cap exists to prevent OOM.`,
-            );
-          }
-        }
-      } else {
-        log(
-          `Embeddings skipped: ${stats.nodes.toLocaleString()} nodes exceeds ` +
-            `the ${nodeLimit.toLocaleString()}-node safety cap. ` +
-            `Override with \`--embeddings 0\` to disable the cap, or ` +
-            `\`--embeddings <n>\` to set a custom cap.`,
-        );
-      }
-    }
-
     // ── Vector-index recreation after a wipe-and-restore (tri-review
     // 4669518496 P1 / KTD1) ────────────────────────────────────────────
     // The full-rebuild and escalated-incremental write plans wipe the DB
