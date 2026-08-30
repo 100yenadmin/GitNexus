@@ -190,7 +190,7 @@ export const preservationApplyCommand = async (
                 },
                 {
                   readRepositoryIdentity: () => {
-                    const repoHasGit = hasGitDir(context.repoPath);
+                    const repoHasGit = options.skipGit !== true && hasGitDir(context.repoPath);
                     return {
                       head: repoHasGit ? getCurrentCommit(context.repoPath) : '',
                       branch: repoHasGit ? getCurrentBranch(context.repoPath) : null,

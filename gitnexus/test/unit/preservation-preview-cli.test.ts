@@ -101,6 +101,35 @@ describe('preservation preview CLI admission', () => {
     },
   );
 
+  it('does not inherit a real .git identity when --skip-git is set', async () => {
+    const requestedPath = '/definitely/not/a/repository';
+    const resolvePlacement = vi
+      .spyOn(repoManager, 'resolveBranchPlacement')
+      .mockResolvedValue({});
+    const getStorage = vi.spyOn(repoManager, 'getStoragePaths').mockReturnValue({
+      storagePath: `${requestedPath}/.gitnexus`,
+      lbugPath: `${requestedPath}/.gitnexus/lbug`,
+      metaPath: `${requestedPath}/.gitnexus/gitnexus.json`,
+    });
+    vi.spyOn(repoManager, 'loadMeta').mockResolvedValue(null);
+    const hasGit = vi.spyOn(git, 'hasGitDir').mockReturnValue(true);
+    const getCommit = vi.spyOn(git, 'getCurrentCommit');
+    const getBranch = vi.spyOn(git, 'getCurrentBranch');
+
+    await expect(
+      computePreservationPlan(requestedPath, {
+        branch: 'main',
+        skipGit: true,
+      }),
+    ).rejects.toThrow('canonical metadata');
+
+    expect(hasGit).not.toHaveBeenCalled();
+    expect(getCommit).not.toHaveBeenCalled();
+    expect(getBranch).not.toHaveBeenCalled();
+    expect(resolvePlacement).toHaveBeenCalledWith(requestedPath, 'main');
+    expect(getStorage).toHaveBeenCalledWith(requestedPath, undefined);
+  });
+
   it('dispatches preservation apply without loading the ordinary analyzer', async () => {
     const apply = vi.fn(async () => undefined);
     const analyze = vi.fn(async () => undefined);

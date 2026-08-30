@@ -176,7 +176,7 @@ export const computePreservationPlan = async (
   // Git identity. `git rev-parse` walks parent directories, so calling it for
   // an arbitrary --skip-git subdirectory would silently bind this plan to the
   // parent repository rather than the requested non-Git root.
-  const repoHasGit = hasGitDir(repoPath);
+  const repoHasGit = options.skipGit !== true && hasGitDir(repoPath);
   const currentCommit = repoHasGit ? getCurrentCommit(repoPath) : '';
   if (repoHasGit && !currentCommit) throw new Error('source commit identity is unavailable');
   const currentBranch = repoHasGit ? getCurrentBranch(repoPath) : null;
