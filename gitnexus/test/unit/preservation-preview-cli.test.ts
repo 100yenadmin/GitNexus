@@ -52,6 +52,7 @@ describe('preservation preview CLI admission', () => {
         stats: { embeddings: 0 },
         embeddingCheckpoint: {
           at: '2026-08-30T00:00:00.000Z',
+          purpose: 'verified-preservation',
           nodesProcessed: 0,
           totalNodes: 0,
           chunksProcessed: 0,
@@ -242,7 +243,7 @@ describe('preservation preview CLI admission', () => {
       });
 
       expect(process.exitCode).toBe(1);
-      expect(stderr).toHaveBeenCalledWith(expect.stringContaining('lacks durable'));
+      expect(stderr).toHaveBeenCalledWith(expect.stringContaining('explicitly marked'));
       expect(scan).not.toHaveBeenCalled();
       expect(lock).not.toHaveBeenCalled();
     },
@@ -272,8 +273,29 @@ describe('preservation preview CLI admission', () => {
     });
 
     expect(process.exitCode).toBe(1);
-    expect(stderr).toHaveBeenCalledWith(expect.stringContaining('lacks durable'));
+    expect(stderr).toHaveBeenCalledWith(expect.stringContaining('explicitly marked'));
     expect(scan).not.toHaveBeenCalled();
+  });
+
+  it('refuses an unmarked ordinary terminal checkpoint before scan or lock work', async () => {
+    const repoPath = await createPreservationRepo({ checkpoint: { purpose: undefined } });
+    const { scan } = mockEmptyPreservationDatabase();
+    const lock = vi.spyOn(stagedPromotion, 'withAnalyzeOwnershipLock');
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+
+    await preservationPreviewCommand(repoPath, {
+      preserveVerifiedEmbeddings: true,
+      dryRun: true,
+      json: true,
+      staged: true,
+      embeddings: true,
+      skipGit: true,
+    });
+
+    expect(process.exitCode).toBe(1);
+    expect(stderr).toHaveBeenCalledWith(expect.stringContaining('explicitly marked'));
+    expect(scan).not.toHaveBeenCalled();
+    expect(lock).not.toHaveBeenCalled();
   });
 
   it('does not inherit a real .git identity when --skip-git is set', async () => {
@@ -425,6 +447,7 @@ describe('preservation preview CLI admission', () => {
         metaDir === promotedStagedMetaDir && meta.embeddingCheckpoint !== undefined,
     )?.[1];
     expect(stagedMeta?.embeddingCheckpoint).toMatchObject({
+      purpose: 'verified-preservation',
       nodesProcessed: 0,
       totalNodes: 0,
       chunksProcessed: 0,

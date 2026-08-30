@@ -215,6 +215,12 @@ export interface RepoMeta {
    */
   embeddingCheckpoint?: {
     at: string;
+    /**
+     * Explicitly marks a terminal checkpoint produced by the verified-preservation
+     * workflow. Ordinary analysis checkpoints omit this field because their final
+     * row checkpoint can be written before vector-index finalization completes.
+     */
+    purpose?: 'verified-preservation';
     nodesProcessed: number;
     totalNodes: number;
     chunksProcessed: number;

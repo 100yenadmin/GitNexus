@@ -53,14 +53,16 @@ const isSha256Digest = (value: unknown): value is string =>
   typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
 
 /**
- * A checkpoint with a fully persisted embedding window and durable identity.
- * These checkpoints are safe to validate and retain without treating the run
- * as interrupted or resolving the embedding runtime just to take the fast path.
+ * A checkpoint explicitly produced after the verified-preservation workflow
+ * has finalized its staged generation, with a fully persisted embedding window
+ * and durable identity. Ordinary analysis checkpoints are deliberately excluded:
+ * their terminal row checkpoint can precede vector-index finalization.
  */
 export const isCompletedEmbeddingCheckpoint = (value: unknown): boolean => {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const checkpoint = value as Partial<NonNullable<RepoMeta['embeddingCheckpoint']>>;
   return (
+    checkpoint.purpose === 'verified-preservation' &&
     isSafeNonNegativeInteger(checkpoint.nodesProcessed) &&
     isSafeNonNegativeInteger(checkpoint.totalNodes) &&
     checkpoint.nodesProcessed === checkpoint.totalNodes &&

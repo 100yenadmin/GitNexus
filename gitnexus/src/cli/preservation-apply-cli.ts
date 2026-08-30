@@ -201,6 +201,7 @@ export const preservationApplyCommand = async (
                 incrementalInProgress: undefined,
                 embeddingCheckpoint: {
                   at: new Date().toISOString(),
+                  purpose: 'verified-preservation',
                   ...terminalProgress,
                   provider: plan.embedding.provider,
                   model: plan.embedding.model,

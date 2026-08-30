@@ -574,6 +574,7 @@ describe('run-analyze module', () => {
       );
       const completedCheckpoint = {
         at: new Date().toISOString(),
+        purpose: 'verified-preservation' as const,
         nodesProcessed: 1,
         totalNodes: 1,
         chunksProcessed: 1,
@@ -603,6 +604,29 @@ describe('run-analyze module', () => {
       expect(fetchMock).not.toHaveBeenCalled();
       expect((await loadMeta(storagePath))?.embeddingCheckpoint).toEqual(completedCheckpoint);
       process.env.GITNEXUS_EMBEDDING_URL = 'http://test:8080/v1';
+
+      await saveMeta(storagePath, {
+        ...completed,
+        embeddingCheckpoint: {
+          ...completedCheckpoint,
+          purpose: undefined,
+        },
+      });
+      fetchMock.mockClear();
+      const ordinaryTerminalLogs: string[] = [];
+
+      const ordinaryTerminal = await runFullAnalysis(
+        tmpRepo.dbPath,
+        { skipAgentsMd: true, skipSkills: true },
+        { onProgress: () => {}, onLog: (message) => ordinaryTerminalLogs.push(message) },
+      );
+
+      expect(ordinaryTerminal.alreadyUpToDate).not.toBe(true);
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(ordinaryTerminalLogs.some((message) => message.includes('embedding checkpoint'))).toBe(
+        true,
+      );
+      expect((await loadMeta(storagePath))?.embeddingCheckpoint).toBeUndefined();
 
       await saveMeta(storagePath, {
         ...completed,

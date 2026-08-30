@@ -14,7 +14,10 @@ import {
   buildEmbeddingPreservationPreviewFromNodes,
   type PreservationPreviewBase,
 } from '../core/embeddings/preservation-preview.js';
-import { assertCompletedCheckpointIdentity } from '../core/embeddings/checkpoint-identity.js';
+import {
+  assertCompletedCheckpointIdentity,
+  isCompletedEmbeddingCheckpoint,
+} from '../core/embeddings/checkpoint-identity.js';
 import {
   PRESERVATION_PLAN_SCHEMA,
   PRESERVATION_PLANNER_VERSION,
@@ -163,16 +166,9 @@ const validatePreviewOptions = (options: PreservationPreviewCliOptions): void =>
 };
 
 const assertPreservationCheckpointProof = (checkpoint: RepoMeta['embeddingCheckpoint']): void => {
-  if (!checkpoint) return;
-  const requiredFields = [
-    'physicalRows',
-    'validRows',
-    'recoverableIdentitySha256',
-    'physicalRowsSha256',
-  ] as const;
-  if (requiredFields.some((field) => checkpoint[field] === undefined)) {
+  if (!isCompletedEmbeddingCheckpoint(checkpoint)) {
     throw new Error(
-      'Preservation completed embedding checkpoint lacks durable physical and identity proof',
+      'Preservation requires an explicitly marked completed checkpoint with durable physical and identity proof',
     );
   }
 };

@@ -119,6 +119,7 @@ type EmbeddingCheckpoint = NonNullable<RepoMeta['embeddingCheckpoint']>;
 
 const completedEmbeddingCheckpoint = (): EmbeddingCheckpoint => ({
   at: '2026-07-20T00:00:02.000Z',
+  purpose: 'verified-preservation',
   nodesProcessed: 2,
   totalNodes: 2,
   chunksProcessed: 2,
@@ -428,6 +429,7 @@ describe('staged promotion journal', () => {
   });
 
   it.each([
+    ['missing verified-preservation purpose', { purpose: undefined }],
     ['pending nodes', { pendingNodeIds: ['Function:pending'] }],
     ['non-terminal progress', { nodesProcessed: 1 }],
     ['missing physical row count', { physicalRows: undefined }],
