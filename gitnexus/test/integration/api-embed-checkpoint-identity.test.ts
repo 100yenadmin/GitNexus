@@ -1912,7 +1912,7 @@ describe('POST /api/embed completed-checkpoint identity', () => {
     expect(state.openModes).toEqual([true, undefined]);
     expect(state.runEmbeddingPipeline).toHaveBeenCalledOnce();
     expect(state.getActiveEmbeddingIdentity).toHaveBeenCalledOnce();
-    expect(state.inspectEmbeddingIntegrity).toHaveBeenCalledTimes(3);
+    expect(state.inspectEmbeddingIntegrity).toHaveBeenCalledTimes(4);
     expect(state.inspectEmbeddingIntegrity.mock.invocationCallOrder[1]).toBeLessThan(
       state.getActiveEmbeddingIdentity.mock.invocationCallOrder[0],
     );
@@ -2455,6 +2455,41 @@ describe('POST /api/embed completed-checkpoint identity', () => {
       physicalRowsSha256: LIVE_DIGEST,
     });
     expect(state.inspectEmbeddingIntegrity).toHaveBeenCalledWith(undefined, true);
+  });
+
+  it('retains terminal source proof after a fresh successful embed', async () => {
+    state.currentMeta = {
+      ...makeMeta(LIVE_DIGEST),
+      stats: { embeddings: 0 },
+      embeddingCheckpoint: undefined,
+    };
+    state.liveIntegrity = makeIntegrity(LIVE_DIGEST, 0);
+    state.runEmbeddingPipeline.mockImplementationOnce(async (...args: unknown[]) => {
+      const options = args[6] as {
+        onCheckpoint: (checkpoint: {
+          nodesProcessed: number;
+          totalNodes: number;
+          chunksProcessed: number;
+        }) => Promise<void>;
+      };
+      state.liveIntegrity = makeIntegrity(LIVE_DIGEST, 3);
+      await options.onCheckpoint({ nodesProcessed: 4, totalNodes: 4, chunksProcessed: 5 });
+    });
+
+    expect((await runEmbedJob(baseUrl, REPO.name)).status).toBe('complete');
+
+    expect(state.currentMeta.embeddingCheckpoint).toMatchObject({
+      purpose: 'verified-preservation',
+      nodesProcessed: 4,
+      totalNodes: 4,
+      chunksProcessed: 5,
+      ...identity,
+      pendingNodeIds: [],
+      physicalRows: 3,
+      validRows: 3,
+      recoverableIdentitySha256: LIVE_DIGEST,
+      physicalRowsSha256: LIVE_DIGEST,
+    });
   });
 
   it.each([

@@ -75,7 +75,7 @@ describe('preservation preview CLI admission', () => {
     return repoPath;
   };
 
-  const mockEmptyPreservationDatabase = (physicalRowsSha256 = 'a'.repeat(64)) => {
+  const mockEmptyPreservationDatabase = (physicalRowsSha256 = 'a'.repeat(64), physicalRows = 0) => {
     vi.spyOn(lbugAdapter, 'withLbugReadOnlyNonRecovering').mockImplementation(
       async (_dbPath, operation) => operation(),
     );
@@ -97,9 +97,9 @@ describe('preservation preview CLI admission', () => {
     });
     const scan = vi.spyOn(lbugAdapter, 'scanEmbeddingPreservationRows').mockResolvedValue({
       tablePresent: true,
-      physicalRows: 0,
+      physicalRows,
       acceptedRows: 0,
-      rejectedRows: 0,
+      rejectedRows: physicalRows,
       duplicateIdRows: 0,
       duplicateSemanticRows: 0,
       noncanonicalIdRows: 0,
@@ -302,7 +302,7 @@ describe('preservation preview CLI admission', () => {
     expect(lock).not.toHaveBeenCalled();
   });
 
-  it('creates the initial byte-bound source attestation for a completed index without a checkpoint', async () => {
+  it('permits a checkpointless empty index to produce a byte-bound plan', async () => {
     const repoPath = await createPreservationRepo({ checkpoint: null });
     const { scan } = mockEmptyPreservationDatabase();
 
@@ -311,6 +311,17 @@ describe('preservation preview CLI admission', () => {
     expect(context.meta.embeddingCheckpoint).toBeUndefined();
     expect(context.plan.proof.physicalRows).toBe(0);
     expect(context.plan.planDigest).toMatch(/^[a-f0-9]{64}$/);
+    expect(scan).toHaveBeenCalledOnce();
+  });
+
+  it('refuses non-empty checkpointless legacy vectors instead of inventing model provenance', async () => {
+    const repoPath = await createPreservationRepo({ checkpoint: null });
+    const { scan } = mockEmptyPreservationDatabase('a'.repeat(64), 1);
+
+    await expect(computePreservationPlan(repoPath, { skipGit: true })).rejects.toThrow(
+      /terminal embedding identity proof for a non-empty index/,
+    );
+
     expect(scan).toHaveBeenCalledOnce();
   });
 

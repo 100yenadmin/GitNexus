@@ -564,33 +564,17 @@ describe('run-analyze module', () => {
       expect(completed).not.toBeNull();
       if (!completed) throw new Error('expected completed metadata');
       const currentProvider = httpEmbeddingProvider('http://test:8080/v1');
-      const { lbugPath } = getStoragePaths(tmpRepo.dbPath);
-      const { inspectEmbeddingIntegrity, withLbugDb } =
-        await import('../../src/core/lbug/lbug-adapter.js');
-      const completedIntegrity = await withLbugDb(
-        lbugPath,
-        () => inspectEmbeddingIntegrity(undefined, true),
-        { readOnly: true },
-      );
-      const completedCheckpoint = {
-        at: new Date().toISOString(),
-        purpose: 'verified-preservation' as const,
-        nodesProcessed: 1,
-        totalNodes: 1,
-        chunksProcessed: 1,
+      expect(completed.embeddingCheckpoint).toMatchObject({
+        purpose: 'verified-preservation',
         provider: currentProvider,
         model: 'test-model',
         dimensions: 384,
         pendingNodeIds: [],
-        physicalRows: completedIntegrity.physicalRows,
-        validRows: completedIntegrity.validRows,
-        recoverableIdentitySha256: completedIntegrity.recoverableIdentitySha256,
-        physicalRowsSha256: completedIntegrity.physicalRowsSha256,
-      };
-      await saveMeta(storagePath, {
-        ...completed,
-        embeddingCheckpoint: completedCheckpoint,
       });
+      expect(completed.embeddingCheckpoint?.physicalRows).toBeGreaterThan(0);
+      expect(completed.embeddingCheckpoint?.physicalRowsSha256).toMatch(/^[a-f0-9]{64}$/);
+      const completedCheckpoint = completed.embeddingCheckpoint;
+      if (!completedCheckpoint) throw new Error('expected terminal embedding proof');
       process.env.GITNEXUS_EMBEDDING_URL = 'http://mismatch.invalid/v1';
       fetchMock.mockClear();
 
@@ -707,7 +691,13 @@ describe('run-analyze module', () => {
       );
 
       expect(fetchMock).toHaveBeenCalled();
-      expect((await loadMeta(storagePath))?.embeddingCheckpoint).toBeUndefined();
+      expect((await loadMeta(storagePath))?.embeddingCheckpoint).toMatchObject({
+        purpose: 'verified-preservation',
+        provider: currentProvider,
+        model: 'test-model',
+        dimensions: 384,
+        pendingNodeIds: [],
+      });
       expect((await loadMeta(storagePath))?.stats?.embeddings).toBe(1);
       expect(
         pendingLogs.some((message) =>

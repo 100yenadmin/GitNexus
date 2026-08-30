@@ -3124,6 +3124,11 @@ const runFullAnalysisImpl = async (
     let embeddingSkipped = true;
     let semanticMode: 'vector-index' | 'exact-scan' | undefined;
     let httpMode = false;
+    let completedEmbeddingProof: RepoMeta['embeddingCheckpoint'];
+    const priorEmbeddingProofIsCompleted = isCompletedEmbeddingCheckpoint(
+      existingMeta?.embeddingCheckpoint,
+    );
+    let canEstablishEmbeddingProof = priorEmbeddingProofIsCompleted;
 
     if (shouldGenerateEmbeddings) {
       const { isHttpMode } = await import('./embeddings/http-client.js');
@@ -3198,6 +3203,10 @@ const runFullAnalysisImpl = async (
     }
 
     if (!embeddingSkipped) {
+      if (!canEstablishEmbeddingProof) {
+        const preEmbeddingIntegrity = await inspectEmbeddingIntegrity(undefined, true);
+        canEstablishEmbeddingProof = preEmbeddingIntegrity.physicalRows === 0;
+      }
       progress(
         'embeddings',
         90,
@@ -3297,6 +3306,21 @@ const runFullAnalysisImpl = async (
             );
             assertEmbeddingIntegrity(integrity, 'Completed embedding checkpoint');
             await saveEmbeddingCheckpoint(checkpoint, [], integrity.validRows, integrity);
+            if (canEstablishEmbeddingProof && checkpoint.nodesProcessed === checkpoint.totalNodes) {
+              completedEmbeddingProof = {
+                at: new Date().toISOString(),
+                purpose: 'verified-preservation',
+                ...checkpoint,
+                provider: embeddingIdentity.provider,
+                model: embeddingIdentity.model,
+                dimensions: embeddingIdentity.dimensions,
+                pendingNodeIds: [],
+                physicalRows: integrity.physicalRows,
+                validRows: integrity.validRows,
+                recoverableIdentitySha256: integrity.recoverableIdentitySha256,
+                physicalRowsSha256: integrity.physicalRowsSha256 || undefined,
+              };
+            }
           },
         },
       );
@@ -3318,6 +3342,24 @@ const runFullAnalysisImpl = async (
     const terminalIntegrity = await inspectEmbeddingIntegrity(undefined, true);
     assertEmbeddingIntegrity(terminalIntegrity, 'Terminal embedding finalization');
     const embeddingCount = terminalIntegrity.validRows;
+
+    const priorCompletedEmbeddingProof = isCompletedEmbeddingCheckpoint(
+      existingMeta?.embeddingCheckpoint,
+    )
+      ? existingMeta?.embeddingCheckpoint
+      : undefined;
+    const terminalEmbeddingProof =
+      completedEmbeddingProof ??
+      (priorCompletedEmbeddingProof
+        ? {
+            ...priorCompletedEmbeddingProof,
+            at: new Date().toISOString(),
+            physicalRows: terminalIntegrity.physicalRows,
+            validRows: terminalIntegrity.validRows,
+            recoverableIdentitySha256: terminalIntegrity.recoverableIdentitySha256,
+            physicalRowsSha256: terminalIntegrity.physicalRowsSha256 || undefined,
+          }
+        : undefined);
 
     if (!embeddingSkipped && stats.nodes > 0 && embeddingCount === 0) {
       throw new Error(
@@ -3417,7 +3459,7 @@ const runFullAnalysisImpl = async (
       // so a sibling branch's prune can union it and not evict our shards.
       cacheKeys: [...parseCache.usedKeys],
       incrementalInProgress: undefined as RepoMeta['incrementalInProgress'],
-      embeddingCheckpoint: undefined,
+      embeddingCheckpoint: terminalEmbeddingProof,
       // The effective pdg config this run's DB rows were built under
       // (#2099 F1). `undefined` on pdg-off runs — this meta is a fresh
       // literal (no spread of existingMeta), so omission is what CLEARS the

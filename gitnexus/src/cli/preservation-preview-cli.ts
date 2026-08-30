@@ -166,10 +166,9 @@ const validatePreviewOptions = (options: PreservationPreviewCliOptions): void =>
 };
 
 const assertPreservationCheckpointProof = (checkpoint: RepoMeta['embeddingCheckpoint']): void => {
-  // A successful ordinary analysis clears its transient checkpoint. In that
-  // state the provider-free preview plus exact plan digest is the initial,
-  // byte-bound source attestation. A present checkpoint is an interrupted or
-  // previously repaired state and must carry explicit finalized proof.
+  // An empty index may have no checkpoint. Non-empty checkpointless state is
+  // rejected after the read-only scan below because current configuration
+  // cannot prove which provider/model produced historical vector bytes.
   if (!checkpoint) return;
   if (!isCompletedEmbeddingCheckpoint(checkpoint)) {
     throw new Error(
@@ -265,6 +264,11 @@ export const computePreservationPlan = async (
         acceptedRows.push(...batch);
       },
     });
+    if (!expectedCheckpoint && scan.physicalRows > 0) {
+      throw new Error(
+        'Preservation requires terminal embedding identity proof for a non-empty index',
+      );
+    }
     const { chunkNode } = await import('../core/embeddings/chunker.js');
     for await (const page of queryEmbeddableNodes(executeQuery)) nodes.push(...page);
     return buildEmbeddingPreservationPreviewFromNodes({

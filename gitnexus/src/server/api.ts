@@ -68,7 +68,10 @@ import { UPLOAD_ROOT } from './upload-paths.js';
 import { sweepStaleUploads } from './upload-sweep.js';
 import { isRfc1918PrivateIpv4 } from './private-ip.js';
 import { logger, flushLoggerSync } from '../core/logger.js';
-import { assertCompletedCheckpointIdentity } from '../core/embeddings/checkpoint-identity.js';
+import {
+  assertCompletedCheckpointIdentity,
+  isCompletedEmbeddingCheckpoint,
+} from '../core/embeddings/checkpoint-identity.js';
 import type { EmbeddingIdentity } from '../core/embeddings/embedding-identity.js';
 import { EMBEDDABLE_LABELS } from '../core/embeddings/types.js';
 import { escapeCypherString } from '../core/lbug/cypher-escape.js';
@@ -2529,6 +2532,10 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                   );
                 }
               }
+              const priorCompletedEmbeddingProof = isCompletedEmbeddingCheckpoint(priorCheckpoint)
+                ? priorCheckpoint
+                : undefined;
+              if (priorCompletedEmbeddingProof) priorCheckpoint = undefined;
               const forceReembedNodeIds = new Set(priorCheckpoint?.pendingNodeIds ?? []);
               const saveEmbeddingCheckpoint = async (
                 checkpoint: {
@@ -2569,6 +2576,13 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
               // Delegated to lbug-adapter which owns the DB query logic and legacy-fallback handling.
               const { fetchExistingEmbeddingHashes } = await import('../core/lbug/lbug-adapter.js');
               const existingEmbeddings = await fetchExistingEmbeddingHashes(executeQuery);
+              const preEmbeddingIntegrity = priorCompletedEmbeddingProof
+                ? undefined
+                : await inspectEmbeddingIntegrity(undefined, true);
+              const canEstablishEmbeddingProof =
+                priorCompletedEmbeddingProof !== undefined ||
+                preEmbeddingIntegrity?.physicalRows === 0;
+              let completedEmbeddingProof: RepoMeta['embeddingCheckpoint'];
               if (existingEmbeddings && existingEmbeddings.size > 0) {
                 console.log(
                   `[embed] ${existingEmbeddings.size} nodes already embedded — incremental run with content-hash comparison`,
@@ -2617,6 +2631,22 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                       throw new Error('Completed embedding checkpoint failed identity validation');
                     }
                     await saveEmbeddingCheckpoint(checkpoint, [], integrity);
+                    if (
+                      canEstablishEmbeddingProof &&
+                      checkpoint.nodesProcessed === checkpoint.totalNodes
+                    ) {
+                      completedEmbeddingProof = {
+                        at: new Date().toISOString(),
+                        purpose: 'verified-preservation',
+                        ...checkpoint,
+                        ...embeddingIdentity,
+                        pendingNodeIds: [],
+                        physicalRows: integrity.physicalRows,
+                        validRows: integrity.validRows,
+                        recoverableIdentitySha256: integrity.recoverableIdentitySha256,
+                        physicalRowsSha256: integrity.physicalRowsSha256 || undefined,
+                      };
+                    }
                   },
                 },
               );
@@ -2633,6 +2663,18 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
               ) {
                 throw new Error('Embedding finalization failed identity validation');
               }
+              const terminalEmbeddingProof =
+                completedEmbeddingProof ??
+                (priorCompletedEmbeddingProof
+                  ? {
+                      ...priorCompletedEmbeddingProof,
+                      at: new Date().toISOString(),
+                      physicalRows: terminalIntegrity.physicalRows,
+                      validRows: terminalIntegrity.validRows,
+                      recoverableIdentitySha256: terminalIntegrity.recoverableIdentitySha256,
+                      physicalRowsSha256: terminalIntegrity.physicalRowsSha256 || undefined,
+                    }
+                  : undefined);
               const terminalMeta = {
                 ...embeddingMeta,
                 stats: {
@@ -2640,7 +2682,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                   ...reconciledGraphStats,
                   embeddings: terminalIntegrity.validRows,
                 },
-                embeddingCheckpoint: undefined,
+                embeddingCheckpoint: terminalEmbeddingProof,
               };
               if (reconciledGraphStats || persistedCheckpointNeedsRegistryReconciliation) {
                 await commitEmbedMetadata(barrier, 'COMMITTING_TERMINAL', async () => {
