@@ -17,7 +17,21 @@ export const embeddingIdentitySetDigest = (identities: ReadonlySet<string>): str
   }
   return digest.digest('hex');
 };
-export type EmbeddingPhysicalVectorInfo = Record<'kind' | 'dimensions' | 'finite' | 'sha256', any>;
+export interface EmbeddingPhysicalVectorInfo {
+  kind: string;
+  dimensions: number;
+  finite: 'finite' | 'nonfinite' | 'malformed' | 'missing';
+  sha256: string;
+}
+export interface EmbeddingAcceptedPayload {
+  id: string;
+  nodeId: string;
+  chunkIndex: number;
+  startLine: number;
+  endLine: number;
+  contentHash: string;
+  embedding: ArrayLike<number>;
+}
 const token = (value: unknown): Buffer => {
   if (value === null || value === undefined) return Buffer.from(String(value));
   const text = Object.is(value, -0) ? '-0' : String(value);
@@ -31,8 +45,9 @@ const updatePart = (digest: ReturnType<typeof createHash>, _name: string, value:
 };
 const updateVectorValue = (digest: ReturnType<typeof createHash>, value: unknown): void => {
   if (typeof value === 'number') {
-    const bytes = Buffer.allocUnsafe(8);
-    bytes.writeDoubleBE(value);
+    // Persisted embedding values are FLOAT32; hash their canonical bytes.
+    const bytes = Buffer.allocUnsafe(4);
+    bytes.writeFloatBE(value);
     digest.update(Buffer.from([1])).update(bytes);
     return;
   }
@@ -78,6 +93,41 @@ export const embeddingPhysicalVectorInfo = (vector: unknown): EmbeddingPhysicalV
   updatePart(digest, 'finite', finite);
   updatePart(digest, 'values-sha256', valuesDigest.digest('hex'));
   return { kind, dimensions, finite, sha256: digest.digest('hex') };
+};
+
+export const embeddingCanonicalFloat32Bytes = (vector: ArrayLike<number>): Buffer => {
+  const bytes = Buffer.allocUnsafe(vector.length * 4);
+  for (let index = 0; index < vector.length; index++) bytes.writeFloatBE(vector[index]!, index * 4);
+  return bytes;
+};
+
+/** Stable, order-independent digest of accepted row metadata and FLOAT32 bytes. */
+export const embeddingAcceptedPayloadDigest = (
+  rows: Iterable<EmbeddingAcceptedPayload>,
+): string => {
+  const rowDigests = [...rows]
+    .map((row) => {
+      const digest = createHash('sha256').update('gitnexus.embedding-accepted-row/v1\0');
+      for (const value of [
+        row.id,
+        row.nodeId,
+        row.chunkIndex,
+        row.startLine,
+        row.endLine,
+        row.contentHash,
+      ])
+        updatePart(digest, 'field', value);
+      const bytes = embeddingCanonicalFloat32Bytes(row.embedding);
+      const length = Buffer.alloc(4);
+      length.writeUInt32BE(bytes.length);
+      digest.update(length).update(bytes);
+      return digest.digest('hex');
+    })
+    .sort();
+  const digest = createHash('sha256').update('gitnexus.embedding-accepted-payload/v1\0');
+  updatePart(digest, 'row-count', rowDigests.length);
+  for (const rowDigest of rowDigests) updatePart(digest, 'row-sha256', rowDigest);
+  return digest.digest('hex');
 };
 export const embeddingPhysicalRowDigest = (row: Record<string, any>): string => {
   const digest = createHash('sha256').update('gitnexus.embedding-physical-row/v1\0');

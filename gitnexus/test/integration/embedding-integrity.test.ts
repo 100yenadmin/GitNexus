@@ -6,8 +6,9 @@ import * as d from '../../src/core/embeddings/identity-digest.js';
 
 describe('embedding writer identity preflight', () => {
   it('validates the whole batch before executing and prepares once per row', async () => {
-    const { batchInsertEmbeddings } =
-      await import('../../src/core/embeddings/embedding-pipeline.js');
+    const { batchInsertEmbeddings } = await import(
+      '../../src/core/embeddings/embedding-pipeline.js'
+    );
     const execute = vi.fn(async () => undefined);
     const vector = new Array(EMBEDDING_DIMS).fill(0);
 
@@ -143,8 +144,9 @@ withTestLbugDB(
   () => {
     it('keeps every identity canonical across a high-volume real-Ladybug write', async () => {
       const adapter = await import('../../src/core/lbug/lbug-adapter.js');
-      const { batchInsertEmbeddings } =
-        await import('../../src/core/embeddings/embedding-pipeline.js');
+      const { batchInsertEmbeddings } = await import(
+        '../../src/core/embeddings/embedding-pipeline.js'
+      );
       const rowCount = 1_024;
       const vector = new Array(EMBEDDING_DIMS).fill(0);
       await batchInsertEmbeddings(
@@ -197,8 +199,9 @@ withTestLbugDB(
 
     it('rejects a same-count snapshot with a different semantic identity set', async () => {
       const adapter = await import('../../src/core/lbug/lbug-adapter.js');
-      const { createEmbeddingSnapshot, embeddingSnapshotMatchesIdentityDigest } =
-        await import('../../src/core/embeddings/cache-snapshot.js');
+      const { createEmbeddingSnapshot, embeddingSnapshotMatchesIdentityDigest } = await import(
+        '../../src/core/embeddings/cache-snapshot.js'
+      );
       const snapshotPath = `${handle.tmpHandle.dbPath}/different-identity.jsonl`;
       const source = { lastCommit: 'fixture', indexedAt: '2026-07-22T00:00:00.000Z' };
       const info = await createEmbeddingSnapshot(snapshotPath, source, async () => [
@@ -270,8 +273,9 @@ withTestLbugDB(
     seed: ["CREATE (:File {id: 'File:live', name: 'live.ts', filePath: 'live.ts', content: ''})"],
     beforeFTS: async () => {
       const adapter = await import('../../src/core/lbug/lbug-adapter.js');
-      const { batchInsertEmbeddings } =
-        await import('../../src/core/embeddings/embedding-pipeline.js');
+      const { batchInsertEmbeddings } = await import(
+        '../../src/core/embeddings/embedding-pipeline.js'
+      );
       await batchInsertEmbeddings(adapter.executeWithReusedStatement, [
         {
           nodeId: 'File:live',
@@ -316,6 +320,18 @@ withTestLbugDB(
       const after = await snapshot();
 
       expect(firstReport).toMatchObject({ physicalRows: 265, acceptedRows: 257, rejectedRows: 8 });
+      expect(firstReport).toMatchObject({
+        duplicateIdRows: 1,
+        duplicateSemanticRows: 1,
+        invalidLineRows: 0,
+        nonfiniteRows: 1,
+        malformedVectorRows: 1,
+        missingContentHashRows: 0,
+        labelMismatchRows: 2,
+      });
+      expect(firstReport.physicalRowsSha256).toMatch(/^[a-f0-9]{64}$/);
+      expect(firstReport.rejectedRowsSha256).toMatch(/^[a-f0-9]{64}$/);
+      expect(firstReport.acceptedPayloadSha256).toMatch(/^[a-f0-9]{64}$/);
       expect(secondReport).toEqual(firstReport);
       expect(firstReport.implicatedOwnerIds.join(',')).toBe(
         'Function:bad,Function:cross,Function:dup-a,Function:dup-b,Function:null,Function:semantic,Trait:legacy',
@@ -367,6 +383,99 @@ withTestLbugDB(
           row('Function:null:0', 'Function:null', 0, [null, ...vector.slice(1)] as number[]),
           row('Function:cross:0', 'Function:cross', 0),
           row('Trait:legacy:0', 'Trait:legacy', 0),
+        ],
+      );
+    },
+  },
+);
+
+withTestLbugDB(
+  'embedding-preservation-proof',
+  () => {
+    it('binds owners and proves stable accepted and rejected payload state', async () => {
+      const adapter = await import('../../src/core/lbug/lbug-adapter.js');
+      const vector = new Array(EMBEDDING_DIMS).fill(0);
+      const accepted: any[] = [];
+      const base = await adapter.scanEmbeddingPreservationRows({
+        onBatch: (b) => accepted.push(...b),
+      });
+      expect(base).toMatchObject({
+        physicalRows: 5,
+        acceptedRows: 1,
+        rejectedRows: 4,
+        invalidLineRows: 1,
+        missingContentHashRows: 1,
+        labelMismatchRows: 2,
+      });
+      expect(d.embeddingAcceptedPayloadDigest([...accepted].reverse())).toBe(
+        base.acceptedPayloadSha256,
+      );
+      await adapter.executeWithReusedStatement(
+        'MATCH (e:CodeEmbedding) WHERE e.id = $id SET e.embedding = $embedding',
+        [{ id: 'Function:ok:0', embedding: new Array(EMBEDDING_DIMS).fill(0.5) }],
+      );
+      const byteChanged = await adapter.scanEmbeddingPreservationRows();
+      expect(byteChanged.acceptedPayloadSha256).not.toBe(base.acceptedPayloadSha256);
+      await adapter.executeWithReusedStatement(
+        'MATCH (e:CodeEmbedding) WHERE e.id = $id SET e.contentHash = $hash',
+        [{ id: 'Function:bad:0', hash: 'drift' }],
+      );
+      const rejectedDrift = await adapter.scanEmbeddingPreservationRows();
+      expect(rejectedDrift.rejectedRows).toBe(base.rejectedRows);
+      expect(rejectedDrift.rejectedRowsSha256).not.toBe(base.rejectedRowsSha256);
+      await adapter.executeWithReusedStatement(
+        'MATCH (e:CodeEmbedding) WHERE e.id = $id SET e.embedding = $embedding',
+        [{ id: 'Function:ok:0', embedding: [Infinity, ...vector.slice(1)] }],
+      );
+      const nonfinite = await adapter.scanEmbeddingPreservationRows();
+      expect(nonfinite).toMatchObject({ acceptedRows: 0, nonfiniteRows: 1 });
+    });
+  },
+  {
+    seed: [
+      "CREATE (:Function {id: 'Function:ok'}), (:Function {id: 'Function:blank'}), (:Function {id: 'Function:line'}), (:Class {id: 'Function:misbound'})",
+    ],
+    beforeFTS: async () => {
+      const adapter = await import('../../src/core/lbug/lbug-adapter.js');
+      const vector = new Array(EMBEDDING_DIMS).fill(0);
+      await adapter.executeWithReusedStatement(
+        'CREATE (e:CodeEmbedding {id: $id, nodeId: $nodeId, chunkIndex: 0, startLine: $startLine, endLine: 2, embedding: $embedding, contentHash: $hash})',
+        [
+          {
+            id: 'Function:ok:0',
+            nodeId: 'Function:ok',
+            startLine: 1,
+            embedding: vector,
+            hash: 'ok',
+          },
+          {
+            id: 'Function:blank:0',
+            nodeId: 'Function:blank',
+            startLine: 1,
+            embedding: vector,
+            hash: '',
+          },
+          {
+            id: 'Function:line:0',
+            nodeId: 'Function:line',
+            startLine: null,
+            embedding: vector,
+            hash: 'line',
+          },
+          {
+            id: 'Function:misbound:0',
+            nodeId: 'Function:misbound',
+            startLine: 1,
+            embedding: vector,
+            hash: 'owner',
+          },
+          {
+            id: 'Function:bad:0',
+            nodeId: 'Function:bad',
+            startLine: 1,
+            embedding: vector,
+            hash: 'bad',
+          },
         ],
       );
     },

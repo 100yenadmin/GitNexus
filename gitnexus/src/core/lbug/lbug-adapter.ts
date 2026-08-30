@@ -29,9 +29,11 @@ import type { PdgEmitManifest } from './pdg-emit-sink.js';
 import { getNodeLabel as deriveNodeLabel, type WriteStreamFactory } from './rel-pair-routing.js';
 import { EMBEDDABLE_LABELS, type CachedEmbedding } from '../embeddings/types.js';
 import {
+  type EmbeddingAcceptedPayload,
   embeddingPhysicalRowDigest,
   embeddingPhysicalRowsDigest,
   embeddingPhysicalVectorInfo,
+  embeddingAcceptedPayloadDigest,
   embeddingIdentitySetDigest,
   embeddingSemanticIdentity,
 } from '../embeddings/identity-digest.js';
@@ -831,8 +833,9 @@ export const acquireLbugOwnership = async (
     markEntered = resolve;
     markFailed = reject;
   });
-  const { analyzeStorageOwnershipIsHeld, withAnalyzeOwnershipLock } =
-    await import('../staged-promotion.js');
+  const { analyzeStorageOwnershipIsHeld, withAnalyzeOwnershipLock } = await import(
+    '../staged-promotion.js'
+  );
   const { attachAnalyzeOwnershipWorker } = await import('../staged-promotion.js');
   let initialStorageOwnership: AnalyzeStorageOwnershipToken | undefined;
   const ownership = withAnalyzeOwnershipLock(
@@ -2109,11 +2112,20 @@ export const getStoredEmbeddingDimensions = async (): Promise<number> => {
 };
 
 interface EmbeddingPreservationObservation {
+  rawId: unknown;
+  rawNodeId: unknown;
+  rawChunkIndex: unknown;
+  rawStartLine: unknown;
+  rawEndLine: unknown;
+  rawContentHash: unknown;
   id: string;
   nodeId: string;
   chunkIndex: number;
+  startLine: number;
+  endLine: number;
+  contentHash: string;
   dimensions: number;
-  finite: boolean;
+  vectorInfo: ReturnType<typeof embeddingPhysicalVectorInfo>;
 }
 
 export type EmbeddingPreservationRow = CachedEmbedding & { id: string };
@@ -2128,6 +2140,21 @@ export interface EmbeddingPreservationScan {
   physicalRows: number;
   acceptedRows: number;
   rejectedRows: number;
+  duplicateIdRows: number;
+  duplicateSemanticRows: number;
+  noncanonicalIdRows: number;
+  emptyIdRows: number;
+  emptyNodeIdRows: number;
+  invalidChunkRows: number;
+  invalidLineRows: number;
+  nonfiniteRows: number;
+  malformedVectorRows: number;
+  wrongDimensionRows: number;
+  missingContentHashRows: number;
+  labelMismatchRows: number;
+  physicalRowsSha256: string;
+  rejectedRowsSha256: string;
+  acceptedPayloadSha256: string;
   implicatedOwnerIds: string[];
   missingOwnerLabels: string[];
 }
@@ -2148,10 +2175,6 @@ export const scanEmbeddingPreservationRows = async (
     const idCounts = new Map<string, number>();
     const semanticCounts = new Map<string, number>();
     const ownerIdsByLabel = new Map<string, Set<string>>();
-    const ownerLabel = (nodeId: string): string => {
-      const separator = nodeId.indexOf(':');
-      return separator > 0 ? nodeId.slice(0, separator) : '';
-    };
     const semanticKey = (nodeId: string, chunkIndex: number): string =>
       nodeId.trim() && Number.isSafeInteger(chunkIndex) && chunkIndex >= 0
         ? embeddingSemanticIdentity(nodeId, chunkIndex)
@@ -2163,6 +2186,21 @@ export const scanEmbeddingPreservationRows = async (
       physicalRows: 0,
       acceptedRows: 0,
       rejectedRows: 0,
+      duplicateIdRows: 0,
+      duplicateSemanticRows: 0,
+      noncanonicalIdRows: 0,
+      emptyIdRows: 0,
+      emptyNodeIdRows: 0,
+      invalidChunkRows: 0,
+      invalidLineRows: 0,
+      nonfiniteRows: 0,
+      malformedVectorRows: 0,
+      wrongDimensionRows: 0,
+      missingContentHashRows: 0,
+      labelMismatchRows: 0,
+      physicalRowsSha256: embeddingPhysicalRowsDigest(false, 0, []),
+      rejectedRowsSha256: embeddingPhysicalRowsDigest(false, 0, []),
+      acceptedPayloadSha256: embeddingAcceptedPayloadDigest([]),
       implicatedOwnerIds: [],
       missingOwnerLabels: [],
     });
@@ -2194,30 +2232,41 @@ export const scanEmbeddingPreservationRows = async (
         `MATCH (e:${EMBEDDING_TABLE_NAME}) RETURN e.id AS id, e.nodeId AS nodeId, ` +
           `e.chunkIndex AS chunkIndex, e.startLine AS startLine, e.endLine AS endLine, ` +
           `e.embedding AS embedding${hashProjection}`,
-        async (row) => {
-          const id = normalizedText(projectionField(row, 'id', 0));
-          const nodeId = normalizedText(projectionField(row, 'nodeId', 1));
-          const rawChunk = projectionField(row, 'chunkIndex', 2);
-          const chunkIndex = strictInteger(rawChunk);
+        (row) => {
+          const rawId = projectionField(row, 'id', 0);
+          const rawNodeId = projectionField(row, 'nodeId', 1);
+          const rawChunkIndex = projectionField(row, 'chunkIndex', 2);
+          const rawStartLine = projectionField(row, 'startLine', 3);
+          const rawEndLine = projectionField(row, 'endLine', 4);
+          const rawContentHash = withHash ? projectionField(row, 'contentHash', 6) : undefined;
           const vector = projectionField(row, 'embedding', 5);
           const vectorInfo = embeddingPhysicalVectorInfo(vector);
           const observation: EmbeddingPreservationObservation = {
-            id,
-            nodeId,
-            chunkIndex,
+            rawId,
+            rawNodeId,
+            rawChunkIndex,
+            rawStartLine,
+            rawEndLine,
+            rawContentHash,
+            id: normalizedText(rawId),
+            nodeId: normalizedText(rawNodeId),
+            chunkIndex: strictInteger(rawChunkIndex),
+            startLine: strictInteger(rawStartLine),
+            endLine: strictInteger(rawEndLine),
+            contentHash: normalizedText(rawContentHash),
             dimensions: vectorInfo.dimensions,
-            finite: vectorInfo.finite === 'finite',
+            vectorInfo,
           };
           observations.push(observation);
           physicalRows++;
-          idCounts.set(id, (idCounts.get(id) ?? 0) + 1);
-          const key = semanticKey(nodeId, chunkIndex);
+          idCounts.set(observation.id, (idCounts.get(observation.id) ?? 0) + 1);
+          const key = semanticKey(observation.nodeId, observation.chunkIndex);
           if (key) semanticCounts.set(key, (semanticCounts.get(key) ?? 0) + 1);
-          const label = ownerLabelForNodeId(nodeId);
+          const label = ownerLabelForNodeId(observation.nodeId);
           if (ownerLabels.has(label)) {
             let ids = ownerIdsByLabel.get(label);
             if (!ids) ownerIdsByLabel.set(label, (ids = new Set()));
-            ids.add(nodeId);
+            ids.add(observation.nodeId);
           }
         },
       );
@@ -2272,53 +2321,53 @@ export const scanEmbeddingPreservationRows = async (
       }
     }
 
+    const ownerState = (row: EmbeddingPreservationObservation): string => {
+      const label = ownerLabelForNodeId(row.nodeId);
+      if (!ownerLabels.has(label)) return 'unsupported-label';
+      if (missingOwnerLabels.has(label)) return 'missing-table';
+      return liveOwners.get(label)?.has(row.nodeId) ? 'present' : 'missing-row';
+    };
+    const rejectionReasons = (row: EmbeddingPreservationObservation): string[] => {
+      const reasons: string[] = [];
+      const idEmpty = row.id.trim() === '';
+      const nodeEmpty = row.nodeId.trim() === '';
+      const chunkInvalid = !Number.isSafeInteger(row.chunkIndex) || row.chunkIndex < 0;
+      const lineInvalid =
+        !Number.isSafeInteger(row.startLine) ||
+        row.startLine < 0 ||
+        !Number.isSafeInteger(row.endLine) ||
+        row.endLine < 0 ||
+        (Number.isSafeInteger(row.startLine) &&
+          Number.isSafeInteger(row.endLine) &&
+          row.endLine < row.startLine);
+      if (idEmpty) reasons.push('id-empty');
+      if (nodeEmpty) reasons.push('node-id-empty');
+      if (chunkInvalid) reasons.push('chunk-index-invalid');
+      if (lineInvalid) reasons.push('line-metadata-invalid');
+      if (!idEmpty && !nodeEmpty && !chunkInvalid && row.id !== `${row.nodeId}:${row.chunkIndex}`) {
+        reasons.push('id-noncanonical');
+      }
+      if (row.vectorInfo.finite !== 'finite') reasons.push(`vector-${row.vectorInfo.finite}`);
+      if (row.dimensions !== EMBEDDING_DIMS) reasons.push('wrong-dimensions');
+      if (ownerState(row) !== 'present') reasons.push(`owner-${ownerState(row)}`);
+      if (hasContentHash && row.contentHash.trim() === '') reasons.push('content-hash-missing');
+      const semantic = semanticKey(row.nodeId, row.chunkIndex);
+      if ((idCounts.get(row.id) ?? 0) > 1) reasons.push('duplicate-id');
+      if (semantic && (semanticCounts.get(semantic) ?? 0) > 1) reasons.push('duplicate-semantic');
+      return reasons;
+    };
+
     const implicated = new Set<string>();
     const acceptedIds = new Set<string>();
     for (const row of observations) {
-      const label = ownerLabel(row.nodeId);
-      const chunkValid = Number.isSafeInteger(row.chunkIndex) && row.chunkIndex >= 0;
-      const semantic = semanticKey(row.nodeId, row.chunkIndex);
-      const ownerPresent =
-        ownerLabels.has(label) &&
-        !missingOwnerLabels.has(label) &&
-        liveOwners.get(label)?.has(row.nodeId) === true;
-      const canonical =
-        row.id.trim() !== '' &&
-        row.nodeId.trim() !== '' &&
-        chunkValid &&
-        row.id === `${row.nodeId}:${row.chunkIndex}`;
-      const defective =
-        !canonical || !row.finite || row.dimensions !== EMBEDDING_DIMS || !ownerPresent;
-      if (
-        row.nodeId.trim() &&
-        (defective ||
-          (idCounts.get(row.id) ?? 0) > 1 ||
-          (semantic !== '' && (semanticCounts.get(semantic) ?? 0) > 1))
-      ) {
-        implicated.add(row.nodeId);
-      }
-    }
-    for (const row of observations) {
-      const label = ownerLabel(row.nodeId);
-      const chunkValid = Number.isSafeInteger(row.chunkIndex) && row.chunkIndex >= 0;
-      const semantic = semanticKey(row.nodeId, row.chunkIndex);
-      if (
-        row.id.trim() !== '' &&
-        row.nodeId.trim() !== '' &&
-        chunkValid &&
-        row.finite &&
-        row.dimensions === EMBEDDING_DIMS &&
-        row.id === `${row.nodeId}:${row.chunkIndex}` &&
-        (idCounts.get(row.id) ?? 0) === 1 &&
-        (semanticCounts.get(semantic) ?? 0) === 1 &&
-        ownerLabels.has(label) &&
-        !missingOwnerLabels.has(label) &&
-        liveOwners.get(label)?.has(row.nodeId) === true &&
-        !implicated.has(row.nodeId)
-      )
-        acceptedIds.add(row.id);
+      const reasons = rejectionReasons(row);
+      if (row.nodeId.trim() && reasons.length > 0) implicated.add(row.nodeId);
+      if (reasons.length === 0) acceptedIds.add(row.id);
     }
 
+    const physicalDigests: string[] = [];
+    const rejectedDigests: string[] = [];
+    const acceptedPayloads: EmbeddingAcceptedPayload[] = [];
     let pending: EmbeddingPreservationRow[] = [];
     let acceptedRows = 0;
     const hashProjection = hasContentHash ? ', e.contentHash AS contentHash' : '';
@@ -2327,22 +2376,74 @@ export const scanEmbeddingPreservationRows = async (
         `e.chunkIndex AS chunkIndex, e.startLine AS startLine, e.endLine AS endLine, ` +
         `e.embedding AS embedding${hashProjection} ORDER BY e.id`,
       async (row) => {
-        const id = normalizedText(projectionField(row, 'id', 0));
-        if (!acceptedIds.has(id)) return;
-        const vector = row.embedding ?? row[5];
+        const rawId = projectionField(row, 'id', 0);
+        const rawNodeId = projectionField(row, 'nodeId', 1);
+        const rawChunkIndex = projectionField(row, 'chunkIndex', 2);
+        const rawStartLine = projectionField(row, 'startLine', 3);
+        const rawEndLine = projectionField(row, 'endLine', 4);
+        const rawContentHash = hasContentHash ? projectionField(row, 'contentHash', 6) : undefined;
+        const vector = projectionField(row, 'embedding', 5);
+        const vectorInfo = embeddingPhysicalVectorInfo(vector);
+        const observation: EmbeddingPreservationObservation = {
+          rawId,
+          rawNodeId,
+          rawChunkIndex,
+          rawStartLine,
+          rawEndLine,
+          rawContentHash,
+          id: normalizedText(rawId),
+          nodeId: normalizedText(rawNodeId),
+          chunkIndex: strictInteger(rawChunkIndex),
+          startLine: strictInteger(rawStartLine),
+          endLine: strictInteger(rawEndLine),
+          contentHash: normalizedText(rawContentHash),
+          dimensions: vectorInfo.dimensions,
+          vectorInfo,
+        };
+        const reasons = rejectionReasons(observation);
+        const physicalDigest = embeddingPhysicalRowDigest({
+          rawId,
+          id: observation.id,
+          rawNodeId,
+          nodeId: observation.nodeId,
+          rawChunkIndex,
+          chunkIndex: observation.chunkIndex,
+          rawStartLine,
+          startLine: observation.startLine,
+          rawEndLine,
+          endLine: observation.endLine,
+          contentHashPresent: hasContentHash,
+          rawContentHash,
+          vector: vectorInfo,
+          ownerLabel: ownerLabelForNodeId(observation.nodeId),
+          ownerState: ownerState(observation),
+          rejectionReasons: reasons,
+        });
+        physicalDigests.push(physicalDigest);
+        if (reasons.length > 0) rejectedDigests.push(physicalDigest);
+        if (!acceptedIds.has(observation.id) || reasons.length > 0) return;
         const embedding =
           Array.isArray(vector) || ArrayBuffer.isView(vector)
             ? Array.from(vector as ArrayLike<number>)
             : [];
-        const hash = hasContentHash ? (row.contentHash ?? row[6]) : undefined;
+        const hash = rawContentHash;
         pending.push({
-          id,
-          nodeId: normalizedText(projectionField(row, 'nodeId', 1)),
-          chunkIndex: strictInteger(projectionField(row, 'chunkIndex', 2)),
-          startLine: strictInteger(projectionField(row, 'startLine', 3)),
-          endLine: strictInteger(projectionField(row, 'endLine', 4)),
+          id: observation.id,
+          nodeId: observation.nodeId,
+          chunkIndex: observation.chunkIndex,
+          startLine: observation.startLine,
+          endLine: observation.endLine,
           embedding,
           ...(hash === null || hash === undefined ? {} : { contentHash: String(hash) }),
+        });
+        acceptedPayloads.push({
+          id: observation.id,
+          nodeId: observation.nodeId,
+          chunkIndex: observation.chunkIndex,
+          startLine: observation.startLine,
+          endLine: observation.endLine,
+          contentHash: observation.contentHash,
+          embedding,
         });
         acceptedRows++;
         if (pending.length === batchSize) {
@@ -2357,6 +2458,49 @@ export const scanEmbeddingPreservationRows = async (
       physicalRows,
       acceptedRows,
       rejectedRows: physicalRows - acceptedRows,
+      duplicateIdRows: [...idCounts.values()].reduce(
+        (total, count) => total + Math.max(0, count - 1),
+        0,
+      ),
+      duplicateSemanticRows: [...semanticCounts.values()].reduce(
+        (total, count) => total + Math.max(0, count - 1),
+        0,
+      ),
+      noncanonicalIdRows: observations.filter(
+        (row) =>
+          row.id.trim() !== '' &&
+          row.nodeId.trim() !== '' &&
+          Number.isSafeInteger(row.chunkIndex) &&
+          row.chunkIndex >= 0 &&
+          row.id !== `${row.nodeId}:${row.chunkIndex}`,
+      ).length,
+      emptyIdRows: observations.filter((row) => row.id.trim() === '').length,
+      emptyNodeIdRows: observations.filter((row) => row.nodeId.trim() === '').length,
+      invalidChunkRows: observations.filter(
+        (row) => !Number.isSafeInteger(row.chunkIndex) || row.chunkIndex < 0,
+      ).length,
+      invalidLineRows: observations.filter(
+        (row) =>
+          !Number.isSafeInteger(row.startLine) ||
+          row.startLine < 0 ||
+          !Number.isSafeInteger(row.endLine) ||
+          row.endLine < 0,
+      ).length,
+      nonfiniteRows: observations.filter((row) => row.vectorInfo.finite === 'nonfinite').length,
+      malformedVectorRows: observations.filter((row) => row.vectorInfo.finite === 'malformed')
+        .length,
+      wrongDimensionRows: observations.filter((row) => row.dimensions !== EMBEDDING_DIMS).length,
+      missingContentHashRows: hasContentHash
+        ? observations.filter((row) => row.contentHash.trim() === '').length
+        : 0,
+      labelMismatchRows: observations.filter((row) => ownerState(row) !== 'present').length,
+      physicalRowsSha256: embeddingPhysicalRowsDigest(true, physicalRows, physicalDigests),
+      rejectedRowsSha256: embeddingPhysicalRowsDigest(
+        true,
+        rejectedDigests.length,
+        rejectedDigests,
+      ),
+      acceptedPayloadSha256: embeddingAcceptedPayloadDigest(acceptedPayloads),
       implicatedOwnerIds: [...implicated].sort(),
       missingOwnerLabels: [...missingOwnerLabels].sort(),
     };
