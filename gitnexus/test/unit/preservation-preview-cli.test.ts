@@ -325,6 +325,103 @@ describe('preservation preview CLI admission', () => {
     expect(scan).toHaveBeenCalledOnce();
   });
 
+  it('scans before validating a completed proof and admits scanner-implicated corruption', async () => {
+    const proofIdentity = 'b'.repeat(64);
+    const repoPath = await createPreservationRepo({
+      checkpoint: {
+        nodesProcessed: 2,
+        totalNodes: 2,
+        chunksProcessed: 2,
+        physicalRows: 2,
+        validRows: 2,
+        recoverableIdentitySha256: proofIdentity,
+        physicalRowsSha256: 'a'.repeat(64),
+      },
+    });
+    const { inspect, scan } = mockEmptyPreservationDatabase();
+    inspect.mockResolvedValue({
+      tablePresent: true,
+      physicalRows: 2,
+      validRows: 2,
+      recoverableRows: 2,
+      emptyIdRows: 0,
+      emptyNodeIdRows: 0,
+      invalidChunkRows: 0,
+      noncanonicalIdRows: 0,
+      duplicateIdRows: 0,
+      duplicateSemanticRows: 0,
+      orphanRows: 0,
+      wrongDimensionRows: 0,
+      recoverableIdentitySha256: proofIdentity,
+      physicalRowsSha256: 'c'.repeat(64),
+    });
+    const acceptedRow = {
+      id: 'TypeAlias:good:0',
+      nodeId: 'TypeAlias:good',
+      chunkIndex: 0,
+      startLine: 1,
+      endLine: 1,
+      embedding: [0],
+      contentHash: 'good-hash',
+    };
+    scan.mockImplementation(async ({ onBatch } = {}) => {
+      await onBatch?.([acceptedRow]);
+      return {
+        tablePresent: true,
+        physicalRows: 2,
+        acceptedRows: 1,
+        rejectedRows: 1,
+        duplicateIdRows: 0,
+        duplicateSemanticRows: 0,
+        noncanonicalIdRows: 0,
+        emptyIdRows: 0,
+        emptyNodeIdRows: 0,
+        invalidChunkRows: 0,
+        invalidLineRows: 0,
+        nonfiniteRows: 0,
+        malformedVectorRows: 0,
+        wrongDimensionRows: 0,
+        missingContentHashRows: 1,
+        labelMismatchRows: 0,
+        physicalRowsSha256: 'c'.repeat(64),
+        rejectedRowsSha256: 'd'.repeat(64),
+        acceptedPayloadSha256: 'e'.repeat(64),
+        implicatedOwnerIds: ['TypeAlias:bad'],
+        missingOwnerLabels: [],
+      };
+    });
+    vi.spyOn(embeddingPipeline, 'queryEmbeddableNodes').mockImplementation(async function* () {
+      yield [
+        {
+          id: 'TypeAlias:bad',
+          name: 'bad',
+          label: 'TypeAlias',
+          filePath: 'bad.ts',
+          content: 'bad',
+        },
+        {
+          id: 'TypeAlias:good',
+          name: 'good',
+          label: 'TypeAlias',
+          filePath: 'good.ts',
+          content: 'good',
+        },
+      ];
+    });
+    vi.spyOn(embeddingPipeline, 'contentHashForNode').mockImplementation((node) =>
+      node.id === 'TypeAlias:good' ? 'good-hash' : 'bad-hash',
+    );
+
+    const context = await computePreservationPlan(repoPath, { skipGit: true });
+
+    expect(scan).toHaveBeenCalledOnce();
+    expect(inspect).toHaveBeenCalledOnce();
+    expect(scan.mock.invocationCallOrder[0]).toBeLessThan(inspect.mock.invocationCallOrder[0]!);
+    expect(context.acceptedRows).toHaveLength(1);
+    expect(context.plan.restoreIdentities).toEqual(['TypeAlias:good:0']);
+    expect(context.plan.reembedOwners).toEqual(['TypeAlias:bad']);
+  });
+
   it('does not inherit a real .git identity when --skip-git is set', async () => {
     const requestedPath = '/definitely/not/a/repository';
     const resolvePlacement = vi.spyOn(repoManager, 'resolveBranchPlacement').mockResolvedValue({});
@@ -375,7 +472,7 @@ describe('preservation preview CLI admission', () => {
   });
 
   it.each(['preview', 'apply'])(
-    'refuses %s when completed-checkpoint vector bytes differ before scan, lock, or provider work',
+    'refuses %s when completed-checkpoint vector bytes differ without scanner corruption proof',
     async (mode) => {
       const repoPath = await createPreservationRepo();
       const { scan } = mockEmptyPreservationDatabase('b'.repeat(64));
@@ -406,7 +503,7 @@ describe('preservation preview CLI admission', () => {
 
       expect(process.exitCode).toBe(1);
       expect(stderr).toHaveBeenCalledWith(expect.stringContaining('durable identity'));
-      expect(scan).not.toHaveBeenCalled();
+      expect(scan).toHaveBeenCalledOnce();
       expect(lock).not.toHaveBeenCalled();
       expect(fetchSpy).not.toHaveBeenCalled();
     },

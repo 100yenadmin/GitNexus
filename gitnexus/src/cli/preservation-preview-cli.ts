@@ -177,6 +177,32 @@ const assertPreservationCheckpointProof = (checkpoint: RepoMeta['embeddingCheckp
   }
 };
 
+/**
+ * A completed proof may be followed by scanner-classified row corruption. The
+ * scanner is the only source that may explain a changed physical digest. The
+ * completed proof still binds the producer identity and prior terminal row
+ * count; the current scan must account for the same rows, agree with the
+ * independent integrity read, and tie every rejection to a non-empty owner.
+ * Any digest drift without that complete scanner explanation remains on the
+ * strict checkpoint validator path.
+ */
+const scannerExplainsCheckpointDrift = (
+  checkpoint: NonNullable<RepoMeta['embeddingCheckpoint']>,
+  scan: Awaited<ReturnType<typeof scanEmbeddingPreservationRows>>,
+  integrity: Awaited<ReturnType<typeof inspectEmbeddingIntegrity>>,
+): boolean =>
+  checkpoint.physicalRowsSha256 !== integrity.physicalRowsSha256 &&
+  scan.rejectedRows > 0 &&
+  scan.implicatedOwnerIds.length > 0 &&
+  scan.emptyNodeIdRows === 0 &&
+  scan.missingOwnerLabels.length === 0 &&
+  scan.physicalRows === checkpoint.physicalRows &&
+  scan.acceptedRows + scan.rejectedRows === scan.physicalRows &&
+  scan.physicalRowsSha256 === integrity.physicalRowsSha256 &&
+  integrity.physicalRows === checkpoint.physicalRows &&
+  integrity.validRows === checkpoint.validRows &&
+  integrity.recoverableRows === checkpoint.physicalRows;
+
 export interface PreservationPlanContext {
   plan: PreservationPlan;
   acceptedRows: EmbeddingPreservationRow[];
@@ -248,17 +274,6 @@ export const computePreservationPlan = async (
   const acceptedRows: EmbeddingPreservationRow[] = [];
   const nodes: EmbeddableNode[] = [];
   const plan = await withLbugReadOnlyNonRecovering(storage.lbugPath, async () => {
-    if (expectedCheckpoint) {
-      const integrity = await inspectEmbeddingIntegrity(
-        undefined,
-        expectedCheckpoint.physicalRowsSha256 !== undefined,
-      );
-      assertCompletedCheckpointIdentity(
-        expectedCheckpoint,
-        integrity,
-        'Preservation completed embedding checkpoint',
-      );
-    }
     const scan = await scanEmbeddingPreservationRows({
       onBatch: (batch) => {
         acceptedRows.push(...batch);
@@ -268,6 +283,19 @@ export const computePreservationPlan = async (
       throw new Error(
         'Preservation requires terminal embedding identity proof for a non-empty index',
       );
+    }
+    if (expectedCheckpoint) {
+      const integrity = await inspectEmbeddingIntegrity(
+        undefined,
+        expectedCheckpoint.physicalRowsSha256 !== undefined,
+      );
+      if (!scannerExplainsCheckpointDrift(expectedCheckpoint, scan, integrity)) {
+        assertCompletedCheckpointIdentity(
+          expectedCheckpoint,
+          integrity,
+          'Preservation completed embedding checkpoint',
+        );
+      }
     }
     const { chunkNode } = await import('../core/embeddings/chunker.js');
     for await (const page of queryEmbeddableNodes(executeQuery)) nodes.push(...page);
