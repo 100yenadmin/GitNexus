@@ -177,6 +177,7 @@ describe('M8b incremental embedding restore', () => {
       expect([...changed, ...added].every((row) => handlerOwner(row.nodeId))).toBe(true);
       const unaffectedBefore = before.filter((row) => !handlerOwner(row.nodeId));
       expect(unaffectedBefore.length).toBeGreaterThan(0);
+      expect(unaffectedBefore.filter((row) => !afterByKey.has(rowKey(row)))).toEqual([]);
       expect(
         unaffectedBefore.every(
           (row) => rowPayload(afterByKey.get(rowKey(row))!) === rowPayload(row),
