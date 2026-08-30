@@ -17,8 +17,13 @@ import {
   promoteStagedGeneration,
   withAnalyzeOwnershipLock,
 } from '../core/staged-promotion.js';
-import { getCurrentBranch, getCurrentCommit, hasGitDir } from '../storage/git.js';
-import { canonicalizePath, registerRepo, saveMeta } from '../storage/repo-manager.js';
+import { getCurrentBranch, getCurrentCommit, getRemoteUrl, hasGitDir } from '../storage/git.js';
+import {
+  assertCanonicalRepositoryIdentity,
+  canonicalizePath,
+  registerRepo,
+  saveMeta,
+} from '../storage/repo-manager.js';
 import { computePreservationPlan } from './preservation-preview-cli.js';
 import type { PreservationPreviewCliOptions } from './preservation-preview-cli.js';
 
@@ -79,6 +84,10 @@ export const preservationApplyCommand = async (
   try {
     const admission = parseApplyOptions(options);
     const initial = await computePreservationPlan(inputPath, options);
+    const repositoryRemoteUrl = hasGitDir(initial.repoPath)
+      ? getRemoteUrl(initial.repoPath)
+      : undefined;
+    await assertCanonicalRepositoryIdentity(initial.repoPath, repositoryRemoteUrl);
     await withAnalyzeOwnershipLock(
       initial.storage.storagePath,
       async () => {

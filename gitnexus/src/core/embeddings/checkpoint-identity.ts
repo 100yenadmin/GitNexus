@@ -52,6 +52,9 @@ const isSafeNonNegativeInteger = (value: unknown): value is number =>
 const isSha256Digest = (value: unknown): value is string =>
   typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
 
+const isNonEmptyString = (value: unknown): value is string =>
+  typeof value === 'string' && value.trim().length > 0;
+
 /**
  * A checkpoint explicitly produced after the verified-preservation workflow
  * has finalized its staged generation, with a fully persisted embedding window
@@ -63,6 +66,10 @@ export const isCompletedEmbeddingCheckpoint = (value: unknown): boolean => {
   const checkpoint = value as Partial<NonNullable<RepoMeta['embeddingCheckpoint']>>;
   return (
     checkpoint.purpose === 'verified-preservation' &&
+    isNonEmptyString(checkpoint.provider) &&
+    isNonEmptyString(checkpoint.model) &&
+    isSafeNonNegativeInteger(checkpoint.dimensions) &&
+    checkpoint.dimensions > 0 &&
     isSafeNonNegativeInteger(checkpoint.nodesProcessed) &&
     isSafeNonNegativeInteger(checkpoint.totalNodes) &&
     checkpoint.nodesProcessed === checkpoint.totalNodes &&

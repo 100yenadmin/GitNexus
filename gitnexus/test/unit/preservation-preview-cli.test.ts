@@ -36,7 +36,7 @@ describe('preservation preview CLI admission', () => {
     provider?: string;
     model?: string;
     config?: Record<string, unknown>;
-    checkpoint?: Record<string, unknown>;
+    checkpoint?: Record<string, unknown> | null;
   } = {}) => {
     const repoPath = await mkdtemp(path.join(tmpdir(), 'gitnexus-preservation-'));
     tempDirs.push(repoPath);
@@ -50,22 +50,25 @@ describe('preservation preview CLI admission', () => {
         lastCommit: '',
         indexedAt: '2026-08-30T00:00:00.000Z',
         stats: { embeddings: 0 },
-        embeddingCheckpoint: {
-          at: '2026-08-30T00:00:00.000Z',
-          purpose: 'verified-preservation',
-          nodesProcessed: 0,
-          totalNodes: 0,
-          chunksProcessed: 0,
-          provider,
-          model,
-          dimensions: 384,
-          pendingNodeIds: [],
-          physicalRows: 0,
-          validRows: 0,
-          recoverableIdentitySha256: 'a'.repeat(64),
-          physicalRowsSha256: 'a'.repeat(64),
-          ...checkpoint,
-        },
+        embeddingCheckpoint:
+          checkpoint === null
+            ? undefined
+            : {
+                at: '2026-08-30T00:00:00.000Z',
+                purpose: 'verified-preservation',
+                nodesProcessed: 0,
+                totalNodes: 0,
+                chunksProcessed: 0,
+                provider,
+                model,
+                dimensions: 384,
+                pendingNodeIds: [],
+                physicalRows: 0,
+                validRows: 0,
+                recoverableIdentitySha256: 'a'.repeat(64),
+                physicalRowsSha256: 'a'.repeat(64),
+                ...checkpoint,
+              },
       }),
     );
     if (config) await writeFile(path.join(repoPath, '.gitnexusrc'), JSON.stringify(config));
@@ -299,6 +302,18 @@ describe('preservation preview CLI admission', () => {
     expect(lock).not.toHaveBeenCalled();
   });
 
+  it('creates the initial byte-bound source attestation for a completed index without a checkpoint', async () => {
+    const repoPath = await createPreservationRepo({ checkpoint: null });
+    const { scan } = mockEmptyPreservationDatabase();
+
+    const context = await computePreservationPlan(repoPath, { skipGit: true });
+
+    expect(context.meta.embeddingCheckpoint).toBeUndefined();
+    expect(context.plan.proof.physicalRows).toBe(0);
+    expect(context.plan.planDigest).toMatch(/^[a-f0-9]{64}$/);
+    expect(scan).toHaveBeenCalledOnce();
+  });
+
   it('does not inherit a real .git identity when --skip-git is set', async () => {
     const requestedPath = '/definitely/not/a/repository';
     const resolvePlacement = vi.spyOn(repoManager, 'resolveBranchPlacement').mockResolvedValue({});
@@ -391,6 +406,7 @@ describe('preservation preview CLI admission', () => {
     mockEmptyPreservationDatabase();
     const expectedDigest = (await computePreservationPlan(repoPath, { skipGit: true })).plan
       .planDigest;
+    vi.spyOn(repoManager, 'assertCanonicalRepositoryIdentity').mockResolvedValue(undefined);
     vi.spyOn(stagedPromotion, 'withAnalyzeOwnershipLock').mockImplementation(
       async (_storagePath, operation) => operation(),
     );
@@ -461,6 +477,35 @@ describe('preservation preview CLI admission', () => {
       recoverableIdentitySha256: 'a'.repeat(64),
       physicalRowsSha256: 'a'.repeat(64),
     });
+  });
+
+  it('refuses a canonical identity collision before ownership or stage mutation', async () => {
+    const repoPath = await createPreservationRepo({ checkpoint: null });
+    mockEmptyPreservationDatabase();
+    const expectedDigest = (await computePreservationPlan(repoPath, { skipGit: true })).plan
+      .planDigest;
+    vi.spyOn(repoManager, 'assertCanonicalRepositoryIdentity').mockRejectedValue(
+      new Error('synthetic canonical repository collision'),
+    );
+    const lock = vi.spyOn(stagedPromotion, 'withAnalyzeOwnershipLock');
+    const prepare = vi.spyOn(stagedPromotion, 'prepareStagedWorkspace');
+    const promote = vi.spyOn(stagedPromotion, 'promoteStagedGeneration');
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+
+    await preservationApplyCommand(repoPath, {
+      preserveVerifiedEmbeddings: true,
+      staged: true,
+      embeddings: true,
+      planDigest: expectedDigest,
+      maxReembedNodes: '1',
+      skipGit: true,
+    });
+
+    expect(process.exitCode).toBe(1);
+    expect(stderr).toHaveBeenCalledWith(expect.stringContaining('canonical repository collision'));
+    expect(lock).not.toHaveBeenCalled();
+    expect(prepare).not.toHaveBeenCalled();
+    expect(promote).not.toHaveBeenCalled();
   });
 
   it('dispatches preservation apply without loading the ordinary analyzer', async () => {

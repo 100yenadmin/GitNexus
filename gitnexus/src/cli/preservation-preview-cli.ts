@@ -166,6 +166,11 @@ const validatePreviewOptions = (options: PreservationPreviewCliOptions): void =>
 };
 
 const assertPreservationCheckpointProof = (checkpoint: RepoMeta['embeddingCheckpoint']): void => {
+  // A successful ordinary analysis clears its transient checkpoint. In that
+  // state the provider-free preview plus exact plan digest is the initial,
+  // byte-bound source attestation. A present checkpoint is an interrupted or
+  // previously repaired state and must carry explicit finalized proof.
+  if (!checkpoint) return;
   if (!isCompletedEmbeddingCheckpoint(checkpoint)) {
     throw new Error(
       'Preservation requires an explicitly marked completed checkpoint with durable physical and identity proof',
@@ -233,10 +238,10 @@ export const computePreservationPlan = async (
     await import('../core/embeddings/embedding-pipeline.js');
   const identity = resolveEmbeddingIdentity(effectiveOptions, EMBEDDING_TEXT_VERSION);
   if (
-    expectedCheckpoint?.provider === undefined ||
-    expectedCheckpoint.provider !== identity.provider ||
-    expectedCheckpoint.model !== identity.model ||
-    expectedCheckpoint.dimensions !== identity.dimensions
+    expectedCheckpoint &&
+    (expectedCheckpoint.provider !== identity.provider ||
+      expectedCheckpoint.model !== identity.model ||
+      expectedCheckpoint.dimensions !== identity.dimensions)
   ) {
     throw new Error('metadata does not prove the requested provider, model, and dimensions');
   }

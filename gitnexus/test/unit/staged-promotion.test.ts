@@ -430,6 +430,15 @@ describe('staged promotion journal', () => {
 
   it.each([
     ['missing verified-preservation purpose', { purpose: undefined }],
+    ['missing provider', { provider: undefined }],
+    ['empty provider', { provider: ' ' }],
+    ['missing model', { model: undefined }],
+    ['empty model', { model: ' ' }],
+    ['missing dimensions', { dimensions: undefined }],
+    ['zero dimensions', { dimensions: 0 }],
+    ['negative dimensions', { dimensions: -1 }],
+    ['fractional dimensions', { dimensions: 1.5 }],
+    ['string dimensions', { dimensions: '384' as unknown as number }],
     ['pending nodes', { pendingNodeIds: ['Function:pending'] }],
     ['non-terminal progress', { nodesProcessed: 1 }],
     ['missing physical row count', { physicalRows: undefined }],
