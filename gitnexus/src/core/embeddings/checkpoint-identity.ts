@@ -46,6 +46,35 @@ type CompletedEmbeddingCheckpoint = Pick<
   | 'physicalRowsSha256'
 >;
 
+const isSafeNonNegativeInteger = (value: unknown): value is number =>
+  typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+
+const isSha256Digest = (value: unknown): value is string =>
+  typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
+
+/**
+ * A checkpoint with a fully persisted embedding window and durable identity.
+ * These checkpoints are safe to validate and retain without treating the run
+ * as interrupted or resolving the embedding runtime just to take the fast path.
+ */
+export const isCompletedEmbeddingCheckpoint = (value: unknown): boolean => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const checkpoint = value as Partial<NonNullable<RepoMeta['embeddingCheckpoint']>>;
+  return (
+    isSafeNonNegativeInteger(checkpoint.nodesProcessed) &&
+    isSafeNonNegativeInteger(checkpoint.totalNodes) &&
+    checkpoint.nodesProcessed === checkpoint.totalNodes &&
+    isSafeNonNegativeInteger(checkpoint.chunksProcessed) &&
+    Array.isArray(checkpoint.pendingNodeIds) &&
+    checkpoint.pendingNodeIds.length === 0 &&
+    isSafeNonNegativeInteger(checkpoint.physicalRows) &&
+    isSafeNonNegativeInteger(checkpoint.validRows) &&
+    checkpoint.validRows === checkpoint.physicalRows &&
+    isSha256Digest(checkpoint.recoverableIdentitySha256) &&
+    isSha256Digest(checkpoint.physicalRowsSha256)
+  );
+};
+
 export const assertCompletedCheckpointIdentity = (
   checkpoint: CompletedEmbeddingCheckpoint,
   report: EmbeddingIntegrityReport,

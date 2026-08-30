@@ -564,6 +564,46 @@ describe('run-analyze module', () => {
       expect(completed).not.toBeNull();
       if (!completed) throw new Error('expected completed metadata');
       const currentProvider = httpEmbeddingProvider('http://test:8080/v1');
+      const { lbugPath } = getStoragePaths(tmpRepo.dbPath);
+      const { inspectEmbeddingIntegrity, withLbugDb } =
+        await import('../../src/core/lbug/lbug-adapter.js');
+      const completedIntegrity = await withLbugDb(
+        lbugPath,
+        () => inspectEmbeddingIntegrity(undefined, true),
+        { readOnly: true },
+      );
+      const completedCheckpoint = {
+        at: new Date().toISOString(),
+        nodesProcessed: 1,
+        totalNodes: 1,
+        chunksProcessed: 1,
+        provider: currentProvider,
+        model: 'test-model',
+        dimensions: 384,
+        pendingNodeIds: [],
+        physicalRows: completedIntegrity.physicalRows,
+        validRows: completedIntegrity.validRows,
+        recoverableIdentitySha256: completedIntegrity.recoverableIdentitySha256,
+        physicalRowsSha256: completedIntegrity.physicalRowsSha256,
+      };
+      await saveMeta(storagePath, {
+        ...completed,
+        embeddingCheckpoint: completedCheckpoint,
+      });
+      process.env.GITNEXUS_EMBEDDING_URL = 'http://mismatch.invalid/v1';
+      fetchMock.mockClear();
+
+      const alreadyComplete = await runFullAnalysis(
+        tmpRepo.dbPath,
+        { skipAgentsMd: true, skipSkills: true },
+        { onProgress: () => {} },
+      );
+
+      expect(alreadyComplete.alreadyUpToDate).toBe(true);
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect((await loadMeta(storagePath))?.embeddingCheckpoint).toEqual(completedCheckpoint);
+      process.env.GITNEXUS_EMBEDDING_URL = 'http://test:8080/v1';
+
       await saveMeta(storagePath, {
         ...completed,
         embeddingCheckpoint: {

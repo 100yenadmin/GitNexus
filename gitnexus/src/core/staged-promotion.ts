@@ -13,6 +13,7 @@ import {
   INDEX_METADATA_FILE,
   type RepoMeta,
 } from '../storage/repo-manager.js';
+import { isCompletedEmbeddingCheckpoint } from './embeddings/checkpoint-identity.js';
 
 const STAGE_MANIFEST_SCHEMA = 'gitnexus.staged-analyze/v1';
 const STAGE_INTENT_SCHEMA = 'gitnexus.staged-analyze-intent/v1';
@@ -1616,32 +1617,6 @@ export const discardStagedWorkspace = async (paths: StagedAnalyzePaths): Promise
   }
   await fs.rm(paths.stageRoot, { recursive: true, force: true });
   await fs.rm(paths.stageIntentPath, { force: true });
-};
-
-const isSafeNonNegativeInteger = (value: unknown): value is number =>
-  typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
-
-const isSha256Digest = (value: unknown): value is string =>
-  typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
-
-const isCompletedEmbeddingCheckpoint = (
-  value: unknown,
-): value is NonNullable<RepoMeta['embeddingCheckpoint']> => {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
-  const checkpoint = value as Partial<NonNullable<RepoMeta['embeddingCheckpoint']>>;
-  return (
-    isSafeNonNegativeInteger(checkpoint.nodesProcessed) &&
-    isSafeNonNegativeInteger(checkpoint.totalNodes) &&
-    checkpoint.nodesProcessed === checkpoint.totalNodes &&
-    isSafeNonNegativeInteger(checkpoint.chunksProcessed) &&
-    Array.isArray(checkpoint.pendingNodeIds) &&
-    checkpoint.pendingNodeIds.length === 0 &&
-    isSafeNonNegativeInteger(checkpoint.physicalRows) &&
-    isSafeNonNegativeInteger(checkpoint.validRows) &&
-    checkpoint.validRows === checkpoint.physicalRows &&
-    isSha256Digest(checkpoint.recoverableIdentitySha256) &&
-    isSha256Digest(checkpoint.physicalRowsSha256)
-  );
 };
 
 /** Validate the staged DB/meta pair before the first canonical rename. */

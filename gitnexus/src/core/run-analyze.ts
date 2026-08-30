@@ -107,6 +107,7 @@ import {
   assertEmbeddingIntegrity,
   embeddingIntegrityIsClean,
   embeddingIntegritySummary,
+  isCompletedEmbeddingCheckpoint,
 } from './embeddings/checkpoint-identity.js';
 import { computeFileHashes, diffFileHashes } from '../storage/file-hash.js';
 import {
@@ -1722,7 +1723,10 @@ const runFullAnalysisImpl = async (
     if (options.dropEmbeddings) {
       log('Discarding the interrupted embedding checkpoint (--drop-embeddings).');
       options = { ...options, force: true };
-    } else if (!isEmptyLegacyCheckpoint(existingMeta.embeddingCheckpoint)) {
+    } else if (
+      !isCompletedEmbeddingCheckpoint(existingMeta.embeddingCheckpoint) &&
+      !isEmptyLegacyCheckpoint(existingMeta.embeddingCheckpoint)
+    ) {
       embeddingIdentityForRun = await resolveEmbeddingIdentity();
       const checkpoint = existingMeta.embeddingCheckpoint;
       if (
@@ -1860,15 +1864,9 @@ const runFullAnalysisImpl = async (
   // database before that point can replay a poisoned interrupted WAL.
   const checkpointToVerify = existingMeta?.embeddingCheckpoint;
   if (
-    resumeEmbeddingCheckpoint &&
+    !options.dropEmbeddings &&
     checkpointToVerify &&
-    !checkpointToVerify.pendingNodeIds?.length &&
-    [
-      checkpointToVerify.physicalRows,
-      checkpointToVerify.validRows,
-      checkpointToVerify.recoverableIdentitySha256,
-      checkpointToVerify.physicalRowsSha256,
-    ].some((value) => value !== undefined)
+    isCompletedEmbeddingCheckpoint(checkpointToVerify)
   ) {
     try {
       const completedIntegrity = await withLbugDb(
@@ -1957,7 +1955,8 @@ const runFullAnalysisImpl = async (
   // ── Early-return: already up to date ──────────────────────────────
   if (
     existingMeta &&
-    !existingMeta.embeddingCheckpoint &&
+    (!existingMeta.embeddingCheckpoint ||
+      isCompletedEmbeddingCheckpoint(existingMeta.embeddingCheckpoint)) &&
     !options.force &&
     existingMeta.lastCommit === currentCommit
   ) {
