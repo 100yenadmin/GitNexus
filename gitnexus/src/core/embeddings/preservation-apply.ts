@@ -98,6 +98,115 @@ const scanMatchesRows = (
   }
 };
 
+const deriveExpectedTerminalContentHashes = (plan: PreservationPlan): Map<string, string> => {
+  const observationsByOwner = new Map(
+    plan.observations.map((observation) => [observation.ownerId, observation]),
+  );
+  if (observationsByOwner.size !== plan.observations.length) {
+    throw new Error('preservation plan contains duplicate owner observations');
+  }
+
+  const reembedOwners = new Set(plan.reembedOwners);
+  if (reembedOwners.size !== plan.reembedOwners.length) {
+    throw new Error('preservation plan contains duplicate re-embed owners');
+  }
+  for (const ownerId of reembedOwners) {
+    if (!observationsByOwner.has(ownerId)) {
+      throw new Error('preservation plan re-embed owner is absent from observations');
+    }
+  }
+
+  const expected = new Map<string, string>();
+  const expectedRestoreIdentities = new Set<string>();
+  for (const observation of plan.observations) {
+    if (
+      typeof observation.expectedContentHash !== 'string' ||
+      observation.expectedContentHash === ''
+    ) {
+      throw new Error('preservation plan is missing an expected terminal content hash');
+    }
+    if (
+      !Number.isSafeInteger(observation.chunkCount) ||
+      observation.chunkCount < 0 ||
+      !Array.isArray(observation.acceptedChunkIndices) ||
+      !Array.isArray(observation.rejectedChunkIndices)
+    ) {
+      throw new Error('preservation plan contains invalid terminal chunk observations');
+    }
+    const accepted = new Set(observation.acceptedChunkIndices);
+    const rejected = new Set(observation.rejectedChunkIndices);
+    const allChunks = new Set([...accepted, ...rejected]);
+    if (
+      accepted.size !== observation.acceptedChunkIndices.length ||
+      rejected.size !== observation.rejectedChunkIndices.length ||
+      allChunks.size !== observation.chunkCount ||
+      [...allChunks].some(
+        (chunkIndex) =>
+          !Number.isSafeInteger(chunkIndex) ||
+          chunkIndex < 0 ||
+          chunkIndex >= observation.chunkCount,
+      ) ||
+      accepted.size + rejected.size !== allChunks.size
+    ) {
+      throw new Error('preservation plan contains incomplete terminal chunk observations');
+    }
+    const terminalChunks = reembedOwners.has(observation.ownerId) ? allChunks : accepted;
+    for (const chunkIndex of terminalChunks) {
+      const identity = `${observation.ownerId}:${chunkIndex}`;
+      if (expected.has(identity)) {
+        throw new Error('preservation plan contains duplicate terminal embedding identities');
+      }
+      expected.set(identity, observation.expectedContentHash);
+    }
+    if (!reembedOwners.has(observation.ownerId)) {
+      for (const chunkIndex of accepted) {
+        expectedRestoreIdentities.add(`${observation.ownerId}:${chunkIndex}`);
+      }
+    }
+  }
+
+  const restoreIdentities = new Set(plan.restoreIdentities);
+  if (
+    restoreIdentities.size !== plan.restoreIdentities.length ||
+    restoreIdentities.size !== expectedRestoreIdentities.size ||
+    [...restoreIdentities].some((identity) => !expectedRestoreIdentities.has(identity))
+  ) {
+    throw new Error('preservation plan restore identities do not cover terminal observations');
+  }
+  if (expected.size !== plan.counts.expectedChunkCount) {
+    throw new Error('preservation plan terminal chunk count is inconsistent');
+  }
+  return expected;
+};
+
+const assertExactTerminalIdentitySet = (
+  expected: ReadonlyMap<string, string>,
+  terminal: readonly CompleteRow[],
+): void => {
+  const observed = new Set<string>();
+  for (const row of terminal) {
+    const canonicalIdentity = `${row.nodeId}:${row.chunkIndex}`;
+    if (row.id !== canonicalIdentity || !expected.has(row.id)) {
+      throw new Error('terminal staged rows do not match the planned owner/chunk set');
+    }
+    if (observed.has(row.id)) {
+      throw new Error('terminal staged rows contain duplicate owner/chunk identities');
+    }
+    if (row.contentHash !== expected.get(row.id)) {
+      throw new Error('terminal staged rows contain an unexpected content hash');
+    }
+    observed.add(row.id);
+  }
+  if (observed.size !== expected.size) {
+    throw new Error('terminal staged rows are missing a planned owner/chunk identity');
+  }
+  for (const identity of expected.keys()) {
+    if (!observed.has(identity)) {
+      throw new Error('terminal staged rows are missing a planned owner/chunk identity');
+    }
+  }
+};
+
 export const verifyPreservationApplyMutation = (
   plan: PreservationPlan,
   expectedRestoreRows: readonly CompleteRow[],
@@ -113,6 +222,8 @@ export const verifyPreservationApplyMutation = (
   }
 
   const terminal = mutation.terminalRows.filter(completeRow);
+  const expectedTerminalContentHashes = deriveExpectedTerminalContentHashes(plan);
+  assertExactTerminalIdentitySet(expectedTerminalContentHashes, terminal);
   if (
     terminal.length !== mutation.terminalRows.length ||
     mutation.terminalScan.physicalRows !== plan.counts.expectedChunkCount ||

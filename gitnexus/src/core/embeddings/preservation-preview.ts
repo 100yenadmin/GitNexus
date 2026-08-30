@@ -139,6 +139,7 @@ export const derivePreservationOwnerObservations = ({
   const rowsByOwner = new Map<string, PreservationPreviewRow[]>();
   const idCounts = new Map<string, number>();
   const semanticCounts = new Map<string, number>();
+  const acceptedOwnersAbsentFromEnumeration = new Set<string>();
   for (const row of acceptedRows) {
     assertAcceptedRow(row);
     idCounts.set(row.id, (idCounts.get(row.id) ?? 0) + 1);
@@ -148,7 +149,12 @@ export const derivePreservationOwnerObservations = ({
       const rows = rowsByOwner.get(row.nodeId) ?? [];
       rows.push(row);
       rowsByOwner.set(row.nodeId, rows);
-    }
+    } else acceptedOwnersAbsentFromEnumeration.add(row.nodeId);
+  }
+  if (acceptedOwnersAbsentFromEnumeration.size > 0) {
+    throw new Error(
+      'Preservation scanner accepted rows reference owners absent from the current owner enumeration',
+    );
   }
 
   const implicated = new Set(scan.implicatedOwnerIds);

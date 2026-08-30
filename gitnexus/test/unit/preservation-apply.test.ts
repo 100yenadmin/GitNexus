@@ -222,6 +222,39 @@ describe('preservation apply admission and orchestration', () => {
     ).toThrow('exactly the planned owners');
   });
 
+  it.each([
+    ['missing', [keepRow, regeneratedRow]],
+    [
+      'extra',
+      [
+        keepRow,
+        regeneratedRow,
+        secondRegeneratedRow,
+        { ...keepRow, id: 'Function:extra:0', nodeId: 'Function:extra', contentHash: 'extra-hash' },
+      ],
+    ],
+    [
+      'swapped',
+      [
+        keepRow,
+        { ...regeneratedRow, id: secondRegeneratedRow.id, nodeId: secondRegeneratedRow.nodeId },
+        { ...secondRegeneratedRow, id: regeneratedRow.id, nodeId: regeneratedRow.nodeId },
+      ],
+    ],
+    [
+      'wrong hash',
+      [keepRow, { ...regeneratedRow, contentHash: 'wrong-hash' }, secondRegeneratedRow],
+    ],
+  ])('rejects %s terminal owner/chunk/content-hash set', (_label, terminalRows) => {
+    expect(() =>
+      verifyPreservationApplyMutation(
+        plan,
+        [keepRow],
+        mutation({ terminalRows, terminalScan: scan(terminalRows) }),
+      ),
+    ).toThrow();
+  });
+
   it('prepares only after admission and promotes only after byte/readback proof', async () => {
     const events: string[] = [];
     const callbacks = runtime(events);

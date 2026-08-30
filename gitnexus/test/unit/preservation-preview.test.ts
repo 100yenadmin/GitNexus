@@ -122,6 +122,17 @@ describe('provider-free preservation preview core', () => {
     expect(plan.observations.some(({ ownerId }) => ownerId === 'orphan:bad')).toBe(false);
   });
 
+  it('fails closed when accepted rows reference an owner absent from enumeration', () => {
+    expect(() =>
+      buildEmbeddingPreservationPreview({
+        base,
+        scan: scan({ physicalRows: 1, acceptedRows: 1, rejectedRows: 0 }),
+        acceptedRows: [row('Function:missing', 0, 'missing')],
+        owners: [owner('Function:known', 'known', [0])],
+      }),
+    ).toThrow('owners absent from the current owner enumeration');
+  });
+
   it('derives chunks and hashes through injected existing pipeline functions', async () => {
     const nodes: EmbeddableNode[] = [
       {
