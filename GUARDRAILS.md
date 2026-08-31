@@ -20,7 +20,7 @@ Maintainer may widen scope per task.
 3. **Run impact analysis before editing shared symbols** — `impact` (upstream) for functions/classes/methods others call. Do not ignore HIGH/CRITICAL without maintainer sign-off.
 4. **Run `detect_changes` before commit** — confirm diffs map to expected symbols/processes when the graph is available.
 5. **Preserve embeddings** — plain `npx gitnexus analyze` now preserves any embeddings recorded in the index metadata (`.gitnexus/gitnexus.json`, mirrored to the legacy `meta.json`) — the previous behavior wiped them. Use `--embeddings` to also generate vectors for new/changed nodes; use `--drop-embeddings` only when an explicit wipe is intended (e.g., model swap).
-6. **Use the bounded recovery contract** — for healthy indexes that are stale against source, use a positive embedding cap (`--embeddings <n>`) so the incremental path retains unaffected logical embedding-row payloads and regenerates only changed/new owners. For malformed or provenance-unproven state, use an explicit positive-cap staged clean rebuild (`--staged --embeddings <n> --drop-embeddings`) and keep the canonical generation as the rollback preimage until validated promotion completes. Older rows without durable provider or identity proof remain unproven; never call them verified preservation.
+6. **Use the bounded recovery contract** — for healthy indexes that are stale against source, use a positive cap on total graph nodes (`--embeddings <n>`). The cap admits or refuses the whole embedding pass before generation; when admitted, the incremental path retains unaffected logical embedding-row payloads and regenerates only changed/new owners. For malformed or provenance-unproven state, use an explicit staged clean rebuild with the same positive total-graph cap (`--staged --embeddings <n> --drop-embeddings`) and keep the canonical generation as the rollback preimage until validated promotion completes. Older rows without durable provider or identity proof remain unproven; never call them verified preservation.
 
 ---
 
@@ -49,7 +49,7 @@ Format: **Trigger → Instruction → Reason**. Append new Signs when the same m
 ### Embedding state is malformed or provenance is unproven
 
 - **Trigger:** Doctor or read-only integrity inspection reports malformed, duplicate, orphaned, wrong-dimension, or otherwise unproven embedding state, including legacy rows without durable provider or identity proof.
-- **Do:** Preserve the canonical logical embedding-row and metadata preimage, then run an explicit positive-cap staged clean rebuild: `npx gitnexus analyze --staged --embeddings <n> --drop-embeddings`. Validate the isolated generation before journaled promotion; on a promotion failure, use the staged rollback path and verify that the logical preimage is restored with no stage, backup, or journal residue.
+- **Do:** Preserve the canonical logical embedding-row and metadata preimage, then run an explicit staged clean rebuild with a positive cap on total graph nodes: `npx gitnexus analyze --staged --embeddings <n> --drop-embeddings`. Validate the isolated generation before journaled promotion; on a promotion failure, use the staged rollback path and verify that the logical preimage is restored with no stage, backup, or journal residue.
 - **Why:** A staged clean rebuild gives malformed or unclassified derived state a bounded replacement path without treating old rows as verified. The deterministic proof covers logical row payloads, not raw LadybugDB container bytes.
 
 ### MCP lists no repos

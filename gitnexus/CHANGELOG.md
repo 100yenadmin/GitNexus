@@ -9,10 +9,11 @@ All notable changes to GitNexus will be documented in this file.
 ### Changed
 
 - **Healthy source-stale indexes keep their unchanged embedding payloads on the capped
-  incremental path**: run `analyze` with a positive embedding cap (`--embeddings <n>`) to
-  regenerate changed or new owners while retaining unaffected logical embedding-row payload
-  bytes. Large effective write sets may still use the existing full-write escalation while
-  preserving the same bounded snapshot contract.
+  incremental path**: run `analyze` with a positive total-graph node cap (`--embeddings <n>`).
+  GitNexus refuses the whole embedding pass when the graph exceeds the cap; when admitted, it
+  regenerates changed or new owners while retaining unaffected logical embedding-row payload bytes.
+  Large effective write sets may still use the existing full-write escalation while preserving the
+  same bounded snapshot contract.
 - **Malformed or provenance-unproven indexes use an explicit capped staged clean rebuild**:
   `--staged --embeddings <n> --drop-embeddings` builds an isolated generation, keeps the
   canonical generation untouched until validation and promotion, and retains the canonical

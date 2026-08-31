@@ -171,16 +171,17 @@ If the error text is `"Only one write transaction at a time is allowed in the sy
 ## Bounded embedding preservation and staged recovery
 
 For a healthy index that is stale against its source, run incremental analysis with a positive
-embedding cap:
+total-graph node cap:
 
 ```bash
 npx gitnexus analyze --embeddings <n>
 ```
 
-The incremental path rewrites the changed/effective file set, regenerates changed or new
-embedding owners within the cap, and retains unaffected logical embedding-row payloads. If the
-effective write set is large, the existing escalation valve may select a full write while
-retaining the same bounded snapshot and restore contract.
+GitNexus refuses the whole embedding pass when the graph has more than `<n>` nodes. When admitted,
+the incremental path rewrites the changed/effective file set, regenerates changed or new embedding
+owners, and retains unaffected logical embedding-row payloads. If the effective write set is large,
+the existing escalation valve may select a full write while retaining the same bounded snapshot and
+restore contract.
 
 For malformed or provenance-unproven embedding state, use an explicit staged clean rebuild:
 
