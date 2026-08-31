@@ -2410,6 +2410,7 @@ const runFullAnalysisImpl = async (
       skipForCap,
       forceRegenerateEmbeddings,
       options.embeddingsNodeLimit,
+      options.embeddings === true,
     );
     if (skipForCap && !preserveOnlyForRecovery) {
       cleanupPdgEmitManifestFiles(pipelineResult.pdgEmitManifest);

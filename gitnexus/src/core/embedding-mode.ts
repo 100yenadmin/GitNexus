@@ -86,8 +86,14 @@ export function preserveOnlyForImplicitForceCap(
   skipForCap: boolean,
   forceRegenerateEmbeddings: boolean,
   embeddingsNodeLimit: number | undefined,
+  explicitEmbeddingRequest: boolean,
 ): boolean {
-  return skipForCap && forceRegenerateEmbeddings && embeddingsNodeLimit === undefined;
+  return (
+    skipForCap &&
+    forceRegenerateEmbeddings &&
+    embeddingsNodeLimit === undefined &&
+    !explicitEmbeddingRequest
+  );
 }
 
 export function deriveEmbeddingMode(

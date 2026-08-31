@@ -1193,10 +1193,11 @@ describe('deriveEmbeddingCap', () => {
   });
 
   it('downgrades only an implicit force top-up to preserve-only recovery', () => {
-    expect(preserveOnlyForImplicitForceCap(true, true, undefined)).toBe(true);
-    expect(preserveOnlyForImplicitForceCap(true, true, 50_000)).toBe(false);
-    expect(preserveOnlyForImplicitForceCap(true, false, undefined)).toBe(false);
-    expect(preserveOnlyForImplicitForceCap(false, true, undefined)).toBe(false);
+    expect(preserveOnlyForImplicitForceCap(true, true, undefined, false)).toBe(true);
+    expect(preserveOnlyForImplicitForceCap(true, true, undefined, true)).toBe(false);
+    expect(preserveOnlyForImplicitForceCap(true, true, 50_000, false)).toBe(false);
+    expect(preserveOnlyForImplicitForceCap(true, false, undefined, false)).toBe(false);
+    expect(preserveOnlyForImplicitForceCap(false, true, undefined, false)).toBe(false);
   });
 });
 

@@ -731,6 +731,7 @@ describe('runFullAnalysis wipe-and-restore vector-index stamp (tri-review 466951
     const wipeLbugDbFiles = vi.fn(async () => undefined);
     const buildVectorIndex = vi.fn(async () => false);
     const executeWithReusedStatement = vi.fn(async () => []);
+    let pdgCsvPath = '';
     vi.doMock('../../src/core/lbug/lbug-adapter.js', () => ({
       initLbug,
       loadGraphToLbug,
@@ -791,7 +792,7 @@ describe('runFullAnalysis wipe-and-restore vector-index stamp (tri-review 466951
         repoPath,
         totalFileCount: 1,
         pdgEmitManifest: {
-          nodeFiles: new Map([['chunk-0', { rows: 1 }]]),
+          nodeFiles: new Map([['chunk-0', { csvPath: pdgCsvPath, rows: 1 }]]),
           relsByPair: new Map(),
         },
         graph: {
@@ -820,6 +821,9 @@ describe('runFullAnalysis wipe-and-restore vector-index stamp (tri-review 466951
     try {
       const { storagePath } = getStoragePaths(tmpRepo.dbPath);
       await fs.mkdir(storagePath, { recursive: true });
+      pdgCsvPath = `${storagePath}/pdg-csv/basicblock.csv`;
+      await fs.mkdir(`${storagePath}/pdg-csv`, { recursive: true });
+      await fs.writeFile(pdgCsvPath, 'id:ID(BasicBlock)\n');
       const originalMeta: RepoMeta = {
         repoPath: tmpRepo.dbPath,
         lastCommit: '',
@@ -844,6 +848,7 @@ describe('runFullAnalysis wipe-and-restore vector-index stamp (tri-review 466951
       expect(wipeLbugDbFiles).not.toHaveBeenCalled();
       expect(buildVectorIndex).not.toHaveBeenCalled();
       expect(executeWithReusedStatement).not.toHaveBeenCalled();
+      await expect(fs.access(pdgCsvPath)).rejects.toMatchObject({ code: 'ENOENT' });
       const meta = JSON.parse(await fs.readFile(`${storagePath}/meta.json`, 'utf-8')) as RepoMeta;
       expect(meta).toEqual(originalMeta);
     } finally {
