@@ -177,11 +177,13 @@ total-graph node cap:
 npx gitnexus analyze --embeddings <n>
 ```
 
-GitNexus refuses the whole embedding pass when the graph has more than `<n>` nodes. When admitted,
-the incremental path rewrites the changed/effective file set, regenerates changed or new embedding
-owners, and retains unaffected logical embedding-row payloads. If the effective write set is large,
-the existing escalation valve may select a full write while retaining the same bounded snapshot and
-restore contract.
+GitNexus refuses the whole embedding pass when the provider-free pipeline reports more than `<n>`
+nodes. Refusal happens before graph persistence, final metadata, registry update, or staged
+promotion; transient pipeline caches or prepared stage recovery files may already exist. When
+admitted, the incremental path rewrites the changed/effective file set, regenerates changed or new
+embedding owners, and retains unaffected logical embedding-row payloads. If the effective write set
+is large, the existing escalation valve may select a full write while retaining the same bounded
+snapshot and restore contract.
 
 For malformed or provenance-unproven embedding state, use an explicit staged clean rebuild:
 

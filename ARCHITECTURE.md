@@ -381,7 +381,9 @@ embedding node cap, `0` disables it), `--staged` (isolated generation plus valid
 ### Bounded embedding preservation and staged recovery
 
 - For a healthy index that is stale against its source, a positive-cap incremental run (`--embeddings <n>`)
-  first admits or refuses the entire embedding pass against the total graph node count. When admitted,
+  first admits or refuses the entire embedding pass against the provider-free pipeline's total graph
+  node count, before graph persistence, final metadata, registry update, or staged promotion. Transient
+  pipeline caches and prepared stage recovery files may already exist. When admitted,
   it rewrites only the changed/effective file set and regenerates changed or new embedding owners.
   Unaffected owners retain their complete logical embedding-row payload. If the effective write set is
   large, the existing escalation valve selects the full-write plan; the bounded snapshot and restore

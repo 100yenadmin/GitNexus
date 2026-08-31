@@ -10,7 +10,9 @@ All notable changes to GitNexus will be documented in this file.
 
 - **Healthy source-stale indexes keep their unchanged embedding payloads on the capped
   incremental path**: run `analyze` with a positive total-graph node cap (`--embeddings <n>`).
-  GitNexus refuses the whole embedding pass when the graph exceeds the cap; when admitted, it
+  GitNexus refuses the whole embedding pass after the provider-free pipeline but before graph
+  persistence, final metadata, registry update, or staged promotion; transient caches or prepared
+  stage recovery files may already exist. When admitted, it
   regenerates changed or new owners while retaining unaffected logical embedding-row payload bytes.
   Large effective write sets may still use the existing full-write escalation while preserving the
   same bounded snapshot contract.

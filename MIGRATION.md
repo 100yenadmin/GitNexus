@@ -118,8 +118,10 @@ There is no embedding-schema migration. The release documents two existing paths
 - A healthy index that is stale against its source can use an incremental run with a positive cap
   on total graph nodes,
   run, `gitnexus analyze --embeddings <n>`. The pass is refused when the graph has more than
-  `<n>` nodes; when admitted, unaffected logical embedding-row payloads remain intact and changed
-  or new owners are regenerated.
+  `<n>` nodes. Refusal happens before graph persistence, final metadata, registry update, or staged
+  promotion, although transient pipeline caches or prepared stage recovery files may already exist.
+  When admitted, unaffected logical embedding-row payloads remain intact and changed or new owners
+  are regenerated.
 - Malformed or provenance-unproven embedding state uses an explicit staged clean rebuild with the
   same positive total-graph cap, `gitnexus analyze --staged --embeddings <n> --drop-embeddings`. The staged generation is
   validated before promotion, and the canonical logical embedding-row and metadata preimage stays
