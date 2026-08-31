@@ -390,8 +390,10 @@ embedding node cap, `0` disables it), `--staged` (isolated generation plus valid
   contract remains the same.
 - For malformed or provenance-unproven embedding state, use an explicit staged clean rebuild with a
   positive cap on total graph nodes (`--staged --embeddings <n> --drop-embeddings`). The staged database is disposable and the
-  canonical generation stays readable until validation and journaled promotion complete. A promotion
-  failure restores the canonical logical embedding-row and metadata preimage.
+  canonical generation stays readable until validation and journaled promotion complete. The injected
+  milestone-10 pre-promotion failure restores the exact canonical logical embedding-row and metadata
+  preimage. A later promotion failure may retain the new metadata, old database backup, and journal so
+  the next analyze can complete the recorded promotion forward.
 - The deterministic M8b proof compares every unaffected embedding-row payload field (identity, owner,
   chunk, line range, content hash, and vector). It proves logical payload-byte preservation on that
   supported path, not unchanged raw LadybugDB container bytes.
