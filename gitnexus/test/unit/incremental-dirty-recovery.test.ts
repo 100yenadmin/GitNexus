@@ -18,8 +18,9 @@
  * Windows.
  */
 
+import { createHash } from 'node:crypto';
 import { writeFile, readFile } from 'fs/promises';
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import {
   getStoragePaths,
   saveMeta,
@@ -31,12 +32,32 @@ import { setupMiniRepo as setupSharedMiniRepo } from '../helpers/mini-repo.js';
 // zero-vector seeding pattern previously lived here as a divergent copy of
 // incremental-orchestration.test.ts's (a helper module has no
 // describe-registration problem, unlike importing a sibling test file).
-import { seedEmbeddingsForFiles } from '../helpers/embedding-seed.js';
+import { readEmbeddingNodeIds, seedEmbeddingsForFiles } from '../helpers/embedding-seed.js';
 
 const setupMiniRepo = () => setupSharedMiniRepo('gitnexus-incr-dirty-rec-');
 
+const EMBEDDING_DIMS = 384;
+const EMBEDDING_ENV_KEYS = [
+  'GITNEXUS_EMBEDDING_URL',
+  'GITNEXUS_EMBEDDING_MODEL',
+  'GITNEXUS_EMBEDDING_DIMS',
+  'GITNEXUS_EMBEDDING_MAX_ATTEMPTS',
+  'GITNEXUS_EMBEDDING_RETRY_CAP_MS',
+  'GITNEXUS_EMBEDDING_MIN_INTERVAL_MS',
+  'GITNEXUS_EMBEDDING_API_KEY',
+] as const;
+
+const deterministicEmbedding = (text: string): number[] => {
+  const digest = createHash('sha256').update(text).digest();
+  return Array.from(
+    { length: EMBEDDING_DIMS },
+    (_, index) => (digest[index % digest.length]! - 128) / 128,
+  );
+};
+
 describe('runFullAnalysis — dirty-flag recovery sidecar parking (#2409)', () => {
   it('parks the crashed run WAL/shadow sidecars before reopening, then rebuilds clean', async () => {
+    const previousEnv = new Map(EMBEDDING_ENV_KEYS.map((key) => [key, process.env[key]] as const));
     const repo = await setupMiniRepo();
     try {
       const { runFullAnalysis } = await import('../../src/core/run-analyze.js');
@@ -79,19 +100,36 @@ describe('runFullAnalysis — dirty-flag recovery sidecar parking (#2409)', () =
       await writeFile(`${lbugPath}.shadow`, shadowGarbage);
 
       const logs: string[] = [];
-      // embeddingsNodeLimit: 1 (KTD9): the recovery runs force:true
-      // internally, and the seeded stats would otherwise route Phase 4 into
-      // a real embedder in CI — the 1-node cap suppresses generation while
-      // leaving the preserve/restore path fully live. On linux the
-      // wipe-and-restore vector-index seam then fires for real (statically
-      // linked VECTOR): a CREATE_VECTOR_INDEX over the restored rows is
-      // expected and harmless here.
+      // Recovery runs force:true internally, so use the same deterministic
+      // in-process HTTP provider as the embedding canaries and admit the
+      // complete fixture with a real positive cap. A below-count cap now
+      // correctly refuses before recovery graph writes; it is no longer a
+      // supported way to suppress generation while continuing the rebuild.
+      process.env.GITNEXUS_EMBEDDING_URL = 'http://in-process.invalid/v1';
+      process.env.GITNEXUS_EMBEDDING_MODEL = 'dirty-recovery-deterministic';
+      process.env.GITNEXUS_EMBEDDING_DIMS = String(EMBEDDING_DIMS);
+      process.env.GITNEXUS_EMBEDDING_MAX_ATTEMPTS = '1';
+      process.env.GITNEXUS_EMBEDDING_RETRY_CAP_MS = '1';
+      process.env.GITNEXUS_EMBEDDING_MIN_INTERVAL_MS = '0';
+      delete process.env.GITNEXUS_EMBEDDING_API_KEY;
+      const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+        const body = JSON.parse(String(init?.body ?? '{}')) as { input?: unknown };
+        const inputs = Array.isArray(body.input) ? body.input.map(String) : [];
+        return new Response(
+          JSON.stringify({
+            data: inputs.map((text) => ({ embedding: deterministicEmbedding(text) })),
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      });
+      vi.stubGlobal('fetch', fetchMock);
       const recovered = await runFullAnalysis(
         repo.dbPath,
-        { skipAgentsMd: true, embeddingsNodeLimit: 1 },
+        { skipAgentsMd: true, embeddingsNodeLimit: 1000 },
         { onProgress: () => {}, onLog: (m) => logs.push(m) },
       );
       expect(recovered.alreadyUpToDate).toBeUndefined();
+      expect(fetchMock).toHaveBeenCalled();
 
       // Both sidecars were parked verbatim (renamed, never deleted) before
       // any open could replay them…
@@ -109,17 +147,21 @@ describe('runFullAnalysis — dirty-flag recovery sidecar parking (#2409)', () =
       expect(joinedLogs).toContain(
         `--force on a repo with ${seededNodeIds.length} existing embeddings`,
       );
-      // …with generation itself cap-suppressed (no embedder in CI):
-      expect(joinedLogs).toContain('exceeds the 1-node safety cap');
-
       // …and the rebuild completed into a clean index: dirty flag cleared,
       // and the seeded embeddings survived the park → open → wipe → restore
       // round-trip (the strongest signal the preservation open really ran:
       // the DB was wiped, so these rows can only come from the cache load).
       const after = await loadMeta(storagePath);
       expect(after!.incrementalInProgress).toBeUndefined();
-      expect(after!.stats?.embeddings).toBe(seededNodeIds.length);
+      const recoveredNodeIds = await readEmbeddingNodeIds(repo.dbPath);
+      expect(seededNodeIds.every((nodeId) => recoveredNodeIds.includes(nodeId))).toBe(true);
+      expect(after!.stats?.embeddings).toBe(recoveredNodeIds.length);
     } finally {
+      vi.unstubAllGlobals();
+      for (const [key, value] of previousEnv) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
       await repo.cleanup();
     }
   }, 300_000);
