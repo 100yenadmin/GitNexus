@@ -45,6 +45,7 @@ import {
   type EmbeddingIntegrityReport,
 } from './lbug/lbug-adapter.js';
 import { estimateBufferPool, setBufferPoolSizeHint } from './lbug/lbug-config.js';
+import { cleanupPdgEmitManifestFiles } from './lbug/pdg-emit-sink.js';
 import { escapeCypherString } from './lbug/cypher-escape.js';
 import {
   createSearchFTSIndexes,
@@ -2411,6 +2412,7 @@ const runFullAnalysisImpl = async (
       options.embeddingsNodeLimit,
     );
     if (skipForCap && !preserveOnlyForRecovery) {
+      cleanupPdgEmitManifestFiles(pipelineResult.pdgEmitManifest);
       throw new Error(
         `Embedding generation refused: ${embeddingAdmissionNodeCount.toLocaleString()} nodes exceeds ` +
           `the ${nodeLimit.toLocaleString()}-node safety cap. ` +

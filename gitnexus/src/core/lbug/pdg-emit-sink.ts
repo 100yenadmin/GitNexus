@@ -185,6 +185,39 @@ export interface PdgEmitManifest {
 }
 
 /**
+ * Remove only the temporary CSV files named by a completed PDG emit manifest.
+ * Cap admission happens after the provider-free pipeline so a refused run can
+ * otherwise leave a large streamed PDG layer behind. The manifest files are
+ * not recovery artifacts: a retry always re-emits them. Cleanup is best-effort
+ * because the original admission refusal remains the primary error.
+ */
+export function cleanupPdgEmitManifestFiles(manifest: PdgEmitManifest | undefined): void {
+  if (!manifest) return;
+
+  const directories = new Set<string>();
+  const files = new Set<string>();
+  for (const { csvPath } of manifest.nodeFiles.values()) files.add(csvPath);
+  for (const { csvPath } of manifest.relsByPair.values()) files.add(csvPath);
+
+  for (const csvPath of files) {
+    directories.add(path.dirname(csvPath));
+    try {
+      fs.unlinkSync(csvPath);
+    } catch {
+      // Best-effort: preserve the cap-refusal error and never widen deletion
+      // beyond the exact manifest paths.
+    }
+  }
+  for (const directory of directories) {
+    try {
+      fs.rmdirSync(directory);
+    } catch {
+      // A non-empty directory may contain unrelated data; leave it intact.
+    }
+  }
+}
+
+/**
  * Write-routing graph façade. Construct one per analyze run, thread it into the
  * per-language `runScopeResolution` calls in place of the real graph during the
  * `--pdg` emit, then {@link finalize} once after the last language.
