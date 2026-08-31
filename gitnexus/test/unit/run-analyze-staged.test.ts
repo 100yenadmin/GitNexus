@@ -218,6 +218,59 @@ describe('runFullAnalysis --staged', () => {
     await expect(fs.access(staged.stageRoot)).rejects.toMatchObject({ code: 'ENOENT' });
   }, 120_000);
 
+  it('refuses an over-cap staged rebuild before canonical mutation or promotion', async () => {
+    const repo = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-staged-cap-refusal-'));
+    tempDirs.push(repo);
+    process.env.GITNEXUS_HOME = path.join(repo, '.registry-home');
+    process.env.GITNEXUS_EMBEDDING_URL = 'http://test.invalid/v1';
+    process.env.GITNEXUS_EMBEDDING_MODEL = 'cap-refusal-test';
+    process.env.GITNEXUS_EMBEDDING_DIMS = String(EMBEDDING_DIMS);
+    const fetchMock = vi.fn(async () => {
+      throw new Error('provider must not be called on cap refusal');
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    await fs.writeFile(
+      path.join(repo, 'index.ts'),
+      'export function stagedCapRefusal() { return 1; }\n',
+    );
+    execFileSync('git', ['init'], { cwd: repo });
+    execFileSync('git', ['add', 'index.ts'], { cwd: repo });
+    execFileSync(
+      'git',
+      ['-c', 'user.name=test', '-c', 'user.email=test@test', 'commit', '-m', 'initial'],
+      { cwd: repo },
+    );
+
+    await runFullAnalysis(repo, { skipAgentsMd: true, skipSkills: true }, { onProgress: () => {} });
+    const canonical = getStoragePaths(repo);
+    const canonicalDbBefore = await fs.readFile(canonical.lbugPath);
+    const canonicalMetaBefore = await fs.readFile(path.join(canonical.storagePath, 'meta.json'));
+    const staged = getStagedAnalyzePaths(canonical.lbugPath, canonical.storagePath);
+
+    await expect(
+      runFullAnalysis(
+        repo,
+        {
+          staged: true,
+          embeddings: true,
+          embeddingsNodeLimit: 1,
+          dropEmbeddings: true,
+          skipAgentsMd: true,
+          skipSkills: true,
+        },
+        { onProgress: () => {} },
+      ),
+    ).rejects.toThrow(/Embedding generation refused: .* exceeds the 1-node safety cap/i);
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(await fs.readFile(canonical.lbugPath)).toEqual(canonicalDbBefore);
+    expect(await fs.readFile(path.join(canonical.storagePath, 'meta.json'))).toEqual(
+      canonicalMetaBefore,
+    );
+    await expect(fs.access(staged.backupLbugPath)).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(fs.access(staged.journalPath)).rejects.toMatchObject({ code: 'ENOENT' });
+  }, 120_000);
+
   it('never resumes a staged embedding checkpoint without an explicit clean rebuild', async () => {
     const repo = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-staged-checkpoint-refusal-'));
     tempDirs.push(repo);

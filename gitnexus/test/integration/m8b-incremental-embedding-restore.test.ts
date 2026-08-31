@@ -194,4 +194,75 @@ describe('M8b incremental embedding restore', () => {
       vi.unstubAllGlobals();
     }
   }, 180_000);
+
+  it('refuses an over-cap incremental run before canonical graph or metadata mutation', async () => {
+    const previousEnv = new Map(EMBEDDING_ENV_KEYS.map((key) => [key, process.env[key]] as const));
+    const home = await mkdtemp(path.join(os.tmpdir(), 'gitnexus-cap-refusal-home-'));
+    const repo = await setupMiniRepo('gitnexus-cap-refusal-');
+    try {
+      process.env.GITNEXUS_HOME = home;
+      process.env.GITNEXUS_LBUG_EXTENSION_INSTALL = 'never';
+      process.env.GITNEXUS_EMBEDDING_URL = 'http://in-process.invalid/v1';
+      process.env.GITNEXUS_EMBEDDING_MODEL = 'cap-refusal-test';
+      process.env.GITNEXUS_EMBEDDING_DIMS = String(EMBEDDING_DIMS);
+      process.env.GITNEXUS_EMBEDDING_MAX_ATTEMPTS = '1';
+      process.env.GITNEXUS_EMBEDDING_RETRY_CAP_MS = '1';
+      process.env.GITNEXUS_EMBEDDING_MIN_INTERVAL_MS = '0';
+      delete process.env.GITNEXUS_EMBEDDING_API_KEY;
+      const fetchMock = vi.fn(async () => {
+        throw new Error('provider must not be called on cap refusal');
+      });
+      vi.stubGlobal('fetch', fetchMock);
+
+      const { runFullAnalysis } = await import('../../src/core/run-analyze.js');
+      await runFullAnalysis(
+        repo.dbPath,
+        { skipAgentsMd: true, skipSkills: true },
+        { onProgress: () => {} },
+      );
+
+      const { lbugPath, storagePath } = getStoragePaths(repo.dbPath);
+      const graphBefore = await readFile(lbugPath);
+      const metaPath = path.join(storagePath, 'meta.json');
+      const metaBefore = await readFile(metaPath);
+
+      const handlerPath = path.join(repo.dbPath, 'src', 'handler.ts');
+      const handlerSource = await readFile(handlerPath, 'utf8');
+      await writeFile(
+        handlerPath,
+        handlerSource.replace(
+          'return formatResponse(saved);',
+          "return formatResponse(saved) + ' cap-refusal';",
+        ),
+        'utf8',
+      );
+      gitCommitAll(repo.dbPath, 'cap refusal source delta');
+
+      await expect(
+        runFullAnalysis(
+          repo.dbPath,
+          {
+            incrementalOnly: true,
+            skipAgentsMd: true,
+            skipSkills: true,
+            embeddings: true,
+            embeddingsNodeLimit: 1,
+          },
+          { onProgress: () => {} },
+        ),
+      ).rejects.toThrow(/Embedding generation refused: .* exceeds the 1-node safety cap/i);
+
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(await readFile(lbugPath)).toEqual(graphBefore);
+      expect(await readFile(metaPath)).toEqual(metaBefore);
+    } finally {
+      await repo.cleanup();
+      await rm(home, { recursive: true, force: true });
+      for (const [key, value] of previousEnv) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      vi.unstubAllGlobals();
+    }
+  }, 120_000);
 });

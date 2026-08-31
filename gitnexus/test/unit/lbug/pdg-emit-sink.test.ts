@@ -17,7 +17,7 @@ import path from 'node:path';
 
 import { createKnowledgeGraph } from '../../../src/core/graph/graph.js';
 import { streamAllCSVsToDisk, buildBasicBlockRow } from '../../../src/core/lbug/csv-generator.js';
-import { PdgEmitSink } from '../../../src/core/lbug/pdg-emit-sink.js';
+import { cleanupPdgEmitManifestFiles, PdgEmitSink } from '../../../src/core/lbug/pdg-emit-sink.js';
 import type { GraphNode, GraphRelationship } from 'gitnexus-shared';
 
 const bbNode = (fp: string, idx: number, line: number): GraphNode => ({
@@ -61,6 +61,26 @@ afterEach(() => {
 });
 
 describe('PdgEmitSink — routing', () => {
+  it('removes only exact manifest files after a pre-COPY refusal', () => {
+    const pdgDir = path.join(tmpRoot, 'pdg-csv');
+    const real = createKnowledgeGraph();
+    const sink = new PdgEmitSink(real, pdgDir);
+    sink.addNode(bbNode('a.ts', 0, 1));
+    sink.addNode(bbNode('a.ts', 1, 5));
+    sink.addRelationship(pdgEdge('a.ts', 0, 1, 'CFG', 'seq'));
+    const manifest = sink.finalize();
+    const unrelated = path.join(pdgDir, 'unrelated.keep');
+    fs.writeFileSync(unrelated, 'keep');
+
+    cleanupPdgEmitManifestFiles(manifest);
+
+    for (const { csvPath } of manifest.nodeFiles.values())
+      expect(fs.existsSync(csvPath)).toBe(false);
+    for (const { csvPath } of manifest.relsByPair.values())
+      expect(fs.existsSync(csvPath)).toBe(false);
+    expect(fs.readFileSync(unrelated, 'utf8')).toBe('keep');
+  });
+
   it('routes BasicBlock nodes and PDG edges to CSV, never to the real graph', () => {
     const real = createKnowledgeGraph();
     const sink = new PdgEmitSink(real, path.join(tmpRoot, 'pdg-csv'));

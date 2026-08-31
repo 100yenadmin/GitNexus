@@ -110,3 +110,25 @@ repo as never analyzed.
 
 The `meta.json` mirror will remain until a future major version. Removal
 will be announced in this file and in the changelog before it happens.
+
+## Bounded embedding preservation and staged recovery (`1.6.10-electric.11`)
+
+There is no embedding-schema migration. The release documents two existing paths:
+
+- A healthy index that is stale against its source can use an incremental run with a positive cap
+  on total graph nodes,
+  run, `gitnexus analyze --embeddings <n>`. The pass is refused when the graph has more than
+  `<n>` nodes. Refusal happens before graph persistence, final metadata, registry update, or staged
+  promotion, although transient pipeline caches or prepared stage recovery files may already exist.
+  When admitted, unaffected logical embedding-row payloads remain intact and changed or new owners
+  are regenerated.
+- Malformed or provenance-unproven embedding state uses an explicit staged clean rebuild with the
+  same positive total-graph cap, `gitnexus analyze --staged --embeddings <n> --drop-embeddings`. The staged generation is
+  validated before promotion, and the canonical logical embedding-row and metadata preimage stays
+  available for journaled rollback.
+
+Rows inherited from metadata without durable provider or identity proof remain unproven. They are
+not called verified preservation; the clean staged rebuild is the replacement path for that state.
+The deterministic proof covers logical row payloads, not raw LadybugDB container bytes. Existing
+`1.6.10-electric.10` installation bytes remain suitable for non-writing rollback while `.11`
+release and runtime steps are handled separately.

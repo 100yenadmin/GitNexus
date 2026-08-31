@@ -362,19 +362,43 @@ Inheritance is captured by the `@reference.inherits` tag and emitted by the scop
 
 ```
 CLI (analyze.ts) → runFullAnalysis(repoPath, options, callbacks)
-  1. Early exit if lastCommit == HEAD (unless --force)     [0%]
-  2. Cache existing embeddings from prior index             [0%]
-  3. runPipelineFromRepo() → KnowledgeGraph                [0-60%]
-  4. Clean up legacy KuzuDB files                          [60%]
-  5. initLbug() → loadGraphToLbug() via CSV streaming      [60-85%]
-  6. Create FTS indexes (File, Function, Class, Method...) [85-90%]
-  7. Restore cached embeddings (batch insert)              [88%]
-  8. Generate new embeddings if --embeddings               [90-98%]
-  9. Save metadata + register repo + update .gitignore     [98-100%]
- 10. Generate AI context files (AGENTS.md, CLAUDE.md)      [100%]
+  1. Early exit if lastCommit == HEAD (unless --force)                 [0%]
+  2. Read metadata and select surgical incremental, full, or staged    [0%]
+  3. Capture a bounded embedding snapshot when a rebuild needs restore [0%]
+  4. runPipelineFromRepo() → KnowledgeGraph                            [0-60%]
+  5. Write changed rows surgically, or wipe + bulk-COPY a full graph   [60-85%]
+  6. Create FTS indexes (File, Function, Class, Method...)              [85-90%]
+  7. Restore cached embeddings in bounded batches                        [88%]
+  8. Generate new embeddings within the requested cap                    [90-98%]
+  9. Validate, save metadata, register repo, and update .gitignore       [98-100%]
+ 10. Generate AI context files (AGENTS.md, CLAUDE.md)                    [100%]
 ```
 
-**Options:** `--force` (rebuild regardless), `--embeddings` (opt-in, skipped if >50k nodes), `--skipGit`, `--noStats`.
+**Options:** `--force` (rebuild regardless), `--embeddings [n]` (opt-in; a positive `n` is the
+embedding node cap, `0` disables it), `--staged` (isolated generation plus validated promotion),
+`--skipGit`, `--noStats`.
+
+### Bounded embedding preservation and staged recovery
+
+- For a healthy index that is stale against its source, a positive-cap incremental run (`--embeddings <n>`)
+  first admits or refuses the entire embedding pass against the provider-free pipeline's total graph
+  node count, before graph persistence, final metadata, registry update, or staged promotion. Transient
+  pipeline caches and prepared stage recovery files may already exist. When admitted,
+  it rewrites only the changed/effective file set and regenerates changed or new embedding owners.
+  Unaffected owners retain their complete logical embedding-row payload. If the effective write set is
+  large, the existing escalation valve selects the full-write plan; the bounded snapshot and restore
+  contract remains the same.
+- For malformed or provenance-unproven embedding state, use an explicit staged clean rebuild with a
+  positive cap on total graph nodes (`--staged --embeddings <n> --drop-embeddings`). The staged database is disposable and the
+  canonical generation stays readable until validation and journaled promotion complete. The injected
+  milestone-10 pre-promotion failure restores the exact canonical logical embedding-row and metadata
+  preimage. A later promotion failure may retain the new metadata, old database backup, and journal so
+  the next analyze can complete the recorded promotion forward.
+- The deterministic M8b proof compares every unaffected embedding-row payload field (identity, owner,
+  chunk, line range, content hash, and vector). It proves logical payload-byte preservation on that
+  supported path, not unchanged raw LadybugDB container bytes.
+- Legacy rows whose metadata lacks durable provider or identity proof remain unproven and are not
+  described as verified preservation. A clean staged rebuild replaces that unclassified state.
 
 ## Storage
 
@@ -385,6 +409,8 @@ CLI (analyze.ts) → runFullAnalysis(repoPath, options, callbacks)
   ├── lbug.shadow    # Shadow sidecar (checkpoint staging)
   ├── lbug.lock      # Single-writer lock
   ├── lbug.{wal,shadow}.dirty-recovery  # parked sidecars from a crashed run; safe to delete
+  ├── embedding-preservation.jsonl         # transient checksummed restore snapshot
+  ├── embedding-table-rebuild.json         # transient staged-table recovery marker
   ├── gitnexus.json  # lastCommit, indexedAt, stats (primary metadata file)
   └── meta.json      # legacy mirror of gitnexus.json, kept in sync (see MIGRATION.md)
 

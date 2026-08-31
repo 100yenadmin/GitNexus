@@ -45,6 +45,7 @@ import {
   type EmbeddingIntegrityReport,
 } from './lbug/lbug-adapter.js';
 import { estimateBufferPool, setBufferPoolSizeHint } from './lbug/lbug-config.js';
+import { cleanupPdgEmitManifestFiles } from './lbug/pdg-emit-sink.js';
 import { escapeCypherString } from './lbug/cypher-escape.js';
 import {
   createSearchFTSIndexes,
@@ -545,6 +546,7 @@ export type { EmbeddingMode } from './embedding-mode.js';
 import {
   deriveEmbeddingMode as _deriveEmbeddingMode,
   deriveEmbeddingCap,
+  preserveOnlyForImplicitForceCap,
   resolveEmbeddingNodeLimit,
   DEFAULT_EMBEDDING_NODE_LIMIT,
 } from './embedding-mode.js';
@@ -2368,6 +2370,90 @@ const runFullAnalysisImpl = async (
     },
   );
 
+  const streamedPdgNodeRows = pipelineResult.pdgEmitManifest
+    ? [...pipelineResult.pdgEmitManifest.nodeFiles.values()].reduce(
+        (total, entry) => total + entry.rows,
+        0,
+      )
+    : 0;
+  const streamedPdgRelationshipRows = pipelineResult.pdgEmitManifest
+    ? [...pipelineResult.pdgEmitManifest.relsByPair.values()].reduce(
+        (total, entry) => total + entry.rows,
+        0,
+      )
+    : 0;
+  const streamedPdgRows = streamedPdgNodeRows + streamedPdgRelationshipRows;
+
+  // Explicit embedding requests and positive caps are all-or-nothing
+  // admission gates, not requests to finish the graph write without semantic
+  // rows. The sole exception is automatic force recovery above the implicit
+  // local cap, which may restore cached vectors in preserve-only mode. Settle
+  // the decision immediately after the provider-free pipeline has produced
+  // the complete
+  // prospective node count and before any LadybugDB, metadata, registry, or
+  // staged-promotion write begins. Pipeline cache reconciliation and prepared
+  // staging files may already exist; the refusal deliberately preserves them
+  // for the existing recovery path.
+  let embeddingSkipped = true;
+  let semanticMode: 'vector-index' | 'exact-scan' | undefined;
+  let httpMode = false;
+  if (shouldGenerateEmbeddings) {
+    const { isHttpMode } = await import('./embeddings/http-client.js');
+    httpMode = isHttpMode();
+    const embeddingAdmissionNodeCount = pipelineResult.graph.nodeCount + streamedPdgNodeRows;
+    const { skipForCap, capDisabled, nodeLimit } = deriveEmbeddingCap(
+      embeddingAdmissionNodeCount,
+      resolveEmbeddingNodeLimit(options.embeddingsNodeLimit, resumeEmbeddingCheckpoint),
+      httpMode,
+    );
+    const preserveOnlyForRecovery = preserveOnlyForImplicitForceCap(
+      skipForCap,
+      forceRegenerateEmbeddings,
+      options.embeddingsNodeLimit,
+      options.embeddings === true,
+    );
+    if (skipForCap && !preserveOnlyForRecovery) {
+      cleanupPdgEmitManifestFiles(pipelineResult.pdgEmitManifest);
+      throw new Error(
+        `Embedding generation refused: ${embeddingAdmissionNodeCount.toLocaleString()} nodes exceeds ` +
+          `the ${nodeLimit.toLocaleString()}-node safety cap. ` +
+          'No analyze graph write, final metadata commit, or staged promotion was started. ' +
+          'Retry with `--embeddings 0` or a limit covering the full graph.',
+      );
+    }
+
+    if (preserveOnlyForRecovery) {
+      log(
+        `Automatic embedding regeneration exceeds the implicit ${nodeLimit.toLocaleString()}-node ` +
+          'local-model safety cap; continuing recovery in preserve-only mode with cached vectors. ' +
+          'Use an explicit positive `--embeddings <n>` cap to admit regeneration.',
+      );
+    } else {
+      embeddingSkipped = false;
+    }
+    if (
+      !preserveOnlyForRecovery &&
+      capDisabled &&
+      embeddingAdmissionNodeCount > DEFAULT_EMBEDDING_NODE_LIMIT
+    ) {
+      if (httpMode) {
+        log(
+          `Remote embedding endpoint selected — generating embeddings for ` +
+            `${embeddingAdmissionNodeCount.toLocaleString()} nodes; the ` +
+            `${DEFAULT_EMBEDDING_NODE_LIMIT.toLocaleString()}-node local-model cap ` +
+            `does not apply.`,
+        );
+      } else {
+        log(
+          `Embedding node-count cap disabled — generating embeddings for ` +
+            `${embeddingAdmissionNodeCount.toLocaleString()} nodes. Ensure sufficient memory; the ` +
+            `default ${DEFAULT_EMBEDDING_NODE_LIMIT.toLocaleString()}-node local-model ` +
+            `cap exists to prevent OOM.`,
+        );
+      }
+    }
+  }
+
   // ── Phase 2: LadybugDB (60–85%) ──────────────────────────────────
   progress('lbug', 60, 'Loading into LadybugDB...');
 
@@ -2464,12 +2550,6 @@ const runFullAnalysisImpl = async (
     await wipeLbugDbFiles(lbugPath);
   }
 
-  const streamedPdgRows = pipelineResult.pdgEmitManifest
-    ? [
-        ...pipelineResult.pdgEmitManifest.nodeFiles.values(),
-        ...pipelineResult.pdgEmitManifest.relsByPair.values(),
-      ].reduce((total, entry) => total + entry.rows, 0)
-    : 0;
   setBufferPoolSizeHint(
     estimateBufferPool(
       pipelineResult.graph.nodeCount + pipelineResult.graph.relationshipCount + streamedPdgRows,
@@ -2937,50 +3017,10 @@ const runFullAnalysisImpl = async (
       progress('fts', 90, 'Search indexes skipped (FTS unavailable)');
     }
 
-    // Settle embedding admission before streaming the snapshot. Exact row-ID
-    // sidecars are needed only when Phase 4 will run; preserve-only and
-    // cap-refused analyses must keep the snapshot pass bounded to its batches.
+    // Exact row-ID sidecars are needed only when Phase 4 will run; preserve-only
+    // analyses keep the snapshot pass bounded to its batches. Explicit positive
+    // cap refusal already terminated before Phase 2.
     const stats = await getLbugStats();
-    let embeddingSkipped = true;
-    let semanticMode: 'vector-index' | 'exact-scan' | undefined;
-    let httpMode = false;
-
-    if (shouldGenerateEmbeddings) {
-      const { isHttpMode } = await import('./embeddings/http-client.js');
-      httpMode = isHttpMode();
-      const { skipForCap, capDisabled, nodeLimit } = deriveEmbeddingCap(
-        stats.nodes,
-        resolveEmbeddingNodeLimit(options.embeddingsNodeLimit, resumeEmbeddingCheckpoint),
-        httpMode,
-      );
-      if (!skipForCap) {
-        embeddingSkipped = false;
-        if (capDisabled && stats.nodes > DEFAULT_EMBEDDING_NODE_LIMIT) {
-          if (httpMode) {
-            log(
-              `Remote embedding endpoint selected — generating embeddings for ` +
-                `${stats.nodes.toLocaleString()} nodes; the ` +
-                `${DEFAULT_EMBEDDING_NODE_LIMIT.toLocaleString()}-node local-model cap ` +
-                `does not apply.`,
-            );
-          } else {
-            log(
-              `Embedding node-count cap disabled — generating embeddings for ` +
-                `${stats.nodes.toLocaleString()} nodes. Ensure sufficient memory; the ` +
-                `default ${DEFAULT_EMBEDDING_NODE_LIMIT.toLocaleString()}-node local-model ` +
-                `cap exists to prevent OOM.`,
-            );
-          }
-        }
-      } else {
-        log(
-          `Embeddings skipped: ${stats.nodes.toLocaleString()} nodes exceeds ` +
-            `the ${nodeLimit.toLocaleString()}-node safety cap. ` +
-            `Override with \`--embeddings 0\` to disable the cap, or ` +
-            `\`--embeddings <n>\` to set a custom cap.`,
-        );
-      }
-    }
 
     // ── Phase 3.5: Re-insert cached embeddings ────────────────────────
     // Runs on BOTH the full-rebuild path and the incremental path:

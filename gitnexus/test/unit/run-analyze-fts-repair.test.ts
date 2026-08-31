@@ -718,7 +718,7 @@ describe('runFullAnalysis wipe-and-restore vector-index stamp (tri-review 466951
     vi.unstubAllEnvs();
   });
 
-  it('stamps capabilities.vectorSearch.status = exact-scan when post-restore index recreation reports failure', async () => {
+  it('refuses an over-cap rebuild before graph writes or cached-row restoration', async () => {
     const RESTORED_NODE_ID = 'Function:src/app.ts:handler:1';
     const stubNode = {
       id: RESTORED_NODE_ID,
@@ -726,11 +726,15 @@ describe('runFullAnalysis wipe-and-restore vector-index stamp (tri-review 466951
       name: 'handler',
       properties: { filePath: 'src/app.ts' },
     };
+    const initLbug = vi.fn(async () => undefined);
+    const loadGraphToLbug = vi.fn(async () => undefined);
+    const wipeLbugDbFiles = vi.fn(async () => undefined);
     const buildVectorIndex = vi.fn(async () => false);
     const executeWithReusedStatement = vi.fn(async () => []);
+    let pdgCsvPath = '';
     vi.doMock('../../src/core/lbug/lbug-adapter.js', () => ({
-      initLbug: vi.fn(async () => undefined),
-      loadGraphToLbug: vi.fn(async () => undefined),
+      initLbug,
+      loadGraphToLbug,
       getLbugStats: vi.fn(async () => ({ nodes: 2, edges: 0, communities: 0, processes: 0 })),
       // The finalize embedding count answers 1 (the restored row) — a zero
       // count would stamp 'unavailable' and the exact-scan assertion below
@@ -747,7 +751,7 @@ describe('runFullAnalysis wipe-and-restore vector-index stamp (tri-review 466951
       embeddingIntegrityFailures: vi.fn(() => 0),
       // Full-rebuild wipe is loud now (#2409, tri-review 4669518496 P2-4) —
       // run-analyze calls this on every full-path analyze.
-      wipeLbugDbFiles: vi.fn(async () => undefined),
+      wipeLbugDbFiles,
       // ≥1 cached row with a real-dims embedding: the harness default (empty
       // cache) would leave restoredEmbeddingCount at 0 and the recreation
       // gate shut — this test would then assert nothing.
@@ -787,7 +791,13 @@ describe('runFullAnalysis wipe-and-restore vector-index stamp (tri-review 466951
       runPipelineFromRepo: vi.fn(async (repoPath: string) => ({
         repoPath,
         totalFileCount: 1,
+        pdgEmitManifest: {
+          nodeFiles: new Map([['chunk-0', { csvPath: pdgCsvPath, rows: 1 }]]),
+          relsByPair: new Map(),
+        },
         graph: {
+          nodeCount: 1,
+          relationshipCount: 0,
           forEachNode: (fn: (node: typeof stubNode) => void) => fn(stubNode),
           getNode: (id: string) => (id === RESTORED_NODE_ID ? stubNode : undefined),
         },
@@ -811,35 +821,36 @@ describe('runFullAnalysis wipe-and-restore vector-index stamp (tri-review 466951
     try {
       const { storagePath } = getStoragePaths(tmpRepo.dbPath);
       await fs.mkdir(storagePath, { recursive: true });
-      // stats.embeddings > 0 → deriveEmbeddingMode loads the cache; force +
-      // embeddingsNodeLimit(1) < getLbugStats().nodes(2) → generation is
-      // cap-skipped. That makes this a wiped PRESERVE-shaped run — exactly
-      // the KTD1 case where a naive `!shouldGenerateEmbeddings` gate would
-      // wrongly stay shut (shouldGenerate is TRUE here, yet the Phase 4
-      // pipeline never runs).
-      await saveMeta(storagePath, {
+      pdgCsvPath = `${storagePath}/pdg-csv/basicblock.csv`;
+      await fs.mkdir(`${storagePath}/pdg-csv`, { recursive: true });
+      await fs.writeFile(pdgCsvPath, 'id:ID(BasicBlock)\n');
+      const originalMeta: RepoMeta = {
         repoPath: tmpRepo.dbPath,
         lastCommit: '',
         indexedAt: new Date().toISOString(),
         stats: { embeddings: 1 },
-      });
+      };
+      await saveMeta(storagePath, originalMeta);
 
       const { runFullAnalysis } = await import('../../src/core/run-analyze.js');
-      await runFullAnalysis(
-        tmpRepo.dbPath,
-        { force: true, embeddingsNodeLimit: 1 },
-        { onProgress: () => {} },
-      );
+      await expect(
+        runFullAnalysis(
+          tmpRepo.dbPath,
+          { force: true, embeddingsNodeLimit: 1 },
+          { onProgress: () => {} },
+        ),
+      ).rejects.toThrow(/Embedding generation refused: 2 nodes exceeds the 1-node safety cap/i);
 
-      // The recreation seam fired exactly once…
-      expect(buildVectorIndex).toHaveBeenCalledTimes(1);
-      // …the restore actually submitted the cached row (one 200-row batch)…
-      expect(executeWithReusedStatement).toHaveBeenCalledTimes(1);
-      // …and the persisted stamp reflects the DB's ACTUAL state, not the
-      // platform capability fallback.
+      // The bounded pre-pipeline embedding snapshot may open the existing DB.
+      // Refusal must still happen before any graph load, wipe, or restore write.
+      expect(initLbug).toHaveBeenCalledTimes(1);
+      expect(loadGraphToLbug).not.toHaveBeenCalled();
+      expect(wipeLbugDbFiles).not.toHaveBeenCalled();
+      expect(buildVectorIndex).not.toHaveBeenCalled();
+      expect(executeWithReusedStatement).not.toHaveBeenCalled();
+      await expect(fs.access(pdgCsvPath)).rejects.toMatchObject({ code: 'ENOENT' });
       const meta = JSON.parse(await fs.readFile(`${storagePath}/meta.json`, 'utf-8')) as RepoMeta;
-      expect(meta.capabilities?.vectorSearch.status).toBe('exact-scan');
-      expect(meta.stats?.embeddings).toBe(1);
+      expect(meta).toEqual(originalMeta);
     } finally {
       await tmpRepo.cleanup();
     }
