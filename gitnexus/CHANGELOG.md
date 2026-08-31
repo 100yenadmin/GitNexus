@@ -8,6 +8,10 @@ All notable changes to GitNexus will be documented in this file.
 
 ### Changed
 
+- **Milestone 9 writer and Doctor protections now ship in the artifact**: supported writers share
+  canonical analyze ownership; registry projections use owner/generation compare-and-swap and
+  recovery-safe implicit branch adoption; Doctor adds registry, freshness, identity, integrity,
+  readiness, and strict exit-status reporting.
 - **Healthy source-stale indexes keep their unchanged embedding payloads on the capped
   incremental path**: run `analyze` with a positive total-graph node cap (`--embeddings <n>`).
   GitNexus refuses the whole embedding pass after the provider-free pipeline but before graph
@@ -18,10 +22,15 @@ All notable changes to GitNexus will be documented in this file.
   same bounded snapshot contract.
 - **Malformed or provenance-unproven indexes use an explicit capped staged clean rebuild**:
   `--staged --embeddings <n> --drop-embeddings` builds an isolated generation, keeps the
-  canonical generation untouched until validation and promotion, and retains the canonical
-  logical embedding-row and metadata preimage for journaled rollback on a promotion failure.
+  canonical generation untouched until validation and promotion. The journal and canonical
+  database backup support rollback or forward recovery; only the injected milestone 10 boundary
+  proved exact logical metadata-and-row restoration, not every later promotion failure.
 - Rows from older metadata that lack durable provider or identity proof remain unclassified;
-  they are not described as verified preservation.
+  they are not described as verified preservation. Doctor structural health is not provider
+  provenance; incremental admission requires separately recorded provider/model/dimensions proof.
+- Automatic `--force` recovery above the implicit local 50,000-node cap continues in
+  preserve-only mode with cached vectors. Explicit embedding requests and explicit positive caps
+  remain all-or-nothing refusal gates.
 
 ### Release boundary
 

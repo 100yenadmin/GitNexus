@@ -545,6 +545,7 @@ export type { EmbeddingMode } from './embedding-mode.js';
 import {
   deriveEmbeddingMode as _deriveEmbeddingMode,
   deriveEmbeddingCap,
+  preserveOnlyForImplicitForceCap,
   resolveEmbeddingNodeLimit,
   DEFAULT_EMBEDDING_NODE_LIMIT,
 } from './embedding-mode.js';
@@ -2382,9 +2383,12 @@ const runFullAnalysisImpl = async (
     : 0;
   const streamedPdgRows = streamedPdgNodeRows + streamedPdgRelationshipRows;
 
-  // An explicit positive embedding cap is an all-or-nothing admission gate,
-  // not a request to finish the graph write without semantic rows. Settle it
-  // immediately after the provider-free pipeline has produced the complete
+  // Explicit embedding requests and positive caps are all-or-nothing
+  // admission gates, not requests to finish the graph write without semantic
+  // rows. The sole exception is automatic force recovery above the implicit
+  // local cap, which may restore cached vectors in preserve-only mode. Settle
+  // the decision immediately after the provider-free pipeline has produced
+  // the complete
   // prospective node count and before any LadybugDB, metadata, registry, or
   // staged-promotion write begins. Pipeline cache reconciliation and prepared
   // staging files may already exist; the refusal deliberately preserves them
@@ -2401,7 +2405,12 @@ const runFullAnalysisImpl = async (
       resolveEmbeddingNodeLimit(options.embeddingsNodeLimit, resumeEmbeddingCheckpoint),
       httpMode,
     );
-    if (skipForCap) {
+    const preserveOnlyForRecovery = preserveOnlyForImplicitForceCap(
+      skipForCap,
+      forceRegenerateEmbeddings,
+      options.embeddingsNodeLimit,
+    );
+    if (skipForCap && !preserveOnlyForRecovery) {
       throw new Error(
         `Embedding generation refused: ${embeddingAdmissionNodeCount.toLocaleString()} nodes exceeds ` +
           `the ${nodeLimit.toLocaleString()}-node safety cap. ` +
@@ -2410,8 +2419,20 @@ const runFullAnalysisImpl = async (
       );
     }
 
-    embeddingSkipped = false;
-    if (capDisabled && embeddingAdmissionNodeCount > DEFAULT_EMBEDDING_NODE_LIMIT) {
+    if (preserveOnlyForRecovery) {
+      log(
+        `Automatic embedding regeneration exceeds the implicit ${nodeLimit.toLocaleString()}-node ` +
+          'local-model safety cap; continuing recovery in preserve-only mode with cached vectors. ' +
+          'Use an explicit positive `--embeddings <n>` cap to admit regeneration.',
+      );
+    } else {
+      embeddingSkipped = false;
+    }
+    if (
+      !preserveOnlyForRecovery &&
+      capDisabled &&
+      embeddingAdmissionNodeCount > DEFAULT_EMBEDDING_NODE_LIMIT
+    ) {
       if (httpMode) {
         log(
           `Remote embedding endpoint selected — generating embeddings for ` +

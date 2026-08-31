@@ -5,6 +5,7 @@ import { describe, it, expect, vi } from 'vitest';
 import {
   deriveEmbeddingMode,
   deriveEmbeddingCap,
+  preserveOnlyForImplicitForceCap,
   resolveEmbeddingNodeLimit,
   DEFAULT_EMBEDDING_NODE_LIMIT,
 } from '../../src/core/embedding-mode.js';
@@ -1189,6 +1190,13 @@ describe('deriveEmbeddingCap', () => {
 
   it('custom cap below default still applies', () => {
     expect(deriveEmbeddingCap(15_000, 10_000).skipForCap).toBe(true);
+  });
+
+  it('downgrades only an implicit force top-up to preserve-only recovery', () => {
+    expect(preserveOnlyForImplicitForceCap(true, true, undefined)).toBe(true);
+    expect(preserveOnlyForImplicitForceCap(true, true, 50_000)).toBe(false);
+    expect(preserveOnlyForImplicitForceCap(true, false, undefined)).toBe(false);
+    expect(preserveOnlyForImplicitForceCap(false, true, undefined)).toBe(false);
   });
 });
 

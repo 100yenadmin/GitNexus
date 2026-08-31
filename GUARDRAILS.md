@@ -48,8 +48,8 @@ Format: **Trigger → Instruction → Reason**. Append new Signs when the same m
 
 ### Embedding state is malformed or provenance is unproven
 
-- **Trigger:** Doctor or read-only integrity inspection reports malformed, duplicate, orphaned, wrong-dimension, or otherwise unproven embedding state, including legacy rows without durable provider or identity proof.
-- **Do:** Preserve the canonical logical embedding-row and metadata preimage, then run an explicit staged clean rebuild with a positive cap on total graph nodes: `npx gitnexus analyze --staged --embeddings <n> --drop-embeddings`. Validate the isolated generation before journaled promotion; on a promotion failure, use the staged rollback path and verify that the logical preimage is restored with no stage, backup, or journal residue.
+- **Trigger:** Doctor or read-only integrity inspection reports malformed, duplicate, orphaned, wrong-dimension, or otherwise unproven embedding state, or the operator cannot independently bind the existing rows to the expected provider, model, and dimensions. Doctor structural health alone is not provider provenance.
+- **Do:** Preserve the canonical logical embedding-row and metadata preimage, then run an explicit staged clean rebuild with a positive cap on total graph nodes: `npx gitnexus analyze --staged --embeddings <n> --drop-embeddings`. Validate the isolated generation before journaled promotion. Follow the journal state after a failure: the injected milestone 10 boundary proved exact rollback, while later failures may retain the old database backup and new metadata for forward recovery.
 - **Why:** A staged clean rebuild gives malformed or unclassified derived state a bounded replacement path without treating old rows as verified. The deterministic proof covers logical row payloads, not raw LadybugDB container bytes.
 
 ### MCP lists no repos

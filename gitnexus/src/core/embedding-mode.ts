@@ -76,6 +76,20 @@ export function deriveEmbeddingCap(
   return { skipForCap, capDisabled, nodeLimit };
 }
 
+/**
+ * The implicit local-model cap is allowed to downgrade only the automatic
+ * `--force` top-up of an already-embedded repository to preserve-only mode.
+ * Explicit embedding requests and explicit positive caps remain all-or-
+ * nothing admission gates.
+ */
+export function preserveOnlyForImplicitForceCap(
+  skipForCap: boolean,
+  forceRegenerateEmbeddings: boolean,
+  embeddingsNodeLimit: number | undefined,
+): boolean {
+  return skipForCap && forceRegenerateEmbeddings && embeddingsNodeLimit === undefined;
+}
+
 export function deriveEmbeddingMode(
   options: EmbeddingModeInput,
   existingEmbeddingCount: number,
