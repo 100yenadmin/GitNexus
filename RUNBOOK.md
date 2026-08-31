@@ -56,7 +56,11 @@ npx gitnexus list
 npx gitnexus analyze --embeddings
 ```
 
-**Important:** If you already had embeddings, **always** pass `--embeddings` on later analyzes, or they can be dropped. See `stats.embeddings` in `.gitnexus/gitnexus.json` (or its legacy `meta.json` mirror; 0 means none).
+**Important:** A plain `analyze` preserves existing embeddings. Pass `--embeddings <n>` when
+you also want changed or new owners regenerated under a positive node cap; use
+`--drop-embeddings` only when intentionally replacing the existing vectors. See
+`stats.embeddings` in `.gitnexus/gitnexus.json` (or its legacy `meta.json` mirror; 0 means
+none).
 
 **Large repos:** Analyze may skip or limit embedding work when node counts are very high; watch CLI output.
 
@@ -164,6 +168,32 @@ If the error text is `"Only one write transaction at a time is allowed in the sy
 - Agent safety rules: [GUARDRAILS.md](GUARDRAILS.md)  
 - Tests: [TESTING.md](TESTING.md)
 
+## Bounded embedding preservation and staged recovery
+
+For a healthy index that is stale against its source, run incremental analysis with a positive
+embedding cap:
+
+```bash
+npx gitnexus analyze --embeddings <n>
+```
+
+The incremental path rewrites the changed/effective file set, regenerates changed or new
+embedding owners within the cap, and retains unaffected logical embedding-row payloads. If the
+effective write set is large, the existing escalation valve may select a full write while
+retaining the same bounded snapshot and restore contract.
+
+For malformed or provenance-unproven embedding state, use an explicit staged clean rebuild:
+
+```bash
+npx gitnexus analyze --staged --embeddings <n> --drop-embeddings
+```
+
+The staged generation is disposable and the canonical generation remains readable until
+validation and journaled promotion complete. Keep the canonical logical embedding-row and
+metadata preimage available for rollback. The deterministic proof covers logical row payloads,
+not raw LadybugDB container bytes; legacy rows without durable provider or identity proof remain
+unproven and are not called verified preservation.
+
 ---
 
 ## Electric fork releases
@@ -173,8 +203,8 @@ to npm, GitHub Container Registry, Docker Hub, or another package registry.
 
 Prepare each version through a reviewed release PR:
 
-1. Set `gitnexus/package.json` and `gitnexus/package-lock.json` to a version such
-   as `1.6.10-electric.1`.
+1. Set `gitnexus/package.json` and `gitnexus/package-lock.json` to the reviewed
+   fork version, such as `1.6.10-electric.11`.
 2. Run `node gitnexus/scripts/sync-plugin-versions.mjs` from the repository root.
 3. Add `Documentation/releases/<version>.md` and update `gitnexus/CHANGELOG.md`.
 4. Run `npm run check:electric-release-policy`, the plugin-version test, build,
@@ -187,7 +217,7 @@ Create the release from the current `main` branch with the protected workflow:
 gh workflow run electric-release.yml \
   --repo electricsheephq/evaOS-gitnexus \
   --ref main \
-  -f expected_version=1.6.10-electric.1 \
+  -f expected_version=1.6.10-electric.11 \
   -f prerelease=false
 ```
 
@@ -219,10 +249,11 @@ After downloading both assets, verify and install locally:
 
 ```bash
 shasum -a 256 --check SHA256SUMS
-npm install --global ./gitnexus-1.6.10-electric.1.tgz
+npm install --global ./gitnexus-1.6.10-electric.11.tgz
 gitnexus --version
 ```
 
 A GitHub Release does not authorize an OpenClaw/evaOS rollout. Keep the prior
-installation available for rollback, switch runtime source separately, and do
-not rebuild or migrate a live index unless that rollout explicitly requires it.
+`1.6.10-electric.10` installation available as non-writing rollback bytes, switch
+runtime source separately, and do not rebuild or migrate a live index unless that
+rollout explicitly requires it.
