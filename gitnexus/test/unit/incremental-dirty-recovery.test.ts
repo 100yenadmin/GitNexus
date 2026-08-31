@@ -32,7 +32,7 @@ import { setupMiniRepo as setupSharedMiniRepo } from '../helpers/mini-repo.js';
 // zero-vector seeding pattern previously lived here as a divergent copy of
 // incremental-orchestration.test.ts's (a helper module has no
 // describe-registration problem, unlike importing a sibling test file).
-import { readEmbeddingNodeIds, seedEmbeddingsForFiles } from '../helpers/embedding-seed.js';
+import { readEmbeddingRowFingerprints, seedEmbeddingsForFiles } from '../helpers/embedding-seed.js';
 
 const setupMiniRepo = () => setupSharedMiniRepo('gitnexus-incr-dirty-rec-');
 
@@ -53,6 +53,50 @@ const deterministicEmbedding = (text: string): number[] => {
     { length: EMBEDDING_DIMS },
     (_, index) => (digest[index % digest.length]! - 128) / 128,
   );
+};
+
+const stampCurrentContentHashes = async (repoPath: string, nodeIds: readonly string[]) => {
+  const adapter = await import('../../src/core/lbug/lbug-adapter.js');
+  const { contentHashForNode } = await import('../../src/core/embeddings/embedding-pipeline.js');
+  const { escapeCypherString } = await import('../../src/core/lbug/cypher-escape.js');
+  const { lbugPath } = getStoragePaths(repoPath);
+  await adapter.initLbug(lbugPath);
+  try {
+    const wanted = `[${nodeIds.map((id) => `'${escapeCypherString(id)}'`).join(', ')}]`;
+    const rows = (await adapter.executeQuery(
+      `MATCH (n:Function) WHERE n.id IN ${wanted} RETURN n.id AS id, n.name AS name, ` +
+        `'Function' AS label, n.filePath AS filePath, n.content AS content, ` +
+        'n.startLine AS startLine, n.endLine AS endLine, n.isExported AS isExported, ' +
+        'n.description AS description',
+    )) as Array<Record<string, unknown>>;
+    expect(rows).toHaveLength(nodeIds.length);
+    for (const row of rows) {
+      const nodeId = String(row.id ?? '');
+      const contentHash = contentHashForNode({
+        id: nodeId,
+        name: String(row.name ?? ''),
+        label: 'Function',
+        filePath: String(row.filePath ?? ''),
+        content: String(row.content ?? ''),
+        startLine: Number(row.startLine ?? 0),
+        endLine: Number(row.endLine ?? 0),
+        isExported:
+          row.isExported === undefined || row.isExported === null
+            ? undefined
+            : Boolean(row.isExported),
+        description:
+          row.description === undefined || row.description === null
+            ? undefined
+            : String(row.description),
+      });
+      await adapter.executeQuery(
+        `MATCH (e:CodeEmbedding) WHERE e.nodeId = '${escapeCypherString(nodeId)}' ` +
+          `SET e.contentHash = '${escapeCypherString(contentHash)}'`,
+      );
+    }
+  } finally {
+    await adapter.closeLbug();
+  }
 };
 
 describe('runFullAnalysis — dirty-flag recovery sidecar parking (#2409)', () => {
@@ -78,6 +122,12 @@ describe('runFullAnalysis — dirty-flag recovery sidecar parking (#2409)', () =
       );
       const seededNodeIds = [...seededIdsByFile.values()].flat();
       expect(seededNodeIds.length).toBeGreaterThan(0);
+      await stampCurrentContentHashes(repo.dbPath, seededNodeIds);
+      const seededNodeIdSet = new Set(seededNodeIds);
+      const seededFingerprintsBefore = (await readEmbeddingRowFingerprints(repo.dbPath)).filter(
+        (row) => seededNodeIdSet.has(row.nodeId),
+      );
+      expect(seededFingerprintsBefore).toHaveLength(seededNodeIds.length);
 
       // Simulate a crashed incremental writeback: dirty flag in meta plus
       // leftover sidecars whose bytes must never be replayed. 8KB puts the
@@ -153,9 +203,11 @@ describe('runFullAnalysis — dirty-flag recovery sidecar parking (#2409)', () =
       // the DB was wiped, so these rows can only come from the cache load).
       const after = await loadMeta(storagePath);
       expect(after!.incrementalInProgress).toBeUndefined();
-      const recoveredNodeIds = await readEmbeddingNodeIds(repo.dbPath);
-      expect(seededNodeIds.every((nodeId) => recoveredNodeIds.includes(nodeId))).toBe(true);
-      expect(after!.stats?.embeddings).toBe(recoveredNodeIds.length);
+      const recoveredFingerprints = await readEmbeddingRowFingerprints(repo.dbPath);
+      expect(recoveredFingerprints.filter((row) => seededNodeIdSet.has(row.nodeId))).toEqual(
+        seededFingerprintsBefore,
+      );
+      expect(after!.stats?.embeddings).toBe(recoveredFingerprints.length);
     } finally {
       vi.unstubAllGlobals();
       for (const [key, value] of previousEnv) {
