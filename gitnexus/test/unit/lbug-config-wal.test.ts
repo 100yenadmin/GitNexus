@@ -193,8 +193,10 @@ describe('createLbugDatabase WAL replay option', () => {
       const Database = vi.fn(function (this: any) {});
       const lbugModule = { Database } as any;
 
-      await withLbugAutoCheckpoint('/tmp/lbug-staged-embedding-explicit-threshold', false, async () =>
-        createLbugDatabase(lbugModule, '/tmp/lbug-staged-embedding-explicit-threshold'),
+      await withLbugAutoCheckpoint(
+        '/tmp/lbug-staged-embedding-explicit-threshold',
+        false,
+        async () => createLbugDatabase(lbugModule, '/tmp/lbug-staged-embedding-explicit-threshold'),
       );
 
       expect(Database.mock.calls[0][5]).toBe(false);
