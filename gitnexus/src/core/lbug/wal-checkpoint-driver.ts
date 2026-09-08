@@ -19,8 +19,11 @@
  *
  * Design contract
  * ---------------
- * - `autoCheckpoint` stays on (maintainer requirement). This driver is
- *   additive: it preempts the native checkpoint, it does not replace it.
+ * - `autoCheckpoint` normally stays on. The one exception is an unpublished
+ *   staging DB that is actively generating embeddings: run-analyze may disable
+ *   the crashing native path there only while this driver is enabled, then
+ *   requires a strict final CHECKPOINT and consolidated staging file before
+ *   atomic publication. Every live/in-place and non-embedding DB keeps it on.
  * - The driver runs ONLY during analyze (callers opt-in explicitly). MCP
  *   and other long-lived flows continue to rely on the close-time
  *   CHECKPOINT in `safeClose`.

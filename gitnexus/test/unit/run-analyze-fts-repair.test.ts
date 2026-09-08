@@ -1055,6 +1055,7 @@ describe('runFullAnalysis wipe-and-restore vector-index stamp (tri-review 466951
       ),
       executeWithReusedStatement,
       closeLbug: vi.fn(async () => undefined),
+      tryFlushWAL: vi.fn(async () => true),
       // Full-rebuild wipe is loud now (#2409, tri-review 4669518496 P2-4) —
       // run-analyze calls this on every full-path analyze.
       wipeLbugDbFiles: vi.fn(async () => undefined),
@@ -1495,6 +1496,7 @@ describe('runFullAnalysis Phase 5 embedding gate (#2790)', () => {
       }),
       executeWithReusedStatement: vi.fn(async () => []),
       closeLbug: vi.fn(async () => undefined),
+      tryFlushWAL: vi.fn(async () => true),
       wipeLbugDbFiles: vi.fn(async () => undefined),
       loadCachedEmbeddings: vi.fn(async () => ({
         embeddingNodeIds: new Set<string>(),

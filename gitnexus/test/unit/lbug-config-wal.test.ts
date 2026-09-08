@@ -6,6 +6,7 @@ import {
   isLbugCheckpointIoError,
   isWalCorruptionError,
   setBufferPoolSizeHint,
+  withLbugAutoCheckpoint,
   _setOsPageSizeForTests,
   bufferPoolExhaustionRemedy,
 } from '../../src/core/lbug/lbug-config.js';
@@ -162,6 +163,73 @@ describe('createLbugDatabase WAL replay option', () => {
       false,
       true,
     );
+  });
+
+  it('disables only native auto-checkpoint inside the scoped open and keeps a positive threshold', async () => {
+    const Database = vi.fn(function (this: any) {});
+    const lbugModule = { Database } as any;
+
+    await withLbugAutoCheckpoint('/tmp/lbug-staged-embedding', false, async () => {
+      await Promise.resolve();
+      createLbugDatabase(lbugModule, '/tmp/lbug-staged-embedding');
+    });
+
+    expect(Database).toHaveBeenCalledWith(
+      '/tmp/lbug-staged-embedding',
+      expect.any(Number),
+      false,
+      false,
+      expect.any(Number),
+      false,
+      DEFAULT_THRESHOLD,
+      true,
+      true,
+    );
+  });
+
+  it('keeps the configured threshold argument while a low-level path scope disables auto-checkpoint', async () => {
+    vi.stubEnv('GITNEXUS_WAL_CHECKPOINT_THRESHOLD', '1048576');
+    try {
+      const Database = vi.fn(function (this: any) {});
+      const lbugModule = { Database } as any;
+
+      await withLbugAutoCheckpoint(
+        '/tmp/lbug-staged-embedding-explicit-threshold',
+        false,
+        async () => createLbugDatabase(lbugModule, '/tmp/lbug-staged-embedding-explicit-threshold'),
+      );
+
+      expect(Database.mock.calls[0][5]).toBe(false);
+      expect(Database.mock.calls[0][6]).toBe(1_048_576);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it('does not affect a different database path opened concurrently with the scope', async () => {
+    const Database = vi.fn(function (this: any) {});
+    const lbugModule = { Database } as any;
+
+    await withLbugAutoCheckpoint('/tmp/lbug-staged-embedding', false, async () => {
+      createLbugDatabase(lbugModule, '/tmp/lbug-live');
+    });
+
+    expect(Database.mock.calls[0][5]).toBe(true);
+  });
+
+  it('restores ordinary auto-checkpoint behavior after a scoped open rejects', async () => {
+    await expect(
+      withLbugAutoCheckpoint('/tmp/lbug-failed-staged-open', false, async () => {
+        await Promise.resolve();
+        throw new Error('synthetic open failure');
+      }),
+    ).rejects.toThrow('synthetic open failure');
+
+    const Database = vi.fn(function (this: any) {});
+    createLbugDatabase({ Database } as any, '/tmp/lbug-after-failed-staged-open');
+
+    expect(Database.mock.calls[0][5]).toBe(true);
+    expect(Database.mock.calls[0][6]).toBe(DEFAULT_THRESHOLD);
   });
 });
 
