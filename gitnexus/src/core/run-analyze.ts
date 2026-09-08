@@ -54,8 +54,10 @@ import {
 } from './lbug/lbug-adapter.js';
 import {
   estimateBufferPool,
+  parseWalCheckpointThreshold,
   setBufferPoolSizeHint,
   resolveNativeSafeStorageDir,
+  withLbugAutoCheckpoint,
 } from './lbug/lbug-config.js';
 import { escapeCypherString } from './lbug/cypher-escape.js';
 import { chunk } from '../lib/utils.js';
@@ -83,6 +85,7 @@ import { diagnoseExtensionLoad } from './lbug/extension-load-error.js';
 import {
   startWalCheckpointDriver,
   checkpointOnce,
+  isManualCheckpointEnabled,
   type WalCheckpointDriver,
 } from './lbug/wal-checkpoint-driver.js';
 import {
@@ -326,6 +329,43 @@ export interface AnalyzeCallbacks {
   onProgress: (phase: string, percent: number, message: string) => void;
   onLog?: (message: string) => void;
 }
+
+/** Pure policy seam for the staged-embedding native checkpoint guard. */
+export const _shouldDisableNativeAutoCheckpoint = (input: {
+  shouldGenerateEmbeddings: boolean;
+  buildPath: string;
+  lbugPath: string;
+  manualCheckpointEnabled: boolean;
+  explicitCheckpointThreshold: boolean;
+}): boolean =>
+  input.shouldGenerateEmbeddings &&
+  input.buildPath !== input.lbugPath &&
+  input.manualCheckpointEnabled &&
+  !input.explicitCheckpointThreshold;
+
+type StagingSidecarStat = (filePath: string) => Promise<unknown>;
+
+/** Fail closed before atomic publication unless the staging DB is consolidated. */
+export const _assertStagingDatabaseConsolidated = async (
+  databasePath: string,
+  statSidecar: StagingSidecarStat = (filePath) => fs.stat(filePath),
+): Promise<void> => {
+  const residual: string[] = [];
+  for (const suffix of ['.wal', '.shadow', '.wal.checkpoint'] as const) {
+    try {
+      await statSidecar(`${databasePath}${suffix}`);
+      residual.push(suffix);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') throw err;
+    }
+  }
+  if (residual.length > 0) {
+    throw new Error(
+      `Staged LadybugDB did not consolidate after the strict final CHECKPOINT; ` +
+        `refusing atomic publication because required sidecars remain: ${residual.join(', ')}`,
+    );
+  }
+};
 
 export interface AnalyzeOptions {
   /**
@@ -1973,6 +2013,40 @@ async function runFullAnalysisInner(
   // acquire. The `.staging.` prefix is what that sweep matches.
   let buildPath = useAtomicSwap ? `${lbugPath}.staging.${randomUUID()}` : lbugPath;
 
+  /**
+   * Open the current build target with native auto-checkpoint disabled only for
+   * a large embedding rebuild in an unpublished staging database. The native
+   * checkpointer is the reproduced SIGSEGV surface; raising its threshold only
+   * postpones that same path as the staging DB grows. This removes the path
+   * instead, while the analyze-owned periodic driver (5 s), embedding-window
+   * checkpoints, and final close checkpoint keep the WAL bounded and durable.
+   *
+   * The manual-checkpoint opt-out is load-bearing: when an operator disables
+   * that driver, native auto-checkpoint stays enabled. An explicit valid native
+   * threshold also opts out: operator tuning is never silently replaced. Live/
+   * in-place databases, cache reads, FTS repair, and non-embedding analyzes keep
+   * their existing constructor behavior. The path-bound override is restored in
+   * finally whether open succeeds or throws, so no later database open inherits
+   * it.
+   */
+  const stagedEmbeddingUsesManualCheckpointsOnly = (): boolean =>
+    _shouldDisableNativeAutoCheckpoint({
+      shouldGenerateEmbeddings,
+      buildPath,
+      lbugPath,
+      manualCheckpointEnabled: isManualCheckpointEnabled(),
+      explicitCheckpointThreshold:
+        parseWalCheckpointThreshold(process.env.GITNEXUS_WAL_CHECKPOINT_THRESHOLD) !== undefined,
+    });
+
+  const initBuildLbug = async (): Promise<void> => {
+    if (stagedEmbeddingUsesManualCheckpointsOnly()) {
+      await withLbugAutoCheckpoint(buildPath, false, () => initLbug(buildPath));
+      return;
+    }
+    await initLbug(buildPath);
+  };
+
   if (isIncremental && hashDiff) {
     log(
       `Incremental: changed=${hashDiff.changed.length}, ` +
@@ -2060,7 +2134,7 @@ async function runFullAnalysisInner(
 
   // Full rebuild (POSIX) builds into the temp `buildPath`; incremental and
   // Windows use `buildPath === lbugPath` in place.
-  await initLbug(buildPath);
+  await initBuildLbug();
 
   // Manual WAL checkpoint driver (#1741): periodically drain the WAL
   // from JS so the un-retriable native auto-checkpoint almost never
@@ -2572,7 +2646,7 @@ async function runFullAnalysisInner(
         await walCheckpointDriver.stop();
         await closeLbug();
         await wipeLbugDbFiles(buildPath);
-        await initLbug(buildPath);
+        await initBuildLbug();
         walCheckpointDriver = startWalCheckpointDriver();
         await loadGraphToLbug(pipelineResult.graph, pipelineResult.repoPath, storagePath, (msg) => {
           lbugMsgCount++;
@@ -3730,6 +3804,11 @@ async function runFullAnalysisInner(
     // Stop the manual checkpoint driver before closeLbug so its
     // in-flight CHECKPOINT cannot race the `safeClose` CHECKPOINT.
     await walCheckpointDriver.stop();
+    // The guarded staging path has no native auto-checkpoint fallback. Require
+    // one surfaced (retry-bounded) final CHECKPOINT before close and publish;
+    // failure enters the catch path, which abandons the staging database.
+    const requireConsolidatedStaging = stagedEmbeddingUsesManualCheckpointsOnly();
+    if (requireConsolidatedStaging) await checkpointOnce();
     // CLI callers (about to process.exit) skip the native close to dodge a
     // LadybugDB destructor double-free after --pdg writes — closeLbugBeforeExit
     // CHECKPOINTs for durability then leaves the handles for process exit to
@@ -3743,6 +3822,10 @@ async function runFullAnalysisInner(
     await (options.skipNativeCloseOnExit && !forceRealCloseForSwap
       ? closeLbugBeforeExit()
       : closeLbug());
+
+    if (requireConsolidatedStaging) {
+      await _assertStagingDatabaseConsolidated(buildPath);
+    }
 
     // #2 atomic publish: the fresh index was built at buildPath (a full rebuild,
     // or an opt-in atomic incremental that copied the live index in first). Swap

@@ -288,6 +288,43 @@ export const parseWalCheckpointThreshold = (raw: string | undefined): number | u
  */
 const DEFAULT_WAL_CHECKPOINT_THRESHOLD = 64 * 1024 * 1024;
 
+/**
+ * Per-open native auto-checkpoint mode.
+ *
+ * Analyze's large embedding rebuild opens a throwaway staging database inside
+ * this path-bound scope with native auto-checkpoint disabled. That path retains
+ * the serialized periodic, checkpoint-window, and final manual CHECKPOINTs,
+ * avoiding the engine-internal checkpoint path that can SIGSEGV while keeping
+ * WAL durability bounded by the JS-owned checkpoints. Keying the hint by the
+ * native-safe database path keeps concurrent opens of other databases and every
+ * ordinary/cache/read-only open on the default (`true`).
+ *
+ * The resolved checkpoint threshold is still passed to the native constructor.
+ * It becomes active again on the next ordinary open; it cannot re-enable native
+ * auto-checkpoint inside an explicitly disabled path scope.
+ */
+const autoCheckpointModes = new Map<string, boolean>();
+
+export const withLbugAutoCheckpoint = async <T>(
+  databasePath: string,
+  enabled: boolean,
+  open: () => Promise<T>,
+): Promise<T> => {
+  const safePath = toNativeSafePath(databasePath);
+  const hadPrevious = autoCheckpointModes.has(safePath);
+  const previous = autoCheckpointModes.get(safePath);
+  autoCheckpointModes.set(safePath, enabled);
+  try {
+    return await open();
+  } finally {
+    if (hadPrevious) autoCheckpointModes.set(safePath, previous!);
+    else autoCheckpointModes.delete(safePath);
+  }
+};
+
+const resolveAutoCheckpoint = (databasePath: string): boolean =>
+  autoCheckpointModes.get(databasePath) ?? true;
+
 const resolveCheckpointThreshold = (): number => {
   const raw = process.env.GITNEXUS_WAL_CHECKPOINT_THRESHOLD;
   if (raw === undefined) return DEFAULT_WAL_CHECKPOINT_THRESHOLD;
@@ -827,7 +864,7 @@ export function createLbugDatabase(
     false, // enableCompression (pinned for v0.16.0)
     options.readOnly ?? false,
     LBUG_MAX_DB_SIZE,
-    true, // autoCheckpoint (always on)
+    resolveAutoCheckpoint(databasePath), // autoCheckpoint (normally on; staged embedding rebuilds use serialized manual checkpoints)
     resolveCheckpointThreshold(), // checkpointThreshold (default 64 MiB; override with GITNEXUS_WAL_CHECKPOINT_THRESHOLD; -1 keeps Ladybug stock ~16 MiB)
     options.throwOnWalReplayFailure ?? true,
     true, // enableChecksums

@@ -44,6 +44,85 @@ describe('run-analyze module', () => {
     expect(mod.PHASE_LABELS.parsing).toBe('Parsing code');
   });
 
+  it.each([
+    [
+      'staged embedding build with manual checkpoints',
+      true,
+      '/index/lbug.staging.1',
+      '/index/lbug',
+      true,
+      false,
+      true,
+    ],
+    [
+      'ordinary non-embedding staging build',
+      false,
+      '/index/lbug.staging.1',
+      '/index/lbug',
+      true,
+      false,
+      false,
+    ],
+    ['in-place embedding build', true, '/index/lbug', '/index/lbug', true, false, false],
+    [
+      'manual-checkpoint opt-out',
+      true,
+      '/index/lbug.staging.1',
+      '/index/lbug',
+      false,
+      false,
+      false,
+    ],
+    [
+      'explicit checkpoint threshold',
+      true,
+      '/index/lbug.staging.1',
+      '/index/lbug',
+      true,
+      true,
+      false,
+    ],
+  ])(
+    'native auto-checkpoint policy: %s',
+    async (
+      _label,
+      shouldGenerateEmbeddings,
+      buildPath,
+      lbugPath,
+      manualCheckpointEnabled,
+      explicitCheckpointThreshold,
+      expected,
+    ) => {
+      const { _shouldDisableNativeAutoCheckpoint } = await import('../../src/core/run-analyze.js');
+      expect(
+        _shouldDisableNativeAutoCheckpoint({
+          shouldGenerateEmbeddings,
+          buildPath,
+          lbugPath,
+          manualCheckpointEnabled,
+          explicitCheckpointThreshold,
+        }),
+      ).toBe(expected);
+    },
+  );
+
+  it('requires a consolidated staging database before publication', async () => {
+    const { _assertStagingDatabaseConsolidated } = await import('../../src/core/run-analyze.js');
+    const missing = Object.assign(new Error('missing'), { code: 'ENOENT' });
+    await expect(
+      _assertStagingDatabaseConsolidated('/index/lbug.staging.1', async () => {
+        throw missing;
+      }),
+    ).resolves.toBeUndefined();
+
+    await expect(
+      _assertStagingDatabaseConsolidated('/index/lbug.staging.1', async (filePath) => {
+        if (filePath.endsWith('.wal')) return {};
+        throw missing;
+      }),
+    ).rejects.toThrow('refusing atomic publication because required sidecars remain: .wal');
+  });
+
   it('creates .gitnexus/.gitignore on the already-up-to-date fast path (#1233)', async () => {
     const tmpRepo = await createTempDir('gitnexus-run-analyze-fast-path-');
     try {
